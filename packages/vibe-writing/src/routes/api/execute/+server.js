@@ -74,12 +74,34 @@ export async function GET({ url }) {
 				});
 
 				// 5. Start the workflow and handle the final result
-				const finalResult = await requestTeam.start(taskDetails.inputs);
+				const teamResult = await requestTeam.start(taskDetails.inputs);
+
+				// Extract the final string from the potentially complex result object.
+				let finalResultString;
+				if (typeof teamResult === 'string') {
+					finalResultString = teamResult;
+				} else if (teamResult && typeof teamResult === 'object') {
+					finalResultString =
+						teamResult.output ||
+						teamResult.result ||
+						teamResult.content ||
+						teamResult.finalResult ||
+						(teamResult.tasks && teamResult.tasks[teamResult.tasks.length - 1]?.output) ||
+						JSON.stringify(teamResult, null, 2);
+				} else {
+					finalResultString = String(teamResult || 'No result generated');
+				}
+
+				// Fulfill the public contract for this Vibe.
+				const structuredResult = {
+					title: `Result for: ${taskDetails.task.description}`,
+					body: finalResultString
+				};
 
 				sendEvent('task_completed', {
 					jsonrpc: '2.0',
 					id: id,
-					result: { status: 'FINISHED', result: finalResult }
+					result: { status: 'FINISHED', result: structuredResult }
 				});
 
 				unsubscribe();

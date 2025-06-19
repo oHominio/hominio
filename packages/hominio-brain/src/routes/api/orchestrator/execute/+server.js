@@ -71,26 +71,7 @@ export async function POST({ request }) {
 						currentState.updates.push({ eventName, data, timestamp: new Date().toISOString() });
 						if (eventName === 'task_completed') {
 							currentState.status = data.result?.status || 'COMPLETED';
-
-							// PARSE THE RESULT OBJECT HERE
-							const teamResult = data.result?.result;
-							let finalResultString;
-							if (typeof teamResult === 'string') {
-								finalResultString = teamResult;
-							} else if (teamResult && typeof teamResult === 'object') {
-								finalResultString =
-									teamResult.output ||
-									teamResult.result ||
-									teamResult.content ||
-									teamResult.finalResult ||
-									(teamResult.tasks && teamResult.tasks[teamResult.tasks.length - 1]?.output) ||
-									JSON.stringify(teamResult, null, 2);
-							} else {
-								finalResultString = String(teamResult || 'No result generated');
-							}
-							// Store the raw result but prepare to send the parsed string
-							currentState.result = teamResult;
-							data.result.result = finalResultString;
+							currentState.result = data.result;
 						} else if (eventName === 'task_error') {
 							currentState.status = 'FAILED';
 							currentState.error = data.error;
@@ -100,8 +81,8 @@ export async function POST({ request }) {
 						taskStates.set(taskId, currentState);
 					}
 
-					// 2. Forward the (now modified) event string to our client
-					const outgoingEvent = `event: ${eventName}\\ndata: ${JSON.stringify(data)}\\n\\n`;
+					// 2. Forward the raw, valid event string to our client
+					const outgoingEvent = `${eventString}\\n\\n`;
 					controller.enqueue(new TextEncoder().encode(outgoingEvent));
 				} catch (e) {
 					console.error(

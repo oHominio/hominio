@@ -9,7 +9,7 @@
 	let taskExpectedOutput = 'A 3-paragraph blog post about the topic.';
 
 	let activityLog = [];
-	let finalResult = '';
+	let finalResult = null;
 	let error = null;
 
 	let tasks = [];
@@ -19,7 +19,7 @@
 
 		isRunning = true;
 		activityLog = [];
-		finalResult = '';
+		finalResult = null;
 		error = null;
 		tasks = [
 			{ title: 'Research Analysis', status: 'PENDING' },
@@ -91,11 +91,11 @@
 								}
 							} else if (eventName === 'task_completed' && data.result) {
 								const finalOutput = data.result?.result;
-								if (finalOutput) {
+								if (finalOutput && typeof finalOutput === 'object' && finalOutput.body) {
 									finalResult = finalOutput;
 								} else {
 									error = `Task completed but the result format was unexpected.`;
-									console.log('Unexpected result format:', data.result);
+									console.log('Unexpected result format:', finalOutput);
 								}
 								tasks = tasks.map((t) => ({ ...t, status: 'DONE' }));
 								isRunning = false;
@@ -229,9 +229,9 @@
 
 				{#if finalResult}
 					<div class="animate-fade-in flex-grow rounded-lg bg-gray-800 p-6 shadow-lg">
-						<h2 class="mb-4 text-2xl font-semibold text-cyan-300">Final Result</h2>
+						<h2 class="mb-4 text-2xl font-semibold text-cyan-300">{finalResult.title}</h2>
 						<div class="prose prose-invert max-h-[60vh] max-w-none overflow-y-auto">
-							{@html marked(finalResult)}
+							{@html marked(finalResult.body)}
 						</div>
 					</div>
 				{/if}
