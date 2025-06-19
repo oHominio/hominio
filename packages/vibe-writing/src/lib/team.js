@@ -17,7 +17,9 @@ export const researchAgent = new Agent({
 	name: 'Research Agent',
 	role: 'Information Researcher',
 	goal: 'Conduct thorough research and provide comprehensive insights',
-	background: 'Experienced researcher with expertise in analyzing trends and gathering insights',
+	background: `Experienced researcher with expertise in analyzing trends and gathering insights. 
+You must formulate your final answer based *only* on the information you've gathered with your available tools. 
+Do not attempt to use any other tools.`,
 	tools: [knowledgeBaseTool],
 	llmConfig: {
 		provider: 'openai',

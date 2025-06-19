@@ -85,12 +85,7 @@ export async function POST({ request }) {
 					const outgoingEvent = `${eventString}\\n\\n`;
 					controller.enqueue(new TextEncoder().encode(outgoingEvent));
 				} catch (e) {
-					console.error(
-						'Orchestrator: Error processing event JSON:',
-						e,
-						'Data String:',
-						dataContent
-					);
+					console.error('IntentVibe: Error processing event JSON:', e, 'Data String:', dataContent);
 				}
 			};
 
@@ -114,10 +109,13 @@ export async function POST({ request }) {
 					}
 				}
 			} catch (error) {
-				console.error('Error reading from vibe stream:', error);
+				console.error('IntentVibe: Error reading from vibe stream:', error);
 				controller.error(error);
 			} finally {
-				console.log(`Stream closed for ${taskId}. Final state:`, taskStates.get(taskId));
+				console.log(
+					`IntentVibe: Stream closed for ${taskId}. Final state:`,
+					taskStates.get(taskId)
+				);
 				if (controller.desiredSize !== null) {
 					controller.close();
 				}

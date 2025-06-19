@@ -2,6 +2,11 @@
 	import { onMount } from 'svelte';
 	import { marked } from 'marked';
 
+	// Configure marked to treat newlines as <br> tags
+	marked.setOptions({
+		breaks: true
+	});
+
 	let isRunning = false;
 	let activityLogsContainer;
 
@@ -27,7 +32,7 @@
 		];
 
 		try {
-			const response = await fetch('/api/orchestrator/execute', {
+			const response = await fetch('/api/intentVibe/execute', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({

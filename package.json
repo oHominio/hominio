@@ -2,7 +2,7 @@
     "name": "hominio",
     "private": true,
     "scripts": {
-        "dev": "concurrently --names 'BRAIN,WRITING' -c 'bgBlue.bold,bgMagenta.bold' 'bun run --filter hominio-brain dev' 'bun run --filter vibe-writing dev'"
+        "dev": "concurrently --names 'OS,WRITING' -c 'bgBlue.bold,bgMagenta.bold' 'bun run --filter hominio-os dev' 'bun run --filter vibe-writing dev'"
     },
     "workspaces": {
         "packages": [

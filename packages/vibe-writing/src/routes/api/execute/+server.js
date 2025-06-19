@@ -76,27 +76,42 @@ export async function GET({ url }) {
 				// 5. Start the workflow and handle the final result
 				const teamResult = await requestTeam.start(taskDetails.inputs);
 
-				// Extract the final string from the potentially complex result object.
-				let finalResultString;
-				if (typeof teamResult === 'string') {
-					finalResultString = teamResult;
-				} else if (teamResult && typeof teamResult === 'object') {
-					finalResultString =
-						teamResult.output ||
-						teamResult.result ||
-						teamResult.content ||
-						teamResult.finalResult ||
-						(teamResult.tasks && teamResult.tasks[teamResult.tasks.length - 1]?.output) ||
-						JSON.stringify(teamResult, null, 2);
-				} else {
-					finalResultString = String(teamResult || 'No result generated');
-				}
-
 				// Fulfill the public contract for this Vibe.
 				const structuredResult = {
 					title: `Result for: ${taskDetails.task.description}`,
-					body: finalResultString
+					body: ''
 				};
+
+				// Handle both successful and blocked/failed outcomes.
+				if (teamResult && teamResult.status === 'FINISHED') {
+					// Extract the final string from the potentially complex result object.
+					let finalResultString;
+					if (typeof teamResult.result === 'string') {
+						finalResultString = teamResult.result;
+					} else if (teamResult.result && typeof teamResult.result === 'object') {
+						finalResultString =
+							teamResult.result.output ||
+							teamResult.result.result ||
+							teamResult.result.content ||
+							teamResult.result.finalResult ||
+							(teamResult.result.tasks &&
+								teamResult.result.tasks[teamResult.result.tasks.length - 1]?.output) ||
+							JSON.stringify(teamResult.result, null, 2);
+					} else {
+						finalResultString = String(teamResult.result || 'No result generated');
+					}
+					structuredResult.body = finalResultString;
+				} else {
+					// The workflow was blocked or failed.
+					structuredResult.body = `**Workflow Failed**
+
+The agent team encountered an error and could not complete the task.
+
+**Status:** ${teamResult.status}
+**Details:** ${teamResult.result || 'No further details available.'}
+
+This often happens if an agent gets stuck in a loop or cannot find a final answer within its iteration limit.`;
+				}
 
 				sendEvent('task_completed', {
 					jsonrpc: '2.0',
