@@ -1,0 +1,11 @@
+{
+    "a2a_version": "0.2.3",
+    "name": "vibe-writing",
+    "displayName": "Creative Writing & Research Vibe",
+    "description": "A specialized AI team for conducting research and writing compelling content, stories, and articles.",
+    "transport": {
+        "type": "http:sse",
+        "endpoint": "/api/execute"
+    },
+    "version": "1.0.0"
+}
