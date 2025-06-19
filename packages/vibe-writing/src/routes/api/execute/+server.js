@@ -16,13 +16,12 @@ export async function GET({ url }) {
 		async start(controller) {
 			const sendEvent = (eventName, data) => {
 				const jsonData = JSON.stringify(data);
-				// SSE data fields cannot contain raw newlines.
-				// We must split the data and send each line with a "data: " prefix.
-				const dataLines = jsonData
+				// SSE spec requires newlines to be sent as separate `data:` lines.
+				const dataString = jsonData
 					.split('\\n')
 					.map((line) => `data: ${line}`)
 					.join('\\n');
-				const message = `event: ${eventName}\\n${dataLines}\\n\\n`;
+				const message = `event: ${eventName}\\n${dataString}\\n\\n`;
 				controller.enqueue(new TextEncoder().encode(message));
 			};
 
@@ -63,7 +62,11 @@ export async function GET({ url }) {
 								status: {
 									state: state.workflowStatus,
 									description: lastLog.logDescription,
-									timestamp: new Date().toISOString()
+									timestamp: new Date().toISOString(),
+									tasks: state.tasks.map((task) => ({
+										title: task.title,
+										status: task.status
+									}))
 								}
 							}
 						});

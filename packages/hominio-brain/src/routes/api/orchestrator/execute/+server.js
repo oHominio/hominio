@@ -47,14 +47,15 @@ export async function POST({ request }) {
 			const processEvent = (eventString) => {
 				if (!eventString) return;
 
+				const lines = eventString.split('\\n');
 				let eventName = 'message';
 				let dataContent = '';
-				const lines = eventString.split('\\n');
 
 				for (const line of lines) {
 					if (line.startsWith('event:')) {
 						eventName = line.substring('event:'.length).trim();
 					} else if (line.startsWith('data:')) {
+						// Concatenate multi-line data.
 						dataContent += line.substring('data:'.length).trim();
 					}
 				}
@@ -70,21 +71,45 @@ export async function POST({ request }) {
 						currentState.updates.push({ eventName, data, timestamp: new Date().toISOString() });
 						if (eventName === 'task_completed') {
 							currentState.status = data.result?.status || 'COMPLETED';
-							currentState.result = data.result;
+
+							// PARSE THE RESULT OBJECT HERE
+							const teamResult = data.result?.result;
+							let finalResultString;
+							if (typeof teamResult === 'string') {
+								finalResultString = teamResult;
+							} else if (teamResult && typeof teamResult === 'object') {
+								finalResultString =
+									teamResult.output ||
+									teamResult.result ||
+									teamResult.content ||
+									teamResult.finalResult ||
+									(teamResult.tasks && teamResult.tasks[teamResult.tasks.length - 1]?.output) ||
+									JSON.stringify(teamResult, null, 2);
+							} else {
+								finalResultString = String(teamResult || 'No result generated');
+							}
+							// Store the raw result but prepare to send the parsed string
+							currentState.result = teamResult;
+							data.result.result = finalResultString;
 						} else if (eventName === 'task_error') {
 							currentState.status = 'FAILED';
 							currentState.error = data.error;
-						} else {
-							currentState.status = data.params?.status?.state || 'RUNNING';
+						} else if (data.params?.status?.state) {
+							currentState.status = data.params.status.state;
 						}
 						taskStates.set(taskId, currentState);
 					}
 
-					// 2. Forward Stream
-					const outgoingEvent = `event: ${eventName}\\ndata: ${dataContent}\\n\\n`;
+					// 2. Forward the (now modified) event string to our client
+					const outgoingEvent = `event: ${eventName}\\ndata: ${JSON.stringify(data)}\\n\\n`;
 					controller.enqueue(new TextEncoder().encode(outgoingEvent));
 				} catch (e) {
-					console.error('Error processing event JSON:', e, 'Data String:', dataContent);
+					console.error(
+						'Orchestrator: Error processing event JSON:',
+						e,
+						'Data String:',
+						dataContent
+					);
 				}
 			};
 
@@ -93,14 +118,8 @@ export async function POST({ request }) {
 				while (true) {
 					const { done, value } = await reader.read();
 					if (done) {
-						// The stream is finished. Process any complete events left in the buffer.
-						const finalParts = buffer.split('\\n\\n');
-						for (const part of finalParts) {
-							if (part.trim()) {
-								processEvent(part);
-							}
-						}
-						break; // Exit the loop
+						if (buffer.trim()) processEvent(buffer);
+						break;
 					}
 
 					buffer += decoder.decode(value, { stream: true });
