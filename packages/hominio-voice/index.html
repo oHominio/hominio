@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hominio Voice - Realtime TTS</title>
+    <style>
+      body {
+        font-family: sans-serif;
+        background-color: #121212;
+        color: #e0e0e0;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        min-height: 100vh;
+        margin: 0;
+      }
+      .container {
+        text-align: center;
+        background-color: #1e1e1e;
+        padding: 2rem;
+        border-radius: 8px;
+        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+        max-width: 600px;
+        width: 90%;
+      }
+      h1 {
+        color: #bb86fc;
+      }
+      textarea {
+        width: 80%;
+        min-height: 100px;
+        background-color: #333;
+        color: #e0e0e0;
+        border: 1px solid #444;
+        border-radius: 4px;
+        padding: 0.5rem;
+        margin-bottom: 1rem;
+      }
+      button {
+        background-color: #03dac6;
+        color: #121212;
+        border: none;
+        padding: 0.8rem 1.5rem;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 1rem;
+        transition: background-color 0.3s;
+        margin: 0.5rem;
+      }
+      button:hover {
+        background-color: #018786;
+      }
+      button:disabled {
+        background-color: #444;
+        cursor: not-allowed;
+      }
+      #status {
+        margin-top: 1rem;
+        font-style: italic;
+        color: #aaa;
+      }
+      #modelStatus {
+        margin-top: 1rem;
+        padding: 1rem;
+        background-color: #2a2a2a;
+        border-radius: 4px;
+        border-left: 4px solid #bb86fc;
+      }
+      .progress-bar {
+        width: 100%;
+        height: 20px;
+        background-color: #444;
+        border-radius: 10px;
+        overflow: hidden;
+        margin: 0.5rem 0;
+      }
+      .progress-fill {
+        height: 100%;
+        background-color: #03dac6;
+        transition: width 0.3s ease;
+      }
+      audio {
+        width: 100%;
+        margin: 1rem 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>Hominio Voice</h1>
+      <p>Real-time Text-to-Speech powered by the Kokoro Engine.</p>
+
+      <div id="modelStatus">
+        <h3>Model Status</h3>
+        <div id="modelMessage">Checking model status...</div>
+        <div class="progress-bar">
+          <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+        </div>
+        <div id="progressText">0%</div>
+      </div>
+
+      <textarea id="messageText">
+Hello, this is a test of the real-time audio streaming directly in the browser.</textarea
+      >
+      <br />
+      <button id="sendButton" onclick="sendMessage()" disabled>
+        Synthesize
+      </button>
+      <button id="checkStatusButton" onclick="checkModelStatus()">
+        Check Status
+      </button>
+
+      <!-- Audio element for playback -->
+      <audio id="audioPlayer" controls style="display: none"></audio>
+
+      <div id="status">Status: Disconnected</div>
+    </div>
+
+    <script>
+      const sendButton = document.getElementById("sendButton");
+      const messageText = document.getElementById("messageText");
+      const statusDiv = document.getElementById("status");
+      const modelMessage = document.getElementById("modelMessage");
+      const progressFill = document.getElementById("progressFill");
+      const progressText = document.getElementById("progressText");
+      const audioPlayer = document.getElementById("audioPlayer");
+
+      let websocket;
+      let statusWebSocket;
+      let audioChunks = [];
+      let isReceivingAudio = false;
+
+      function connectTTS() {
+        const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const wsUrl = `${proto}//${window.location.host}/ws/tts`;
+
+        statusDiv.textContent = "Status: Connecting to TTS...";
+        websocket = new WebSocket(wsUrl);
+
+        websocket.onopen = () => {
+          statusDiv.textContent = "Status: TTS Connected";
+        };
+
+        websocket.onmessage = (event) => {
+          if (typeof event.data === "string") {
+            try {
+              const data = JSON.parse(event.data);
+              if (data.type === "status") {
+                statusDiv.textContent = `Status: ${data.message}`;
+                return;
+              }
+            } catch (e) {
+              // Handle text messages
+              if (event.data === "END") {
+                statusDiv.textContent = "Status: Audio complete";
+                playAudioChunks();
+              } else if (event.data.startsWith("ERROR:")) {
+                statusDiv.textContent = `Status: ${event.data}`;
+              }
+            }
+          } else if (event.data instanceof Blob) {
+            // Handle audio data (WAV header + chunks)
+            if (!isReceivingAudio) {
+              isReceivingAudio = true;
+              audioChunks = [];
+              statusDiv.textContent = "Status: Receiving audio...";
+            }
+            audioChunks.push(event.data);
+          }
+        };
+
+        websocket.onclose = () => {
+          statusDiv.textContent = "Status: TTS Disconnected. Retrying in 3s...";
+          setTimeout(connectTTS, 3000);
+        };
+
+        websocket.onerror = (error) => {
+          console.error("TTS WebSocket Error:", error);
+          statusDiv.textContent = "Status: TTS Error";
+          websocket.close();
+        };
+      }
+
+      function connectModelStatus() {
+        const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const wsUrl = `${proto}//${window.location.host}/ws/model-status`;
+
+        statusWebSocket = new WebSocket(wsUrl);
+
+        statusWebSocket.onmessage = (event) => {
+          try {
+            const status = JSON.parse(event.data);
+            updateModelStatus(status);
+          } catch (e) {
+            console.error("Error parsing model status:", e);
+          }
+        };
+
+        statusWebSocket.onclose = () => {
+          setTimeout(connectModelStatus, 5000);
+        };
+      }
+
+      function updateModelStatus(status) {
+        modelMessage.textContent = status.message;
+        progressFill.style.width = `${status.progress}%`;
+        progressText.textContent = `${Math.round(status.progress)}%`;
+
+        // Enable/disable send button based on model readiness
+        sendButton.disabled = status.status !== "ready";
+
+        // Update progress bar color based on status
+        if (status.status === "ready") {
+          progressFill.style.backgroundColor = "#4caf50";
+        } else if (status.status === "error") {
+          progressFill.style.backgroundColor = "#f44336";
+        } else {
+          progressFill.style.backgroundColor = "#03dac6";
+        }
+      }
+
+      async function checkModelStatus() {
+        try {
+          const response = await fetch("/model-status");
+          const status = await response.json();
+          updateModelStatus(status);
+        } catch (error) {
+          console.error("Error checking model status:", error);
+          modelMessage.textContent = "Error checking model status";
+        }
+      }
+
+      function playAudioChunks() {
+        if (audioChunks.length === 0) {
+          statusDiv.textContent = "Status: No audio data received";
+          return;
+        }
+
+        try {
+          // Combine all audio chunks into a single blob
+          const audioBlob = new Blob(audioChunks, { type: "audio/wav" });
+          const audioUrl = URL.createObjectURL(audioBlob);
+
+          // Set up the audio player
+          audioPlayer.src = audioUrl;
+          audioPlayer.style.display = "block";
+
+          // Play the audio
+          audioPlayer
+            .play()
+            .then(() => {
+              statusDiv.textContent = "Status: Playing audio";
+            })
+            .catch((error) => {
+              console.error("Error playing audio:", error);
+              statusDiv.textContent = "Status: Audio playback error";
+            });
+
+          // Clean up
+          audioPlayer.onended = () => {
+            URL.revokeObjectURL(audioUrl);
+            audioPlayer.style.display = "none";
+            statusDiv.textContent = "Status: Playback complete";
+            isReceivingAudio = false;
+          };
+        } catch (error) {
+          console.error("Error creating audio blob:", error);
+          statusDiv.textContent = "Status: Error processing audio";
+        }
+      }
+
+      function sendMessage() {
+        if (websocket.readyState !== WebSocket.OPEN) {
+          statusDiv.textContent = "Status: Not connected.";
+          return;
+        }
+
+        const text = messageText.value;
+        if (!text.trim()) {
+          statusDiv.textContent = "Status: Please enter some text.";
+          return;
+        }
+
+        websocket.send(text);
+        statusDiv.textContent = "Status: Synthesizing...";
+        audioChunks = [];
+        isReceivingAudio = false;
+      }
+
+      // Initial connections
+      connectTTS();
+      connectModelStatus();
+      checkModelStatus();
+    </script>
+  </body>
+</html>
