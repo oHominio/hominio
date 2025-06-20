@@ -1,4 +1,4 @@
-import { researchAgent, writerAgent } from '$lib/team';
+import { createResearchAgent, createWriterAgent } from '$lib/team';
 import { Team, Task } from 'kaibanjs';
 import { SECRET_RED_PILL_API_KEY } from '$env/static/private';
 
@@ -27,6 +27,10 @@ export async function GET({ url }) {
 			};
 
 			try {
+				// 3. Create FRESH agent instances for this specific request
+				const researchAgent = createResearchAgent();
+				const writerAgent = createWriterAgent();
+
 				// 3. Create a NEW, stateless team for this specific request.
 				const researchTask = new Task({
 					title: 'Research Analysis',
@@ -42,8 +46,9 @@ export async function GET({ url }) {
 					expectedOutput: taskDetails.task.expectedOutput
 				});
 
+				// Create team with unique name to avoid conflicts
 				const requestTeam = new Team({
-					name: 'RequestWritingVibeTeam',
+					name: `RequestWritingVibeTeam_${id}`,
 					agents: [researchAgent, writerAgent],
 					tasks: [researchTask, writeTask],
 					env: {
@@ -51,10 +56,13 @@ export async function GET({ url }) {
 					}
 				});
 
+				console.log(`[WRITING] Created isolated team ${requestTeam.name} for request ${id}`);
+
 				// 4. Subscribe to the team's internal status updates
 				const unsubscribe = requestTeam.store.subscribe((state) => {
 					const lastLog = state.workflowLogs[state.workflowLogs.length - 1];
 					if (lastLog) {
+						console.log(`[WRITING] Team ${requestTeam.name} - ${lastLog.logDescription}`);
 						sendEvent('task_status_update', {
 							jsonrpc: '2.0',
 							method: 'taskStatusUpdate',
@@ -75,6 +83,7 @@ export async function GET({ url }) {
 				});
 
 				// 5. Start the workflow and handle the final result
+				console.log(`[WRITING] Starting workflow for team ${requestTeam.name}`);
 				const teamResult = await requestTeam.start(taskDetails.inputs);
 
 				// Fulfill the public contract for this Vibe.
@@ -120,10 +129,11 @@ This often happens if an agent gets stuck in a loop or cannot find a final answe
 					result: { status: 'FINISHED', result: structuredResult }
 				});
 
+				console.log(`[WRITING] Workflow completed successfully for team ${requestTeam.name}`);
 				unsubscribe();
 				controller.close();
 			} catch (e) {
-				console.error('Error during Vibe execution:', e);
+				console.error(`[WRITING] Error during Vibe execution for request ${id}:`, e.message);
 				sendEvent('task_error', {
 					jsonrpc: '2.0',
 					id: id,
@@ -138,7 +148,9 @@ This often happens if an agent gets stuck in a loop or cannot find a final answe
 		headers: {
 			'Content-Type': 'text/event-stream',
 			'Cache-Control': 'no-cache',
-			Connection: 'keep-alive'
+			Connection: 'keep-alive',
+			'Access-Control-Allow-Origin': '*',
+			'Access-Control-Allow-Headers': 'Cache-Control'
 		}
 	});
 }
