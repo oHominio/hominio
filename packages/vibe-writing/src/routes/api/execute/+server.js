@@ -15,13 +15,14 @@ export async function GET({ url }) {
 	const stream = new ReadableStream({
 		async start(controller) {
 			const sendEvent = (eventName, data) => {
-				const jsonData = JSON.stringify(data);
-				// SSE spec requires newlines to be sent as separate `data:` lines.
-				const dataString = jsonData
-					.split('\\n')
-					.map((line) => `data: ${line}`)
-					.join('\\n');
-				const message = `event: ${eventName}\\n${dataString}\\n\\n`;
+				// Send clean JSON object with event type included
+				const eventData = {
+					type: eventName,
+					timestamp: new Date().toISOString(),
+					...data
+				};
+				const message = `data: ${JSON.stringify(eventData)}\n\n`;
+				console.log(`[WRITING] Sending JSON event: ${eventName}`);
 				controller.enqueue(new TextEncoder().encode(message));
 			};
 

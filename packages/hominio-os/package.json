@@ -28,7 +28,8 @@
 		"prettier-plugin-tailwindcss": "^0.6.11",
 		"svelte": "catalog:",
 		"tailwindcss": "^4.0.0",
-		"vite": "catalog:"
+		"vite": "catalog:",
+		"vite-plugin-devtools-json": "^0.2.0"
 	},
 	"dependencies": {
 		"@langchain/community": "^0.3.46",
