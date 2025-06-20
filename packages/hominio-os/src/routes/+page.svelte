@@ -7,6 +7,8 @@
 	let expectedOutput = 'A 3-paragraph blog post about the topic.';
 	let intents = [];
 	let selectedIntentId = null;
+	let logContentElement;
+	let isNearBottom = true;
 
 	marked.setOptions({
 		gfm: true,
@@ -18,6 +20,29 @@
 	}
 
 	$: selectedIntent = intents.find((i) => i.id === selectedIntentId);
+
+	// Smart auto-scroll: only scroll to bottom if user is already near the bottom
+	$: if (
+		selectedIntent &&
+		logContentElement &&
+		(selectedIntent.activityLog || selectedIntent.rawData) &&
+		isNearBottom
+	) {
+		setTimeout(() => {
+			if (logContentElement && isNearBottom) {
+				logContentElement.scrollTop = logContentElement.scrollHeight;
+			}
+		}, 10);
+	}
+
+	// Check if user is near bottom when they scroll
+	function handleLogScroll() {
+		if (logContentElement) {
+			const { scrollTop, scrollHeight, clientHeight } = logContentElement;
+			const threshold = 100; // pixels from bottom
+			isNearBottom = scrollTop + clientHeight >= scrollHeight - threshold;
+		}
+	}
 
 	// When intents list changes, update selection
 	$: {
@@ -220,257 +245,848 @@
 	});
 </script>
 
-<div class="flex h-screen bg-gray-900 font-sans text-gray-100">
-	<!-- Left Sidebar for Controls & Intent List -->
-	<div class="w-1/4 flex-shrink-0 space-y-6 overflow-y-auto bg-gray-800 p-6">
-		<header>
-			<h1 class="text-3xl font-bold text-cyan-400">Hominio OS</h1>
-			<p class="mt-1 text-gray-400">The orchestrator for your AI agent teams.</p>
-		</header>
+<div class="app-container">
+	<!-- Header -->
+	<header class="app-header">
+		<div class="logo-section">
+			<div class="logo-icon"></div>
+			<div class="logo-text">
+				<h1>Hominio OS</h1>
+				<p>Your AI agent orchestration platform</p>
+			</div>
+		</div>
+	</header>
 
-		<div>
-			<h2 class="mb-4 text-xl font-semibold text-cyan-300">Start New Intent</h2>
-			<div class="space-y-4">
-				<div>
-					<label for="description" class="mb-1 block text-sm text-gray-400">Task Description</label>
+	<div class="main-layout">
+		<!-- Left Sidebar for Controls & Intent List -->
+		<aside class="control-panel">
+			<div class="panel-section">
+				<h2 class="section-title">Start New Intent</h2>
+				<div class="form-group">
+					<label for="description">Task Description</label>
 					<textarea
 						id="description"
 						bind:value={taskDescription}
 						rows="4"
-						class="w-full rounded-md border border-gray-600 bg-gray-700 p-2 text-sm focus:ring-2 focus:ring-cyan-500 focus:outline-none"
+						class="form-textarea"
+						placeholder="Describe what you want to accomplish..."
 					></textarea>
 				</div>
-				<div>
-					<label for="expectedOutput" class="mb-1 block text-sm text-gray-400"
-						>Expected Output</label
-					>
+				<div class="form-group">
+					<label for="expectedOutput">Expected Output</label>
 					<textarea
 						id="expectedOutput"
 						bind:value={expectedOutput}
 						rows="3"
-						class="w-full rounded-md border border-gray-600 bg-gray-700 p-2 text-sm focus:ring-2 focus:ring-cyan-500 focus:outline-none"
+						class="form-textarea"
+						placeholder="What format or type of result do you expect?"
 					></textarea>
 				</div>
-				<button
-					on:click={startVibe}
-					class="w-full rounded-md bg-cyan-600 px-4 py-2 font-bold text-white transition-colors hover:bg-cyan-700 disabled:bg-gray-600"
-				>
-					Execute Writing Vibe
-				</button>
+				<button on:click={startVibe} class="btn btn-primary"> Execute Writing Vibe </button>
 			</div>
-		</div>
 
-		<div class="border-t border-gray-700 pt-4">
-			<h3 class="mb-2 font-semibold text-cyan-300">Intents</h3>
-			<div class="flex-grow space-y-2 overflow-y-auto">
-				{#if intents.length === 0}
-					<div class="pt-4 text-center text-sm text-gray-500">No intents yet.</div>
-				{/if}
-				{#each intents as intent (intent.id)}
-					<div
-						role="button"
-						tabindex="0"
-						class="cursor-pointer rounded-md border-l-4 p-3 {selectedIntentId === intent.id
-							? 'border-cyan-500 bg-cyan-900/50'
-							: 'border-gray-600 bg-gray-700/50 hover:bg-gray-700'}"
-						on:click={() => selectIntent(intent.id)}
-						on:keypress={() => selectIntent(intent.id)}
-					>
-						<div class="flex items-center justify-between">
-							<p class="flex-1 truncate text-sm font-semibold">{intent.taskDescription}</p>
+			<div class="panel-section">
+				<h3 class="section-title">Active Intents</h3>
+				<div class="intents-list">
+					{#if intents.length === 0}
+						<div class="empty-state">
+							<p>No intents yet. Start one above!</p>
+						</div>
+					{/if}
+					{#each intents as intent (intent.id)}
+						<div
+							class="intent-card {selectedIntentId === intent.id ? 'selected' : ''}"
+							role="button"
+							tabindex="0"
+							on:click={() => selectIntent(intent.id)}
+							on:keypress={() => selectIntent(intent.id)}
+						>
+							<div class="intent-header">
+								<p class="intent-title">{intent.taskDescription}</p>
 
-							{#if intent.status === 'RUNNING'}
-								<button
-									on:click|stopPropagation={() => stopVibe(intent.id)}
-									class="btn btn-xs btn-ghost btn-circle"
-									title="Stop Intent"
-									aria-label="Stop Intent"
-								>
-									<svg
-										xmlns="http://www.w3.org/2000/svg"
-										class="h-4 w-4"
-										viewBox="0 0 20 20"
-										fill="currentColor"
+								{#if intent.status === 'RUNNING'}
+									<button
+										on:click|stopPropagation={() => stopVibe(intent.id)}
+										class="stop-btn"
+										title="Stop Intent"
+										aria-label="Stop Intent"
 									>
-										<path
-											fill-rule="evenodd"
-											d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 7a1 1 0 00-1 1v4a1 1 0 102 0V8a1 1 0 00-1-1zm4 0a1 1 0 00-1 1v4a1 1 0 102 0V8a1 1 0 00-1-1z"
-											clip-rule="evenodd"
-										/>
-									</svg>
-								</button>
-							{/if}
-						</div>
-						<div class="mt-1 flex items-center justify-between">
-							{#if intent.status === 'RUNNING'}
-								<div class="badge badge-info badge-outline badge-xs">Running</div>
-							{:else if intent.status === 'DONE'}
-								<div class="badge badge-success badge-outline badge-xs">Done</div>
-							{:else if intent.status === 'ERROR'}
-								<div class="badge badge-error badge-outline badge-xs">Error</div>
-							{:else if intent.status === 'STOPPED'}
-								<div class="badge badge-warning badge-outline badge-xs">Stopped</div>
-							{/if}
-							<div class="text-right text-xs text-gray-400">
-								{Math.floor(intent.timer / 60)}m {intent.timer % 60}s
+										Stop
+									</button>
+								{/if}
 							</div>
-						</div>
-					</div>
-				{/each}
-			</div>
-		</div>
-	</div>
 
-	<!-- Main Content: Task Board & Results -->
-	<main class="w-1/2 flex-grow space-y-4 overflow-y-auto p-6">
-		{#if selectedIntent}
-			<div class="flex items-center justify-between">
-				<h2 class="truncate text-2xl font-bold text-cyan-400">
-					Intent: {selectedIntent.taskDescription}
-				</h2>
-			</div>
-
-			<div class="h-full rounded-lg bg-gray-800 p-6 shadow-lg">
-				{#if selectedIntent.finalResult}
-					<div>
-						<h3 class="text-xl font-bold text-cyan-300">{selectedIntent.finalResult.title}</h3>
-						<div class="prose prose-invert mt-4 max-w-none">
-							{@html marked(selectedIntent.finalResult.body || '')}
-						</div>
-					</div>
-				{:else if selectedIntent.error}
-					<div class="rounded-lg border border-red-700 bg-red-900/50 p-4">
-						<h4 class="mb-1 font-semibold text-red-300">Error</h4>
-						<p class="text-sm text-red-200">{@html marked(selectedIntent.error || '')}</p>
-					</div>
-				{:else if selectedIntent.tasks.length > 0}
-					<div>
-						<h3 class="mb-4 text-lg font-semibold text-cyan-300">Task Board</h3>
-						<div class="grid h-96 grid-cols-4 gap-4">
-							<!-- TODO Column -->
-							<div class="rounded-lg border-t-4 border-yellow-500 bg-gray-700/50 p-4">
-								<h4 class="mb-3 text-center font-semibold text-yellow-400">📋 To Do</h4>
-								<div class="space-y-2">
-									{#each selectedIntent.tasks.filter((t) => t.status === 'TODO') as task}
-										<div class="rounded-md border-l-2 border-yellow-500 bg-gray-800 p-3 shadow-sm">
-											<p class="text-sm font-medium text-gray-200">{task.name}</p>
-											<div class="mt-1 flex items-center justify-between">
-												<span
-													class="inline-block rounded bg-yellow-500/20 px-2 py-1 text-xs text-yellow-400"
-												>
-													TODO
-												</span>
-											</div>
-										</div>
-									{/each}
+							<div class="intent-footer">
+								<div class="status-badge status-{intent.status.toLowerCase()}">
+									{#if intent.status === 'RUNNING'}
+										<span class="loading-dot"></span> Running
+									{:else if intent.status === 'DONE'}
+										Complete
+									{:else if intent.status === 'ERROR'}
+										Error
+									{:else if intent.status === 'STOPPED'}
+										Stopped
+									{/if}
 								</div>
-							</div>
-
-							<!-- DOING Column -->
-							<div class="rounded-lg border-t-4 border-blue-500 bg-gray-700/50 p-4">
-								<h4 class="mb-3 text-center font-semibold text-blue-400">⚡ In Progress</h4>
-								<div class="space-y-2">
-									{#each selectedIntent.tasks.filter((t) => t.status === 'DOING') as task}
-										<div class="rounded-md border-l-2 border-blue-500 bg-gray-800 p-3 shadow-sm">
-											<p class="text-sm font-medium text-gray-200">{task.name}</p>
-											<div class="mt-1 flex items-center justify-between">
-												<span
-													class="inline-block rounded bg-blue-500/20 px-2 py-1 text-xs text-blue-400"
-												>
-													DOING
-												</span>
-												<div class="loading loading-dots loading-xs text-blue-400"></div>
-											</div>
-										</div>
-									{/each}
-								</div>
-							</div>
-
-							<!-- DONE Column -->
-							<div class="rounded-lg border-t-4 border-green-500 bg-gray-700/50 p-4">
-								<h4 class="mb-3 text-center font-semibold text-green-400">✅ Done</h4>
-								<div class="space-y-2">
-									{#each selectedIntent.tasks.filter((t) => t.status === 'DONE') as task}
-										<div class="rounded-md border-l-2 border-green-500 bg-gray-800 p-3 shadow-sm">
-											<p class="text-sm font-medium text-gray-200">{task.name}</p>
-											<div class="mt-1">
-												<span
-													class="inline-block rounded bg-green-500/20 px-2 py-1 text-xs text-green-400"
-												>
-													DONE
-												</span>
-											</div>
-										</div>
-									{/each}
-								</div>
-							</div>
-
-							<!-- BLOCKED Column -->
-							<div class="rounded-lg border-t-4 border-red-500 bg-gray-700/50 p-4">
-								<h4 class="mb-3 text-center font-semibold text-red-400">🚫 Blocked</h4>
-								<div class="space-y-2">
-									{#each selectedIntent.tasks.filter((t) => t.status === 'BLOCKED' || t.status === 'ERROR') as task}
-										<div class="rounded-md border-l-2 border-red-500 bg-gray-800 p-3 shadow-sm">
-											<p class="text-sm font-medium text-gray-200">{task.name}</p>
-											<div class="mt-1">
-												<span
-													class="inline-block rounded bg-red-500/20 px-2 py-1 text-xs text-red-400"
-												>
-													{task.status}
-												</span>
-											</div>
-										</div>
-									{/each}
+								<div class="timer">
+									{Math.floor(intent.timer / 60)}:{(intent.timer % 60).toString().padStart(2, '0')}
 								</div>
 							</div>
 						</div>
-					</div>
-				{:else}
-					<div class="flex h-full flex-col items-center justify-center p-8 text-center">
-						<span class="loading loading-dots loading-lg text-cyan-500"></span>
-						<p class="mt-4 text-gray-400">Awaiting first update from agent...</p>
-					</div>
-				{/if}
-			</div>
-		{:else}
-			<div class="flex h-full items-center justify-center rounded-lg bg-gray-800/50">
-				<div class="text-center">
-					<h2 class="text-2xl font-bold text-cyan-400">Welcome to Hominio OS</h2>
-					<p class="mt-2 text-gray-400">
-						Start a new intent from the control panel on the left to begin.
-					</p>
+					{/each}
 				</div>
 			</div>
-		{/if}
-	</main>
+		</aside>
 
-	<!-- Right Sidebar for Activity Log -->
-	<aside class="flex h-screen w-1/3 flex-col bg-gray-800/50 p-6">
-		<h2 class="mb-4 flex-shrink-0 text-xl font-bold text-cyan-300">Activity Log</h2>
-		<div class="flex-grow overflow-y-auto rounded-lg bg-gray-900 p-4">
+		<!-- Main Content: Task Board & Results -->
+		<main class="main-content">
+			{#if selectedIntent}
+				<div class="content-header">
+					<h2 class="intent-name">{selectedIntent.taskDescription}</h2>
+				</div>
+
+				<div class="content-body">
+					{#if selectedIntent.finalResult}
+						<div class="result-section">
+							<h3 class="result-title">{selectedIntent.finalResult.title}</h3>
+							<div class="result-content">
+								{@html marked(selectedIntent.finalResult.body || '')}
+							</div>
+						</div>
+					{:else if selectedIntent.error}
+						<div class="error-section">
+							<h4>Error Occurred</h4>
+							<div class="error-content">
+								{@html marked(selectedIntent.error || '')}
+							</div>
+						</div>
+					{:else if selectedIntent.tasks.length > 0}
+						<div class="task-board">
+							<h3 class="board-title">Task Progress Board</h3>
+							<div class="board-columns">
+								<!-- TODO Column -->
+								<div class="board-column todo-column">
+									<div class="column-header">
+										<h4>To Do</h4>
+									</div>
+									<div class="tasks-container">
+										{#each selectedIntent.tasks.filter((t) => t.status === 'TODO') as task}
+											<div class="task-card todo-task">
+												<p class="task-name">{task.name}</p>
+												<div class="task-status">TODO</div>
+											</div>
+										{/each}
+									</div>
+								</div>
+
+								<!-- DOING Column -->
+								<div class="board-column doing-column">
+									<div class="column-header">
+										<h4>In Progress</h4>
+									</div>
+									<div class="tasks-container">
+										{#each selectedIntent.tasks.filter((t) => t.status === 'DOING') as task}
+											<div class="task-card doing-task">
+												<p class="task-name">{task.name}</p>
+												<div class="task-status">
+													<span class="loading-dot"></span> DOING
+												</div>
+											</div>
+										{/each}
+									</div>
+								</div>
+
+								<!-- DONE Column -->
+								<div class="board-column done-column">
+									<div class="column-header">
+										<h4>Complete</h4>
+									</div>
+									<div class="tasks-container">
+										{#each selectedIntent.tasks.filter((t) => t.status === 'DONE') as task}
+											<div class="task-card done-task">
+												<p class="task-name">{task.name}</p>
+												<div class="task-status">DONE</div>
+											</div>
+										{/each}
+									</div>
+								</div>
+
+								<!-- BLOCKED Column -->
+								<div class="board-column blocked-column">
+									<div class="column-header">
+										<h4>Blocked</h4>
+									</div>
+									<div class="tasks-container">
+										{#each selectedIntent.tasks.filter((t) => t.status === 'BLOCKED' || t.status === 'ERROR') as task}
+											<div class="task-card blocked-task">
+												<p class="task-name">{task.name}</p>
+												<div class="task-status">{task.status}</div>
+											</div>
+										{/each}
+									</div>
+								</div>
+							</div>
+						</div>
+					{:else}
+						<div class="loading-section">
+							<div class="loading-animation">
+								<div class="loading-dot"></div>
+								<div class="loading-dot"></div>
+								<div class="loading-dot"></div>
+							</div>
+							<p>Initializing AI agents...</p>
+						</div>
+					{/if}
+				</div>
+			{:else}
+				<div class="welcome-section">
+					<div class="welcome-content">
+						<h2>Welcome to Hominio OS</h2>
+						<p>Your AI-powered orchestration platform for complex workflows</p>
+						<p class="welcome-subtitle">Start a new intent from the control panel to begin</p>
+					</div>
+				</div>
+			{/if}
+		</main>
+
+		<!-- Right Sidebar for Activity Log -->
+		<aside class="activity-panel">
+			<h2 class="panel-title">Activity Log</h2>
 			{#if selectedIntent}
 				{#if selectedIntent.activityLog.trim()}
-					<div class="space-y-2">
-						<h4 class="text-sm font-semibold text-cyan-400">Activity Log:</h4>
-						<pre
-							class="font-mono text-xs whitespace-pre-wrap text-gray-300">{selectedIntent.activityLog}</pre>
-					</div>
+					<h4 class="log-title">System Activity</h4>
+					<pre
+						class="log-content"
+						bind:this={logContentElement}
+						on:scroll={handleLogScroll}>{selectedIntent.activityLog}</pre>
 				{:else if selectedIntent.rawData}
-					<div class="space-y-2">
-						<h4 class="text-sm font-semibold text-yellow-400">Raw SSE Data (Debug Mode):</h4>
-						<pre
-							class="rounded bg-gray-800 p-2 font-mono text-xs whitespace-pre-wrap text-gray-300">{selectedIntent.rawData}</pre>
-					</div>
+					<h4 class="debug-title">Debug Data</h4>
+					<pre
+						class="debug-content"
+						bind:this={logContentElement}
+						on:scroll={handleLogScroll}>{selectedIntent.rawData}</pre>
 				{:else}
-					<div class="flex h-full items-center justify-center">
-						<p class="text-sm text-gray-500">No activity log yet. Waiting for updates...</p>
+					<div class="empty-log">
+						<p>Waiting for activity...</p>
 					</div>
 				{/if}
 			{:else}
-				<div class="flex h-full items-center justify-center">
-					<p class="text-sm text-gray-500">Select an intent to view its log.</p>
+				<div class="empty-log">
+					<p>Select an intent to view its activity log</p>
 				</div>
 			{/if}
-		</div>
-	</aside>
+		</aside>
+	</div>
 </div>
+
+<style>
+	.app-container {
+		height: 100vh;
+		max-height: 100vh;
+		min-height: 100vh;
+		display: flex;
+		flex-direction: column;
+		font-family:
+			-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+		overflow: hidden;
+	}
+
+	.app-header {
+		background: rgba(255, 255, 255, 0.7);
+		backdrop-filter: blur(10px);
+		border-bottom: 1px solid rgba(30, 58, 95, 0.1);
+		padding: 1rem 2rem;
+	}
+
+	.logo-section {
+		display: flex;
+		align-items: center;
+		gap: 1rem;
+	}
+
+	.logo-icon {
+		width: 40px;
+		height: 40px;
+		background: #1e3a5f;
+		border-radius: 10px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		position: relative;
+	}
+
+	.logo-icon::before {
+		content: '';
+		width: 12px;
+		height: 12px;
+		background: #f5f1e8;
+		border-radius: 50%;
+		position: absolute;
+		top: 8px;
+	}
+
+	.logo-icon::after {
+		content: '';
+		width: 20px;
+		height: 12px;
+		background: #f5f1e8;
+		border-radius: 10px 10px 0 0;
+		position: absolute;
+		bottom: 5px;
+	}
+
+	.logo-text h1 {
+		margin: 0;
+		font-size: 1.75rem;
+		font-weight: 700;
+		color: #1e3a5f;
+		letter-spacing: -0.02em;
+	}
+
+	.logo-text p {
+		margin: 0;
+		color: #6b7280;
+		font-size: 0.9rem;
+	}
+
+	.main-layout {
+		flex: 1;
+		display: grid;
+		grid-template-columns: 320px 1fr 300px;
+		gap: 0;
+		height: calc(100vh - 90px);
+		overflow: hidden;
+		min-width: 0;
+		width: 100vw;
+	}
+
+	.control-panel,
+	.activity-panel {
+		background: rgba(255, 255, 255, 0.6);
+		backdrop-filter: blur(20px);
+		border-right: 1px solid rgba(30, 58, 95, 0.1);
+		padding: 1.5rem;
+		overflow-y: auto;
+		overflow-x: hidden;
+		display: flex;
+		flex-direction: column;
+		height: 100%;
+		min-width: 0;
+		max-width: 100%;
+	}
+
+	.activity-panel {
+		border-right: none;
+		border-left: 1px solid rgba(30, 58, 95, 0.1);
+		padding: 1rem;
+		width: 300px;
+		max-width: 300px;
+		min-width: 300px;
+		height: 100%;
+		max-height: 100%;
+		min-height: 0;
+	}
+
+	.panel-section {
+		margin-bottom: 2rem;
+	}
+
+	.section-title,
+	.panel-title {
+		color: #1e3a5f;
+		font-size: 1.1rem;
+		font-weight: 600;
+		margin-bottom: 1rem;
+	}
+
+	.form-group {
+		margin-bottom: 1rem;
+	}
+
+	.form-group label {
+		display: block;
+		margin-bottom: 0.5rem;
+		color: #6b7280;
+		font-size: 0.9rem;
+		font-weight: 500;
+	}
+
+	.form-textarea {
+		width: 100%;
+		padding: 0.75rem;
+		border: 2px solid rgba(30, 58, 95, 0.1);
+		border-radius: 12px;
+		background: rgba(255, 255, 255, 0.9);
+		color: #1e3a5f;
+		font-size: 0.9rem;
+		resize: vertical;
+		transition: all 0.3s ease;
+		font-family: inherit;
+	}
+
+	.form-textarea:focus {
+		outline: none;
+		border-color: #7ed4ad;
+		box-shadow: 0 0 0 3px rgba(126, 212, 173, 0.2);
+	}
+
+	.btn {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 0.5rem;
+		padding: 0.875rem 1.5rem;
+		border: none;
+		border-radius: 50px;
+		font-size: 0.9rem;
+		font-weight: 600;
+		cursor: pointer;
+		transition: all 0.3s ease;
+		font-family: inherit;
+		width: 100%;
+	}
+
+	.btn-primary {
+		background: #1e3a5f;
+		color: white;
+	}
+
+	.btn-primary:hover {
+		background: #2a4a6b;
+		transform: translateY(-2px);
+		box-shadow: 0 10px 20px rgba(30, 58, 95, 0.2);
+	}
+
+	.intents-list {
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
+	}
+
+	.empty-state {
+		text-align: center;
+		padding: 2rem 0;
+		color: #6b7280;
+		font-size: 0.9rem;
+	}
+
+	.intent-card {
+		background: rgba(255, 255, 255, 0.8);
+		border: 2px solid rgba(30, 58, 95, 0.1);
+		border-radius: 16px;
+		padding: 1rem;
+		cursor: pointer;
+		transition: all 0.3s ease;
+	}
+
+	.intent-card:hover {
+		border-color: #7ed4ad;
+		transform: translateY(-2px);
+		box-shadow: 0 8px 16px rgba(30, 58, 95, 0.1);
+	}
+
+	.intent-card.selected {
+		border-color: #7ed4ad;
+		background: rgba(126, 212, 173, 0.1);
+		box-shadow: 0 8px 16px rgba(126, 212, 173, 0.2);
+	}
+
+	.intent-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: flex-start;
+		margin-bottom: 0.75rem;
+	}
+
+	.intent-title {
+		margin: 0;
+		font-size: 0.9rem;
+		font-weight: 600;
+		color: #1e3a5f;
+		line-height: 1.3;
+		flex: 1;
+	}
+
+	.stop-btn {
+		background: none;
+		border: none;
+		font-size: 1.2rem;
+		cursor: pointer;
+		padding: 0;
+		margin-left: 0.5rem;
+		opacity: 0.7;
+		transition: opacity 0.3s ease;
+	}
+
+	.stop-btn:hover {
+		opacity: 1;
+	}
+
+	.intent-footer {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+	}
+
+	.status-badge {
+		display: flex;
+		align-items: center;
+		gap: 0.25rem;
+		padding: 0.25rem 0.75rem;
+		border-radius: 12px;
+		font-size: 0.75rem;
+		font-weight: 500;
+	}
+
+	.status-running {
+		background: rgba(59, 130, 246, 0.2);
+		color: #1e40af;
+	}
+
+	.status-done {
+		background: rgba(34, 197, 94, 0.2);
+		color: #15803d;
+	}
+
+	.status-error {
+		background: rgba(239, 68, 68, 0.2);
+		color: #dc2626;
+	}
+
+	.status-stopped {
+		background: rgba(156, 163, 175, 0.2);
+		color: #6b7280;
+	}
+
+	.timer {
+		font-size: 0.75rem;
+		color: #6b7280;
+		font-mono: true;
+	}
+
+	.main-content {
+		background: rgba(255, 255, 255, 0.4);
+		padding: 2rem;
+		overflow-y: auto;
+		overflow-x: hidden;
+		display: flex;
+		flex-direction: column;
+		height: 100%;
+		max-height: 100%;
+		min-height: 0;
+	}
+
+	.content-header {
+		margin-bottom: 2rem;
+	}
+
+	.intent-name {
+		margin: 0;
+		font-size: 1.5rem;
+		font-weight: 700;
+		color: #1e3a5f;
+	}
+
+	.content-body {
+		flex: 1;
+		background: rgba(255, 255, 255, 0.8);
+		backdrop-filter: blur(20px);
+		border-radius: 24px;
+		padding: 2rem;
+		box-shadow: 0 20px 40px rgba(30, 58, 95, 0.1);
+		border: 1px solid rgba(255, 255, 255, 0.5);
+	}
+
+	.result-section {
+		max-width: none;
+	}
+
+	.result-title {
+		color: #1e3a5f;
+		font-size: 1.5rem;
+		font-weight: 600;
+		margin-bottom: 1.5rem;
+	}
+
+	.result-content {
+		color: #1e3a5f;
+		line-height: 1.6;
+	}
+
+	.result-content :global(h1),
+	.result-content :global(h2),
+	.result-content :global(h3) {
+		color: #1e3a5f;
+		margin-top: 1.5rem;
+		margin-bottom: 0.75rem;
+	}
+
+	.result-content :global(p) {
+		margin-bottom: 1rem;
+	}
+
+	.error-section {
+		background: rgba(239, 68, 68, 0.1);
+		border: 2px solid rgba(239, 68, 68, 0.2);
+		border-radius: 16px;
+		padding: 1.5rem;
+	}
+
+	.error-section h4 {
+		color: #dc2626;
+		margin-bottom: 1rem;
+	}
+
+	.error-content {
+		color: #7f1d1d;
+		line-height: 1.5;
+	}
+
+	.task-board {
+		height: 100%;
+	}
+
+	.board-title {
+		color: #1e3a5f;
+		font-size: 1.25rem;
+		font-weight: 600;
+		margin-bottom: 1.5rem;
+	}
+
+	.board-columns {
+		display: grid;
+		grid-template-columns: repeat(4, 1fr);
+		gap: 1.5rem;
+		height: calc(100% - 4rem);
+	}
+
+	.board-column {
+		background: rgba(255, 255, 255, 0.6);
+		border-radius: 16px;
+		padding: 1rem;
+		display: flex;
+		flex-direction: column;
+	}
+
+	.column-header {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		margin-bottom: 1rem;
+		padding-bottom: 0.75rem;
+		border-bottom: 2px solid rgba(30, 58, 95, 0.1);
+	}
+
+	.column-icon {
+		font-size: 1.2rem;
+	}
+
+	.column-header h4 {
+		margin: 0;
+		font-size: 0.9rem;
+		font-weight: 600;
+		color: #1e3a5f;
+	}
+
+	.tasks-container {
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
+		overflow-y: auto;
+	}
+
+	.task-card {
+		background: rgba(255, 255, 255, 0.9);
+		border-radius: 12px;
+		padding: 1rem;
+		border-left: 4px solid;
+		box-shadow: 0 4px 8px rgba(30, 58, 95, 0.1);
+	}
+
+	.todo-task {
+		border-left-color: #f59e0b;
+	}
+
+	.doing-task {
+		border-left-color: #3b82f6;
+	}
+
+	.done-task {
+		border-left-color: #10b981;
+	}
+
+	.blocked-task {
+		border-left-color: #ef4444;
+	}
+
+	.task-name {
+		margin: 0 0 0.75rem 0;
+		font-size: 0.85rem;
+		font-weight: 500;
+		color: #1e3a5f;
+		line-height: 1.3;
+	}
+
+	.task-status {
+		display: flex;
+		align-items: center;
+		gap: 0.25rem;
+		font-size: 0.75rem;
+		font-weight: 600;
+		color: #6b7280;
+	}
+
+	.loading-section {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		justify-content: center;
+		height: 100%;
+		color: #6b7280;
+	}
+
+	.loading-animation {
+		display: flex;
+		gap: 0.5rem;
+		margin-bottom: 1rem;
+	}
+
+	.loading-dot {
+		width: 8px;
+		height: 8px;
+		background: #7ed4ad;
+		border-radius: 50%;
+		animation: loading-pulse 1.5s ease-in-out infinite;
+	}
+
+	.loading-dot:nth-child(2) {
+		animation-delay: 0.2s;
+	}
+
+	.loading-dot:nth-child(3) {
+		animation-delay: 0.4s;
+	}
+
+	@keyframes loading-pulse {
+		0%,
+		80%,
+		100% {
+			transform: scale(0.8);
+			opacity: 0.5;
+		}
+		40% {
+			transform: scale(1);
+			opacity: 1;
+		}
+	}
+
+	.welcome-section {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		height: 100%;
+		text-align: center;
+	}
+
+	.welcome-content h2 {
+		margin: 0 0 0.5rem 0;
+		font-size: 2rem;
+		font-weight: 700;
+		color: #1e3a5f;
+	}
+
+	.welcome-content p {
+		margin: 0;
+		color: #6b7280;
+		font-size: 1.1rem;
+	}
+
+	.welcome-icon {
+		font-size: 4rem;
+		margin: 2rem 0;
+	}
+
+	.welcome-subtitle {
+		font-size: 0.9rem !important;
+		color: #9ca3af !important;
+	}
+
+	.log-title,
+	.debug-title {
+		color: #1e3a5f;
+		font-size: 0.9rem;
+		font-weight: 600;
+		margin-bottom: 1rem;
+	}
+
+	.debug-title {
+		color: #f59e0b;
+	}
+
+	.log-content,
+	.debug-content {
+		font-family:
+			'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+		font-size: 0.75rem;
+		line-height: 1.4;
+		color: #1e3a5f;
+		white-space: pre-wrap;
+		word-wrap: break-word;
+		word-break: break-all;
+		background: rgba(30, 58, 95, 0.02);
+		padding: 0.5rem;
+		border-radius: 6px;
+		margin: 0;
+		flex: 1;
+		overflow-y: auto;
+		overflow-x: hidden;
+		max-height: 100%;
+		min-height: 0;
+	}
+
+	.debug-content {
+		background: rgba(245, 158, 11, 0.02);
+		color: #92400e;
+	}
+
+	.empty-log {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		flex: 1;
+		color: #9ca3af;
+		font-size: 0.9rem;
+		text-align: center;
+		padding: 2rem 0;
+	}
+
+	@media (max-width: 1200px) {
+		.main-layout {
+			grid-template-columns: 280px 1fr 280px;
+		}
+
+		.control-panel,
+		.activity-panel {
+			padding: 1.5rem;
+		}
+	}
+
+	@media (max-width: 768px) {
+		.main-layout {
+			grid-template-columns: 1fr;
+			grid-template-rows: auto 1fr auto;
+		}
+
+		.control-panel,
+		.activity-panel {
+			height: auto;
+			max-height: 300px;
+		}
+
+		.board-columns {
+			grid-template-columns: 1fr 1fr;
+			gap: 1rem;
+		}
+	}
+</style>
