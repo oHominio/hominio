@@ -1,5 +1,8 @@
 fastapi
 uvicorn[standard]
 websockets
+RealtimeTTS[kokoro]
+RealtimeSTT
+scipy
 numpy
-realtimetts[kokoro] 
+python-multipart 

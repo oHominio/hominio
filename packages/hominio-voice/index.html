@@ -85,25 +85,36 @@
       .main-container {
         flex: 1;
         display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
+        gap: 2rem;
         padding: 2rem;
-        max-width: 800px;
+        max-width: 1400px;
         margin: 0 auto;
         width: 100%;
       }
 
-      .voice-interface {
+      .stt-interface {
+        flex: 1;
         background: rgba(255, 255, 255, 0.8);
         backdrop-filter: blur(20px);
         border-radius: 24px;
-        padding: 3rem;
+        padding: 2rem;
+        box-shadow: 0 20px 40px rgba(30, 58, 95, 0.1);
+        border: 1px solid rgba(255, 255, 255, 0.5);
+        display: flex;
+        flex-direction: column;
+      }
+
+      .tts-interface {
+        flex: 1;
+        background: rgba(255, 255, 255, 0.8);
+        backdrop-filter: blur(20px);
+        border-radius: 24px;
+        padding: 2rem;
         box-shadow: 0 20px 40px rgba(30, 58, 95, 0.1);
         text-align: center;
-        width: 100%;
-        max-width: 500px;
         border: 1px solid rgba(255, 255, 255, 0.5);
+        display: flex;
+        flex-direction: column;
       }
 
       .voice-avatar {
@@ -227,6 +238,21 @@
         cursor: not-allowed;
       }
 
+      .btn.recording {
+        animation: pulse-record 1.5s infinite;
+        transform: scale(1.05);
+      }
+
+      @keyframes pulse-record {
+        0%,
+        100% {
+          box-shadow: 0 0 20px rgba(239, 68, 68, 0.5);
+        }
+        50% {
+          box-shadow: 0 0 30px rgba(239, 68, 68, 0.8);
+        }
+      }
+
       .model-status {
         background: rgba(255, 255, 255, 0.6);
         border-radius: 16px;
@@ -345,6 +371,84 @@
         }
       }
 
+      .interface-title {
+        font-size: 1.5rem;
+        font-weight: 600;
+        margin-bottom: 1rem;
+        color: #2c3e50;
+        text-align: center;
+      }
+
+      .transcript-display {
+        flex: 1;
+        background: rgba(248, 249, 250, 0.8);
+        border-radius: 16px;
+        padding: 1.5rem;
+        margin: 1rem 0;
+        border: 1px solid rgba(0, 0, 0, 0.1);
+        min-height: 300px;
+        overflow-y: auto;
+        font-family:
+          "Inter",
+          -apple-system,
+          BlinkMacSystemFont,
+          sans-serif;
+        line-height: 1.6;
+      }
+
+      .transcript-content {
+        white-space: pre-wrap;
+        word-wrap: break-word;
+        min-height: 100%;
+      }
+
+      .realtime-text {
+        color: #666;
+        font-style: italic;
+        margin-bottom: 0.5rem;
+      }
+
+      .final-text {
+        color: #333;
+        font-weight: 500;
+        line-height: 1.8;
+      }
+
+      .stt-controls {
+        text-align: center;
+        margin-top: 1rem;
+      }
+
+      .stt-controls .status-text {
+        margin-top: 1rem;
+        font-size: 0.9rem;
+      }
+
+      .tts-content {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+      }
+
+      .transcript-line {
+        cursor: pointer;
+        padding: 0.5rem;
+        border-radius: 8px;
+        margin-bottom: 0.5rem;
+        transition: background-color 0.2s;
+        border: 1px solid transparent;
+      }
+
+      .transcript-line:hover {
+        background-color: rgba(126, 212, 173, 0.1) !important;
+        border-color: rgba(126, 212, 173, 0.2);
+      }
+
+      .transcript-line:active {
+        background-color: rgba(126, 212, 173, 0.2) !important;
+      }
+
       @media (max-width: 768px) {
         .header {
           padding: 1rem;
@@ -354,9 +458,19 @@
           font-size: 2rem;
         }
 
-        .voice-interface {
-          padding: 2rem 1.5rem;
-          margin: 1rem;
+        .main-container {
+          flex-direction: column;
+          gap: 1rem;
+          padding: 1rem;
+        }
+
+        .stt-interface,
+        .tts-interface {
+          padding: 1.5rem;
+        }
+
+        .transcript-display {
+          min-height: 200px;
         }
 
         .controls {
@@ -401,257 +515,67 @@
     </div>
 
     <div class="main-container">
-      <div class="voice-interface">
-        <div class="voice-avatar" id="voiceAvatar"></div>
+      <!-- STT Interface (Left Side) -->
+      <div class="stt-interface">
+        <div class="interface-title">🎤 Speech to Text</div>
 
-        <div class="greeting">Good afternoon</div>
-        <div class="status-text" id="statusText">Ready to assist you</div>
-
-        <div class="input-section">
-          <textarea
-            id="messageText"
-            class="text-input"
-            placeholder="What would you like me to say?">
-Hello, this is a test of the real-time audio streaming directly in the browser.</textarea
-          >
+        <div class="transcript-display">
+          <div class="transcript-content" id="transcriptContent">
+            <div class="realtime-text" id="realtimeText"></div>
+            <div class="final-text" id="finalText"></div>
+          </div>
         </div>
 
-        <div class="controls">
-          <button
-            id="sendButton"
-            class="btn btn-primary"
-            onclick="sendMessage()"
-            disabled>
-            Speak
+        <div class="stt-controls">
+          <button id="recordButton" class="btn btn-secondary">
+            🎤 Hold to Record
           </button>
           <button
-            id="checkStatusButton"
+            id="clearTranscriptButton"
             class="btn btn-secondary"
-            onclick="checkModelStatus()">
-            Refresh
+            style="margin-left: 1rem">
+            🗑️ Clear
           </button>
+          <div class="status-text" id="sttStatusText">Ready to listen</div>
         </div>
+      </div>
 
-        <audio
-          id="audioPlayer"
-          class="audio-player"
-          controls
-          style="display: none"></audio>
+      <!-- TTS Interface (Right Side) -->
+      <div class="tts-interface">
+        <div class="tts-content">
+          <div class="voice-avatar" id="voiceAvatar"></div>
+
+          <div class="interface-title">🔊 Text to Speech</div>
+          <div class="status-text" id="statusText">Ready to speak</div>
+
+          <div class="input-section">
+            <textarea
+              id="messageText"
+              class="text-input"
+              placeholder="What would you like me to say?">
+Hello, this is a test of the real-time audio streaming directly in the browser.</textarea
+            >
+          </div>
+
+          <div class="controls">
+            <button id="sendButton" class="btn btn-primary" disabled>
+              Speak
+            </button>
+            <button id="checkStatusButton" class="btn btn-secondary">
+              Refresh
+            </button>
+          </div>
+
+          <audio
+            id="audioPlayer"
+            class="audio-player"
+            controls
+            style="display: none"></audio>
+        </div>
       </div>
     </div>
 
-    <script>
-      const sendButton = document.getElementById("sendButton");
-      const messageText = document.getElementById("messageText");
-      const statusText = document.getElementById("statusText");
-      const connectionStatus = document.getElementById("connectionStatus");
-      const voiceEngineStatus = document.getElementById("voiceEngineStatus");
-      const engineStatusText = document.getElementById("engineStatusText");
-      const audioPlayer = document.getElementById("audioPlayer");
-      const voiceAvatar = document.getElementById("voiceAvatar");
-
-      let websocket;
-      let statusWebSocket;
-      let audioChunks = [];
-      let isReceivingAudio = false;
-
-      function updateConnectionStatus(status, connected = false) {
-        connectionStatus.textContent = status;
-        connectionStatus.className = `connection-status ${connected ? "connected" : ""}`;
-      }
-
-      function updateVoiceState(state) {
-        voiceAvatar.className = `voice-avatar ${state}`;
-      }
-
-      function connectTTS() {
-        const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const wsUrl = `${proto}//${window.location.host}/ws/tts`;
-
-        updateConnectionStatus("Connecting...");
-        statusText.textContent = "Connecting to voice engine...";
-
-        websocket = new WebSocket(wsUrl);
-
-        websocket.onopen = () => {
-          updateConnectionStatus("Connected", true);
-          statusText.textContent = "Ready to assist you";
-          updateVoiceState("");
-        };
-
-        websocket.onmessage = (event) => {
-          if (typeof event.data === "string") {
-            try {
-              const data = JSON.parse(event.data);
-              if (data.type === "status") {
-                statusText.textContent = data.message;
-                return;
-              }
-            } catch (e) {
-              if (event.data === "END") {
-                statusText.textContent = "Voice synthesis complete";
-                updateVoiceState("");
-                playAudioChunks();
-              } else if (event.data.startsWith("ERROR:")) {
-                statusText.textContent = event.data;
-                updateVoiceState("");
-              }
-            }
-          } else if (event.data instanceof Blob) {
-            if (!isReceivingAudio) {
-              isReceivingAudio = true;
-              audioChunks = [];
-              statusText.textContent = "Receiving voice data...";
-              updateVoiceState("active");
-            }
-            audioChunks.push(event.data);
-          }
-        };
-
-        websocket.onclose = () => {
-          updateConnectionStatus("Disconnected");
-          statusText.textContent = "Connection lost. Reconnecting...";
-          updateVoiceState("");
-          setTimeout(connectTTS, 3000);
-        };
-
-        websocket.onerror = (error) => {
-          console.error("TTS WebSocket Error:", error);
-          updateConnectionStatus("Error");
-          statusText.textContent = "Connection error";
-          updateVoiceState("");
-          websocket.close();
-        };
-      }
-
-      function connectModelStatus() {
-        const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-        const wsUrl = `${proto}//${window.location.host}/ws/model-status`;
-
-        statusWebSocket = new WebSocket(wsUrl);
-
-        statusWebSocket.onmessage = (event) => {
-          try {
-            const status = JSON.parse(event.data);
-            updateModelStatus(status);
-          } catch (e) {
-            console.error("Error parsing model status:", e);
-          }
-        };
-
-        statusWebSocket.onclose = () => {
-          setTimeout(connectModelStatus, 5000);
-        };
-      }
-
-      function updateModelStatus(status) {
-        sendButton.disabled = status.status !== "ready";
-
-        // Remove any existing status classes
-        voiceEngineStatus.className = "voice-engine-status";
-
-        if (status.status === "ready") {
-          voiceEngineStatus.classList.add("ready");
-          engineStatusText.textContent = "Ready";
-          statusText.textContent = "Ready to assist you";
-        } else if (status.status === "error") {
-          voiceEngineStatus.classList.add("error");
-          engineStatusText.textContent = "Error";
-          statusText.textContent = "Voice engine error";
-        } else {
-          voiceEngineStatus.classList.add("loading");
-          engineStatusText.textContent = `${Math.round(status.progress)}%`;
-          statusText.textContent = "Preparing voice engine...";
-        }
-      }
-
-      async function checkModelStatus() {
-        try {
-          const response = await fetch("/model-status");
-          const status = await response.json();
-          updateModelStatus(status);
-        } catch (error) {
-          console.error("Error checking model status:", error);
-          voiceEngineStatus.classList.add("error");
-          engineStatusText.textContent = "Error";
-        }
-      }
-
-      function playAudioChunks() {
-        if (audioChunks.length === 0) {
-          statusText.textContent = "No audio data received";
-          return;
-        }
-
-        try {
-          const audioBlob = new Blob(audioChunks, { type: "audio/wav" });
-          const audioUrl = URL.createObjectURL(audioBlob);
-
-          audioPlayer.src = audioUrl;
-          audioPlayer.style.display = "block";
-
-          audioPlayer
-            .play()
-            .then(() => {
-              statusText.textContent = "Playing audio";
-              updateVoiceState("active");
-            })
-            .catch((error) => {
-              console.error("Error playing audio:", error);
-              statusText.textContent = "Audio playback error";
-            });
-
-          audioPlayer.onended = () => {
-            URL.revokeObjectURL(audioUrl);
-            audioPlayer.style.display = "none";
-            statusText.textContent = "Ready to assist you";
-            updateVoiceState("");
-            isReceivingAudio = false;
-          };
-        } catch (error) {
-          console.error("Error creating audio blob:", error);
-          statusText.textContent = "Error processing audio";
-        }
-      }
-
-      function sendMessage() {
-        if (websocket.readyState !== WebSocket.OPEN) {
-          statusText.textContent = "Not connected to voice engine";
-          return;
-        }
-
-        const text = messageText.value;
-        if (!text.trim()) {
-          statusText.textContent = "Please enter some text to speak";
-          return;
-        }
-
-        websocket.send(text);
-        statusText.textContent = "Synthesizing voice...";
-        updateVoiceState("listening");
-        audioChunks = [];
-        isReceivingAudio = false;
-      }
-
-      // Greeting based on time of day
-      function updateGreeting() {
-        const hour = new Date().getHours();
-        const greetingElement = document.querySelector(".greeting");
-
-        if (hour < 12) {
-          greetingElement.textContent = "Good morning";
-        } else if (hour < 17) {
-          greetingElement.textContent = "Good afternoon";
-        } else {
-          greetingElement.textContent = "Good evening";
-        }
-      }
-
-      // Initialize
-      updateGreeting();
-      connectTTS();
-      connectModelStatus();
-      checkModelStatus();
-    </script>
+    <!-- Modular JavaScript Architecture -->
+    <script type="module" src="js/app.js"></script>
   </body>
 </html>

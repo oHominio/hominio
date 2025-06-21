@@ -16,6 +16,8 @@ RUN apt-get update && apt-get install -y \
     git \
     curl \
     build-essential \
+    alsa-utils \
+    libasound2-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install PyTorch for CUDA 12.1 (compatible with KokoroEngine)
@@ -31,10 +33,19 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Set environment variables for headless operation
+# Set environment variables for headless operation (RealtimeSTT server example pattern)
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
-ENV DISPLAY=:99
+# Suppress ALSA errors in headless environment
+ENV ALSA_PCM_CARD=-1
+ENV ALSA_PCM_DEVICE=-1
+ENV ALSA_MIXER_CARD=-1
+ENV ALSA_MIXER_DEVICE=-1
+# Redirect ALSA errors to null
+ENV ALSA_CARD=none
+# Additional audio suppression
+ENV SDL_AUDIODRIVER=dummy
+ENV PULSE_RUNTIME_PATH=/tmp/pulse-runtime
 
 # Expose port
 EXPOSE 8080

@@ -1,21 +1,23 @@
 app = "hominio-voice"
 primary_region = "ord"
-vm.size = "a100-40gb"
 
 [build]
 dockerfile = "Dockerfile"
+
+[vm]
+size = "a100-40gb"
 
 [http_service]
 internal_port = 8080
 force_https = true
 auto_stop_machines = "stop"
-auto_start_machines = false
-min_machines_running = 0    # Can be set to 1 for production.
-max_machines_running = 1
+auto_start_machines = true
+min_machines_running = 0
+processes = ["app"]
 
 [[http_service.checks]]
-interval = "10s"
+grace_period = "10s"
+interval = "30s"
+method = "GET"
 timeout = "5s"
-grace_period = "60s" # Give the app ample time to start and load models.
-method = "get"
 path = "/health"
