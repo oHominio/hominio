@@ -2,7 +2,9 @@
 Configuration and environment setup for hominio-voice application
 """
 import os
+import sys
 import multiprocessing
+import torch
 from typing import Dict, Any
 
 
@@ -16,22 +18,65 @@ def setup_environment():
     os.environ['SDL_AUDIODRIVER'] = 'dummy'
     os.environ['PULSE_RUNTIME_PATH'] = '/tmp/pulse-runtime'
     
-    # Prevent multiprocessing resource leaks
+    # Prevent multiprocessing resource leaks and SIGABRT crashes
     os.environ['PYTHONUNBUFFERED'] = '1'
+    os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
     
-    # Disable tokenizers parallelism to prevent resource conflicts
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    # CRITICAL: Fix multiprocessing semaphore leaks
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+    os.environ['OMP_NUM_THREADS'] = '1'
+    os.environ['MKL_NUM_THREADS'] = '1'
+    os.environ['NUMBA_NUM_THREADS'] = '1'
+    os.environ['OPENBLAS_NUM_THREADS'] = '1'
     
-    # Additional environment variables for stability
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
+    # Force single-threaded execution for stability
+    os.environ['PYTORCH_NUM_THREADS'] = '1'
+    os.environ['TF_NUM_INTRAOP_THREADS'] = '1'
+    os.environ['TF_NUM_INTEROP_THREADS'] = '1'
     
-    # CUDA and GPU settings for headless operation
-    os.environ['CUDA_VISIBLE_DEVICES'] = ''
+    # FORCE CUDA usage - NO CPU FALLBACKS
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Force GPU 0
+    os.environ['NVIDIA_VISIBLE_DEVICES'] = 'all'
+    os.environ['NVIDIA_DRIVER_CAPABILITIES'] = 'compute,utility'
+    os.environ['FORCE_CUDA'] = '1'
     
-    # Set multiprocessing start method
-    if __name__ == "__main__":
+    # Multiprocessing stability - CRITICAL for preventing SIGABRT
+    try:
+        # Set multiprocessing start method BEFORE any other imports
         multiprocessing.set_start_method('spawn', force=True)
+        print("✅ Set multiprocessing start method to 'spawn'")
+    except RuntimeError as e:
+        print(f"⚠️ Could not set multiprocessing start method: {e}")
+    
+    # Additional stability fixes
+    os.environ['MALLOC_TRIM_THRESHOLD_'] = '0'  # Prevent memory fragmentation
+    os.environ['MALLOC_MMAP_THRESHOLD_'] = '131072'  # Control memory mapping
+    
+    # CUDA validation - warn but don't exit immediately to allow container startup
+    try:
+        if not torch.cuda.is_available():
+            print("⚠️ WARNING: CUDA is not available! This application requires GPU acceleration.")
+            print("⚠️ Please ensure:")
+            print("   1. NVIDIA GPU is properly configured")
+            print("   2. NVIDIA drivers are installed")
+            print("   3. CUDA runtime is available")
+            print("   4. Container has GPU access")
+            print("🔄 Continuing startup - CUDA validation will happen during engine initialization...")
+        else:
+            # Log CUDA information
+            print(f"✅ CUDA is available! Device count: {torch.cuda.device_count()}")
+            print(f"✅ Current CUDA device: {torch.cuda.current_device()}")
+            print(f"✅ CUDA device name: {torch.cuda.get_device_name(0)}")
+            print(f"✅ CUDA version: {torch.version.cuda}")
+            
+            # Force PyTorch to use CUDA
+            torch.cuda.set_device(0)
+            print("🚀 Forced PyTorch to use CUDA device 0")
+    except ImportError:
+        print("⚠️ PyTorch not yet available - CUDA validation will happen later")
+    except Exception as e:
+        print(f"⚠️ CUDA validation error: {e}")
+        print("🔄 Continuing startup - will retry during engine initialization...")
 
 
 class Config:
@@ -42,29 +87,29 @@ class Config:
     TTS_VOICE = "af_heart"
     TTS_MUTED = True  # Always muted for headless operation
     
-    # STT Configuration
-    STT_MODEL = "tiny"
+    # STT Configuration - MATCHED TO REFERENCE IMPLEMENTATION
+    STT_MODEL = "base.en"  # Changed from "tiny" to match reference
     STT_LANGUAGE = "en"
     STT_REALTIME_ENABLED = True
-    STT_REALTIME_MODEL = "tiny"
-    STT_REALTIME_PAUSE = 0.02
+    STT_REALTIME_MODEL = "base.en"  # Changed from "tiny" to match reference
+    STT_REALTIME_PAUSE = 0.03  # Changed from 0.02 to match reference
     
-    # Enhanced VAD Configuration for better voice activity detection
-    STT_SILERO_SENSITIVITY = 0.4  # Increased from 0.05 for better detection
-    STT_WEBRTC_SENSITIVITY = 2    # Reduced from 3 for more sensitive detection
+    # VAD Configuration - MATCHED TO REFERENCE IMPLEMENTATION
+    STT_SILERO_SENSITIVITY = 0.05  # Changed back to reference value
+    STT_WEBRTC_SENSITIVITY = 3     # Changed back to reference value
     STT_POST_SPEECH_SILENCE = 0.7
-    STT_MIN_RECORDING_LENGTH = 0.8  # Reduced from 1.1 for faster response
-    STT_MIN_GAP_BETWEEN_RECORDINGS = 0.1  # Small gap to prevent audio artifacts
-    STT_EARLY_TRANSCRIPTION_SILENCE = 0.3  # Increased from 0.2 for better early detection
+    STT_MIN_RECORDING_LENGTH = 0.5  # Changed to match reference
+    STT_MIN_GAP_BETWEEN_RECORDINGS = 0  # Changed to match reference
+    STT_EARLY_TRANSCRIPTION_SILENCE = 0  # Changed to match reference
     
     # Dynamic VAD settings for different conversation phases
     STT_MID_SENTENCE_PAUSE = 0.3      # Shorter pause for mid-sentence detection
     STT_END_SENTENCE_PAUSE = 0.7      # Standard pause for sentence endings
     STT_UNKNOWN_SENTENCE_PAUSE = 1.0  # Longer pause for unclear speech patterns
     
-    STT_BEAM_SIZE = 1
-    STT_BEAM_SIZE_REALTIME = 1
-    STT_DEVICE = 'cpu'
+    STT_BEAM_SIZE = 3  # Changed from 1 to match reference
+    STT_BEAM_SIZE_REALTIME = 3  # Changed from 1 to match reference
+    STT_DEVICE = 'cuda'  # Force GPU usage - NO CPU FALLBACK
     STT_COMPUTE_TYPE = 'int8'
     
     # LLM Configuration
@@ -92,12 +137,14 @@ class Config:
             'spinner': False,
             'enable_realtime_transcription': cls.STT_REALTIME_ENABLED,
             'realtime_model_type': cls.STT_REALTIME_MODEL,
+            'use_main_model_for_realtime': False,  # Added from reference
             'realtime_processing_pause': cls.STT_REALTIME_PAUSE,
             'silero_sensitivity': cls.STT_SILERO_SENSITIVITY,
             'webrtc_sensitivity': cls.STT_WEBRTC_SENSITIVITY,
             'post_speech_silence_duration': cls.STT_POST_SPEECH_SILENCE,
             'min_length_of_recording': cls.STT_MIN_RECORDING_LENGTH,
             'min_gap_between_recordings': cls.STT_MIN_GAP_BETWEEN_RECORDINGS,
+            'silero_use_onnx': True,  # Added from reference
             'silero_deactivity_detection': True,
             'early_transcription_on_silence': cls.STT_EARLY_TRANSCRIPTION_SILENCE,
             'beam_size': cls.STT_BEAM_SIZE,
@@ -105,7 +152,10 @@ class Config:
             'no_log_file': True,
             'device': cls.STT_DEVICE,
             'compute_type': cls.STT_COMPUTE_TYPE,
-            'initial_prompt': "Add periods only for complete sentences. Use ellipsis (...) for unfinished thoughts."
+            'debug_mode': True,  # Added from reference
+            'initial_prompt_realtime': "The sky is blue. When the sky... She walked home. Because he... Today is sunny. If only I...",  # Changed to match reference
+            'faster_whisper_vad_filter': False,  # Added from reference
+            'allowed_latency_limit': 500  # Added from reference
         }
         
         # Add VAD callbacks if provided

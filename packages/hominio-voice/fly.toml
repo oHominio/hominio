@@ -1,11 +1,22 @@
 app = "hominio-voice"
 primary_region = "ord"
+vm.size = "a100-40gb"
+
 
 [build]
 dockerfile = "Dockerfile"
 
-[vm]
-size = "a100-40gb"
+[env]
+CUDA_VISIBLE_DEVICES = "0"
+NVIDIA_VISIBLE_DEVICES = "all"
+NVIDIA_DRIVER_CAPABILITIES = "compute,utility"
+FORCE_CUDA = "1"
+PYTHONUNBUFFERED = "1"
+PYTHONDONTWRITEBYTECODE = "1"
+OMP_NUM_THREADS = "1"
+MKL_NUM_THREADS = "1"
+TOKENIZERS_PARALLELISM = "false"
+PYTORCH_NUM_THREADS = "1"
 
 [http_service]
 internal_port = 8080

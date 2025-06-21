@@ -129,8 +129,11 @@ class LLMClientManager:
             )
             
             async for chunk in response:
-                if chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
+                # Add safety checks for chunk structure
+                if hasattr(chunk, 'choices') and len(chunk.choices) > 0:
+                    choice = chunk.choices[0]
+                    if hasattr(choice, 'delta') and hasattr(choice.delta, 'content') and choice.delta.content:
+                        yield choice.delta.content
                     
         except Exception as e:
             logger.error(f"❌ Error getting streaming LLM response: {e}")

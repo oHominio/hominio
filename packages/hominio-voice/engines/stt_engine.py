@@ -131,9 +131,6 @@ class STTEngineManager:
                 """Callback for when a full sentence is transcribed"""
                 logger.info(f"✅ STT Full sentence: {full_sentence}")
                 
-                if self.on_final_transcription:
-                    self.on_final_transcription(full_sentence)
-                
                 # Send final transcription message
                 if loop and not loop.is_closed():
                     message = {'type': 'fullSentence', 'text': full_sentence}
@@ -146,11 +143,14 @@ class STTEngineManager:
                     # Import here to avoid circular imports
                     from services.conversation_manager import conversation_manager
                     
-                    # Process the user input asynchronously
-                    asyncio.run_coroutine_threadsafe(
-                        conversation_manager.process_user_input(full_sentence.strip()), 
-                        loop
-                    )
+                    # Schedule the async task in the main event loop (like the old code)
+                    if loop and not loop.is_closed():
+                        asyncio.run_coroutine_threadsafe(
+                            conversation_manager.process_user_input(full_sentence.strip()), 
+                            loop
+                        )
+                    else:
+                        logger.error("Event loop not available to schedule LLM call.")
             
             self.status.update({
                 "status": "loading",
@@ -179,21 +179,8 @@ class STTEngineManager:
             # Create STT engine
             self.engine = AudioToTextRecorder(**stt_config)
             
-            # Start transcription worker thread
-            def transcription_worker():
-                """Worker thread that continuously processes transcriptions"""
-                logger.info("🔄 Starting STT transcription worker thread...")
-                
-                while self._is_ready:
-                    try:
-                        # This call blocks until audio is processed and calls process_full_sentence
-                        self.engine.text(process_full_sentence)
-                    except Exception as e:
-                        logger.error(f"STT transcription error: {e}")
-                        time.sleep(0.1)
-            
-            # Start the transcription worker thread
-            self.transcription_thread = threading.Thread(target=transcription_worker, daemon=True)
+            # Note: Do NOT call engine.listen() here - the text() method handles listening
+            logger.info("🔄 STT engine created, ready for transcription loop")
             
             self.status.update({
                 "status": "ready",
@@ -211,7 +198,6 @@ class STTEngineManager:
             })
             
             self._is_ready = True
-            self.transcription_thread.start()
             
             logger.info("✅ STT engine initialized successfully with enhanced VAD")
             return True
@@ -252,8 +238,14 @@ class STTEngineManager:
     
     def start_listening(self):
         """Start listening for audio input"""
-        self.is_listening = True
-        logger.info("👂 STT engine started listening")
+        if not self.is_listening:
+            self.is_listening = True
+            logger.info("👂 STT engine started listening")
+            # Start the continuous transcription loop when we start listening
+            if not self.transcription_thread or not self.transcription_thread.is_alive():
+                self.start_transcription_loop()
+        else:
+            logger.debug("👂 STT engine already listening")
     
     def stop_listening(self):
         """Stop listening for audio input"""
@@ -289,6 +281,72 @@ class STTEngineManager:
             logger.error(f"Error shutting down STT engine: {e}")
         finally:
             self._is_ready = False
+
+    def start_transcription_loop(self):
+        """Start the continuous transcription loop following reference implementation pattern"""
+        if not self._is_ready or not self.engine:
+            logger.error("Cannot start transcription loop: STT engine not ready")
+            return
+            
+        def transcription_loop():
+            """Continuous transcription loop - follows reference implementation pattern"""
+            logger.info("🔄 Starting continuous transcription loop...")
+            
+            def on_final_transcription(text: str):
+                """Callback for when a full sentence is transcribed"""
+                logger.info(f"✅ STT Full sentence: {text}")
+                
+                # Send final transcription message
+                if self.message_queue:
+                    try:
+                        # Get the current event loop
+                        try:
+                            loop = asyncio.get_running_loop()
+                        except RuntimeError:
+                            loop = asyncio.get_event_loop()
+                            
+                        message = {'type': 'fullSentence', 'text': text}
+                        asyncio.run_coroutine_threadsafe(
+                            self.message_queue.put(message), loop
+                        )
+                    except Exception as e:
+                        logger.error(f"Error sending final transcription: {e}")
+                
+                # Trigger conversation processing
+                if text.strip() and self.on_final_transcription:
+                    try:
+                        # Get the current event loop
+                        try:
+                            loop = asyncio.get_running_loop()
+                        except RuntimeError:
+                            loop = asyncio.get_event_loop()
+                            
+                        # Schedule the async task in the main event loop
+                        asyncio.run_coroutine_threadsafe(
+                            self.on_final_transcription(text.strip()), 
+                            loop
+                        )
+                    except Exception as e:
+                        logger.error(f"Error scheduling conversation processing: {e}")
+            
+            # Continuous transcription loop - this is the key pattern from reference
+            while self._is_ready and self.is_listening:
+                try:
+                    logger.debug("🔄 Calling STT engine text() method...")
+                    # This blocks until a complete transcription is available
+                    # When it returns, we immediately call it again for continuous processing
+                    self.engine.text(on_final_transcription)
+                    logger.debug("🔄 STT engine text() method returned, calling again...")
+                except Exception as e:
+                    logger.error(f"STT transcription error: {e}")
+                    time.sleep(0.1)  # Brief pause on error before retrying
+                    
+            logger.info("🔄 Transcription loop ended")
+        
+        # Start the transcription loop in a daemon thread
+        self.transcription_thread = threading.Thread(target=transcription_loop, daemon=True)
+        self.transcription_thread.start()
+        logger.info("🔄 Transcription loop thread started")
 
 
 # Global STT engine manager instance

@@ -6,4 +6,5 @@ RealtimeSTT
 scipy
 numpy
 python-multipart
-openai 
+openai
+ctranslate2<4.5.0 
