@@ -11,6 +11,7 @@ export class TTSService {
   constructor() {
     this.isInitialized = false;
     this.modelStatus = "unknown";
+    this.isConnectedForPush = false; // Track TTS push connection
   }
 
   /**
@@ -19,27 +20,40 @@ export class TTSService {
   async initialize() {
     if (this.isInitialized) return;
 
-    // Create TTS WebSocket connection
-    wsManager.createConnection("tts", "/ws/tts", {
+    // Create TTS push WebSocket connection for automatic conversation responses
+    wsManager.createConnection("tts-push", "/ws/tts-push", {
+      onOpen: () => {
+        console.log("🔊 [TTS] Connected to TTS push service");
+        this.isConnectedForPush = true;
+      },
+      onMessage: (event) => this.handleTTSPushMessage(event),
+      onClose: () => {
+        console.log("🔊 [TTS] TTS push service disconnected");
+        this.isConnectedForPush = false;
+      },
+      onError: (error) => {
+        console.error("🔊 [TTS] TTS push WebSocket Error:", error);
+        this.isConnectedForPush = false;
+      },
+      autoReconnect: true,
+    });
+
+    // Create model status WebSocket connection
+    wsManager.createConnection("model-status", "/ws/model-status", {
       onOpen: () => {
         uiState.updateConnectionStatus("Connected", true);
         uiState.showReady();
       },
-      onMessage: (event) => this.handleTTSMessage(event),
+      onMessage: (event) => this.handleModelStatusMessage(event),
       onClose: () => {
         uiState.updateConnectionStatus("Disconnected");
         uiState.updateStatusText("Connection lost. Reconnecting...");
       },
       onError: (error) => {
-        console.error("TTS WebSocket Error:", error);
+        console.error("Model Status WebSocket Error:", error);
         uiState.updateConnectionStatus("Error");
         uiState.updateStatusText("Connection error");
       },
-    });
-
-    // Create model status WebSocket connection
-    wsManager.createConnection("model-status", "/ws/model-status", {
-      onMessage: (event) => this.handleModelStatusMessage(event),
       autoReconnect: true,
     });
 
@@ -50,30 +64,53 @@ export class TTSService {
   }
 
   /**
-   * Handle TTS WebSocket messages
+   * Handle TTS push WebSocket messages (automatic conversation responses)
    */
-  handleTTSMessage(event) {
-    if (typeof event.data === "string") {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.type === "status") {
-          uiState.updateStatusText(data.message);
+  handleTTSPushMessage(event) {
+    try {
+      if (typeof event.data === "string") {
+        if (event.data === "END") {
+          console.log("🔊 [TTS] Audio stream ended, playing accumulated audio");
+          // Play all accumulated audio chunks when stream ends
+          audioService
+            .playAudioChunks()
+            .then(() => {
+              console.log("🔊 [TTS] Audio playback completed");
+              uiState.showListening(
+                "Conversation active - listening for speech..."
+              );
+            })
+            .catch((error) => {
+              console.error("🔊 [TTS] Audio playback failed:", error);
+              uiState.showError("Audio playback failed");
+            });
           return;
         }
-      } catch (e) {
-        // Handle non-JSON string messages
-        if (event.data === "END") {
-          uiState.updateStatusText("Voice synthesis complete");
-          uiState.updateVoiceState("");
-          audioService.playAudioChunks();
-        } else if (event.data.startsWith("ERROR:")) {
-          uiState.updateStatusText(event.data);
-          uiState.updateVoiceState("");
+
+        if (event.data === "ERROR") {
+          console.error("🔊 [TTS] Audio generation error");
+          uiState.showError("Audio generation failed");
+          return;
         }
+
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === "status") {
+            console.log("🔊 [TTS] Status:", data.message);
+            uiState.updateStatusText(data.message);
+          }
+        } catch (e) {
+          console.log("🔊 [TTS] Non-JSON message:", event.data);
+        }
+      } else {
+        // Binary audio data - add to buffer
+        console.log("🔊 [TTS] Received audio chunk, buffering...");
+        uiState.showSpeaking("AI is responding...");
+        audioService.addAudioChunk(event.data);
       }
-    } else if (event.data instanceof Blob) {
-      // Handle audio chunks
-      audioService.addAudioChunk(event.data);
+    } catch (error) {
+      console.error("🔊 [TTS] Error handling TTS push message:", error);
+      uiState.showError("Audio processing error");
     }
   }
 
@@ -92,37 +129,7 @@ export class TTSService {
     }
   }
 
-  /**
-   * Send text for TTS synthesis
-   */
-  async sendText(text) {
-    if (!text || !text.trim()) {
-      uiState.updateStatusText("Please enter some text to speak");
-      return false;
-    }
-
-    if (wsManager.getConnectionStatus("tts") !== "connected") {
-      uiState.updateStatusText("Not connected to voice engine");
-      return false;
-    }
-
-    if (this.modelStatus !== "ready") {
-      uiState.updateStatusText("Voice engine not ready");
-      return false;
-    }
-
-    // Reset audio state and send text
-    audioService.resetAudioState();
-
-    const success = wsManager.send("tts", text);
-    if (success) {
-      uiState.updateStatusText("Synthesizing voice...", "listening");
-    } else {
-      uiState.updateStatusText("Failed to send text");
-    }
-
-    return success;
-  }
+  // Manual TTS synthesis removed - only automatic push from STT → LLM → TTS
 
   /**
    * Check model status via HTTP
@@ -153,8 +160,9 @@ export class TTSService {
     return {
       isInitialized: this.isInitialized,
       modelStatus: this.modelStatus,
-      connectionStatus: wsManager.getConnectionStatus("tts"),
       modelConnectionStatus: wsManager.getConnectionStatus("model-status"),
+      pushConnectionStatus: wsManager.getConnectionStatus("tts-push"),
+      isConnectedForPush: this.isConnectedForPush,
     };
   }
 
@@ -162,10 +170,11 @@ export class TTSService {
    * Shutdown TTS service
    */
   shutdown() {
-    wsManager.close("tts");
     wsManager.close("model-status");
+    wsManager.close("tts-push");
     audioService.stopAudio();
     this.isInitialized = false;
+    this.isConnectedForPush = false;
   }
 }
 

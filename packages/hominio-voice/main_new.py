@@ -18,6 +18,7 @@ from core.config import setup_environment, Config
 from core.logging_setup import setup_logging, get_logger
 from engines.tts_engine import tts_manager
 from engines.llm_client import llm_manager
+from engines.stt_engine import stt_manager
 from services.conversation_manager import conversation_manager
 from utils.signal_handlers import signal_handler
 from utils.audio_utils import decode_and_resample
@@ -36,7 +37,16 @@ async def lifespan(app: FastAPI):
     # Register shutdown callbacks
     signal_handler.add_shutdown_callback(lambda: tts_manager.shutdown())
     signal_handler.add_shutdown_callback(lambda: llm_manager.shutdown())
+    signal_handler.add_shutdown_callback(lambda: stt_manager.shutdown())
     signal_handler.add_shutdown_callback(lambda: conversation_manager.shutdown())
+    
+    # Set up conversation manager callbacks for visual state management
+    def on_state_change(new_state, message=None):
+        """Handle conversation state changes for WebSocket clients"""
+        # This could be extended to send state updates to WebSocket clients
+        logger.info(f"🎭 Conversation state changed to: {new_state}")
+    
+    conversation_manager.set_state_change_callback(on_state_change)
     
     # Initialize engines
     logger.info("⚙️ Initializing engines...")
@@ -49,6 +59,17 @@ async def lifespan(app: FastAPI):
     if not await llm_manager.initialize():
         logger.error("❌ Failed to initialize LLM client")
     
+    # Initialize STT engine with VAD callbacks
+    stt_callbacks = {
+        'on_vad_detect_start': conversation_manager.on_vad_detected,
+        'on_vad_detect_stop': conversation_manager.on_vad_stopped,
+        'on_final_transcription': conversation_manager.process_user_input,
+    }
+    stt_manager.set_callbacks(stt_callbacks)
+    
+    if not await stt_manager.initialize():
+        logger.error("❌ Failed to initialize STT engine")
+    
     logger.info("✅ Application startup complete")
     
     yield
@@ -56,6 +77,7 @@ async def lifespan(app: FastAPI):
     # Cleanup on shutdown
     logger.info("🔌 Shutting down application...")
     conversation_manager.shutdown()
+    stt_manager.shutdown()
     tts_manager.shutdown()
     llm_manager.shutdown()
     logger.info("👋 Application shutdown complete")
@@ -96,6 +118,7 @@ async def get_model_status():
     """Get status of all engines"""
     return {
         "tts": tts_manager.get_status(),
+        "stt": stt_manager.get_status(),
         "llm": {
             "status": "ready" if llm_manager.is_ready() else "not_ready",
             "model": Config.LLM_MODEL
@@ -116,6 +139,7 @@ async def model_status_websocket(websocket: WebSocket):
             # Send status every 5 seconds
             status = {
                 "tts": tts_manager.get_status(),
+                "stt": stt_manager.get_status(),
                 "llm": {
                     "status": "ready" if llm_manager.is_ready() else "not_ready",
                     "model": Config.LLM_MODEL
@@ -132,67 +156,11 @@ async def model_status_websocket(websocket: WebSocket):
     except Exception as e:
         logger.error(f"Model status WebSocket error: {e}")
 
-@app.websocket("/ws/tts")
-async def tts_websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for TTS synthesis"""
-    await websocket.accept()
-    logger.info("🔊 TTS WebSocket connected")
-    
-    # Set this as the active TTS connection
-    conversation_manager.set_active_tts_websocket(websocket)
-    
-    try:
-        while True:
-            # Wait for text messages to synthesize
-            message = await websocket.receive_text()
-            data = json.loads(message)
-            
-            if data.get("type") == "synthesize":
-                text = data.get("text", "")
-                if text:
-                    logger.info(f"🔊 Received TTS request: '{text[:50]}...'")
-                    
-                    if not tts_manager.is_ready():
-                        await websocket.send_text(json.dumps({
-                            "type": "error",
-                            "message": "TTS engine not ready"
-                        }))
-                        continue
-                    
-                    try:
-                        # Send WAV header
-                        wav_header = tts_manager.get_wave_header()
-                        await websocket.send_bytes(wav_header)
-                        
-                        # Synthesize and send audio chunks
-                        audio_chunks = await tts_manager.synthesize_text(text)
-                        
-                        for chunk in audio_chunks:
-                            await websocket.send_bytes(chunk)
-                        
-                        # Send completion signal
-                        await websocket.send_text("END")
-                        logger.info("✅ TTS synthesis completed")
-                        
-                    except Exception as e:
-                        logger.error(f"TTS synthesis error: {e}")
-                        await websocket.send_text(json.dumps({
-                            "type": "error",
-                            "message": str(e)
-                        }))
-            
-    except WebSocketDisconnect:
-        logger.info("🔊 TTS WebSocket disconnected")
-    except Exception as e:
-        logger.error(f"TTS WebSocket error: {e}")
-    finally:
-        # Clear the active TTS connection
-        if conversation_manager.active_tts_ws == websocket:
-            conversation_manager.set_active_tts_websocket(None)
+# Manual TTS WebSocket endpoint removed - only automatic push from STT → LLM → TTS
 
 @app.websocket("/ws/stt")
 async def stt_websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for STT processing"""
+    """WebSocket endpoint for STT processing with enhanced VAD"""
     await websocket.accept()
     logger.info("🎤 STT WebSocket connected")
     
@@ -200,8 +168,36 @@ async def stt_websocket_endpoint(websocket: WebSocket):
     conversation_manager.set_active_tts_websocket(websocket)
     
     try:
+        # Send initial status
+        await websocket.send_text(json.dumps({
+            "type": "status",
+            "message": "STT engine ready for audio processing"
+        }))
+        
+        # Create a task to broadcast STT messages to the WebSocket client
+        async def message_broadcaster():
+            """Broadcast STT messages to the WebSocket client"""
+            try:
+                message_queue = stt_manager.get_message_queue()
+                if not message_queue:
+                    logger.warning("STT message queue not available")
+                    return
+                
+                while True:
+                    # Get message from queue
+                    message = await message_queue.get()
+                    if isinstance(message, dict):
+                        await websocket.send_text(json.dumps(message))
+                    else:
+                        await websocket.send_text(message)
+            except Exception as e:
+                logger.error(f"Error in STT message broadcaster: {e}")
+        
+        # Start the broadcaster task
+        broadcaster_task = asyncio.create_task(message_broadcaster())
+        
+        # Main message processing loop
         while True:
-            # Handle different message types
             try:
                 message = await websocket.receive()
                 
@@ -213,6 +209,7 @@ async def stt_websocket_endpoint(websocket: WebSocket):
                         if data.get("type") == "start":
                             logger.info("🎤 STT recording started")
                             conversation_manager.start_listening()
+                            stt_manager.start_listening()
                             
                             # Interrupt any current TTS
                             conversation_manager.interrupt_if_speaking()
@@ -220,22 +217,34 @@ async def stt_websocket_endpoint(websocket: WebSocket):
                         elif data.get("type") == "stop":
                             logger.info("🎤 STT recording stopped")
                             conversation_manager.stop_listening()
+                            stt_manager.stop_listening()
                     
                     elif "bytes" in message:
                         # Handle audio data
-                        if conversation_manager.is_listening:
+                        if stt_manager.is_ready() and conversation_manager.is_listening:
                             audio_data = message["bytes"]
                             
-                            # For now, we'll simulate STT processing
-                            # In a full implementation, this would feed to RealtimeSTT
-                            logger.debug(f"📥 Received audio chunk: {len(audio_data)} bytes")
-                            
-                            # TODO: Implement actual STT processing
-                            # This would involve:
-                            # 1. Decoding and resampling audio
-                            # 2. Feeding to RealtimeSTT engine
-                            # 3. Processing real-time and final transcriptions
-                            # 4. Calling conversation_manager.process_user_input() on final transcription
+                            try:
+                                # Parse the message format: [4 bytes length][metadata JSON][audio data]
+                                metadata_length = int.from_bytes(audio_data[:4], byteorder='little')
+                                metadata_json = audio_data[4:4+metadata_length].decode('utf-8')
+                                metadata = json.loads(metadata_json)
+                                sample_rate = metadata.get('sampleRate', 16000)
+                                
+                                # Extract audio chunk
+                                chunk = audio_data[4+metadata_length:]
+                                
+                                # Resample if necessary
+                                if sample_rate != 16000:
+                                    chunk = decode_and_resample(chunk, sample_rate, 16000)
+                                
+                                # Feed audio to STT engine
+                                stt_manager.feed_audio(chunk)
+                                logger.debug(f"📥 Fed audio chunk: {len(chunk)} bytes")
+                                
+                            except Exception as e:
+                                logger.error(f"Error processing audio data: {e}")
+                                continue
                 
             except json.JSONDecodeError as e:
                 logger.error(f"JSON decode error: {e}")
@@ -243,15 +252,24 @@ async def stt_websocket_endpoint(websocket: WebSocket):
                     "type": "error",
                     "message": "Invalid JSON message"
                 }))
-            
+            except Exception as e:
+                logger.error(f"Error in STT WebSocket message processing: {e}")
+                break
+                
     except WebSocketDisconnect:
         logger.info("🎤 STT WebSocket disconnected")
     except Exception as e:
         logger.error(f"STT WebSocket error: {e}")
     finally:
+        # Clean up
+        if 'broadcaster_task' in locals():
+            broadcaster_task.cancel()
+        
         # Clear the active TTS connection
         if conversation_manager.active_tts_ws == websocket:
             conversation_manager.set_active_tts_websocket(None)
+        
+        logger.info("🎤 STT WebSocket cleanup completed")
 
 # Run the application
 if __name__ == "__main__":

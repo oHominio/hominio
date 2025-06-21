@@ -8,6 +8,7 @@ export class UIState {
   constructor() {
     this.currentVoiceState = "";
     this.currentConnectionState = "disconnected";
+    this.currentConversationState = "standby"; // New conversation state tracking
     this.initializeGreeting();
   }
 
@@ -32,6 +33,32 @@ export class UIState {
 
     this.currentVoiceState = state;
     voiceAvatar.className = `voice-avatar ${state}`;
+  }
+
+  /**
+   * Update conversation state with visual feedback
+   * States: standby, listening, vad-detected, thinking, speaking
+   */
+  updateConversationState(state, message = null) {
+    this.currentConversationState = state;
+
+    // Update visual state
+    this.updateVoiceState(state);
+
+    // Update status message based on state
+    const statusMessages = {
+      standby: "Ready to listen...",
+      listening: "Listening... (speak now)",
+      "vad-detected": "Voice detected! 🎤",
+      thinking: "Processing your request...",
+      speaking: "Speaking...",
+    };
+
+    const statusMessage = message || statusMessages[state] || "Ready";
+    this.updateStatusText(statusMessage);
+
+    // Log state change for debugging
+    console.log(`🎭 Conversation state: ${state}`);
   }
 
   /**
@@ -67,7 +94,10 @@ export class UIState {
       if (status.status === "ready") {
         voiceEngineStatus.classList.add("ready");
         if (engineStatusText) engineStatusText.textContent = "Ready";
-        this.updateStatusText("Ready to assist you");
+        // Only update to ready if we're not in an active conversation
+        if (this.currentConversationState === "standby") {
+          this.updateStatusText("Ready to assist you");
+        }
       } else if (status.status === "error") {
         voiceEngineStatus.classList.add("error");
         if (engineStatusText) engineStatusText.textContent = "Error";
@@ -105,6 +135,7 @@ export class UIState {
   showError(message) {
     this.updateStatusText(message);
     this.updateVoiceState("error");
+    this.currentConversationState = "error";
   }
 
   /**
@@ -119,8 +150,51 @@ export class UIState {
    * Show ready state
    */
   showReady(message = "Ready to assist you") {
-    this.updateStatusText(message);
-    this.updateVoiceState("");
+    this.updateConversationState("standby", message);
+  }
+
+  // New conversation state methods
+
+  /**
+   * Set listening state - AI is ready to hear user
+   */
+  showListening() {
+    this.updateConversationState("listening");
+  }
+
+  /**
+   * Set recording state - user is actively recording
+   */
+  showRecording(message = "Recording... Click to stop") {
+    this.updateConversationState("listening", message);
+  }
+
+  /**
+   * Set VAD detected state - voice activity detected
+   */
+  showVADDetected() {
+    this.updateConversationState("vad-detected");
+  }
+
+  /**
+   * Set thinking state - processing transcription and LLM
+   */
+  showThinking(message = "Processing your request...") {
+    this.updateConversationState("thinking", message);
+  }
+
+  /**
+   * Set speaking state - TTS is playing
+   */
+  showSpeaking(message = "Speaking...") {
+    this.updateConversationState("speaking", message);
+  }
+
+  /**
+   * Set standby state - default ready state
+   */
+  showStandby(message = "Ready to listen...") {
+    this.updateConversationState("standby", message);
   }
 
   /**
@@ -130,6 +204,7 @@ export class UIState {
     return {
       voiceState: this.currentVoiceState,
       connectionState: this.currentConnectionState,
+      conversationState: this.currentConversationState,
     };
   }
 }

@@ -4,6 +4,7 @@ import { uiState } from "../core/ui-state.js";
 /**
  * STT (Speech-to-Text) Service
  * Handles real-time audio recording and WebSocket streaming to backend
+ * Now includes potential sentence detection for early LLM processing
  */
 export class STTService {
   constructor() {
@@ -14,12 +15,19 @@ export class STTService {
     this.processor = null;
     this.isRecording = false;
     this.isConnected = false;
+    this.isConversationActive = false; // New: tracks if conversation session is active
 
     // Callbacks
     this.onPartialTranscription = null;
     this.onFinalTranscription = null;
     this.onError = null;
     this.onStatusChange = null;
+    this.onPotentialSentence = null; // New callback for potential sentence detection
+
+    // Potential sentence detection
+    this.lastPartialText = "";
+    this.sentenceEndPattern = /[.!?]+\s*$/; // Pattern for sentence endings
+    this.potentialSentenceCache = new Set(); // Cache to avoid duplicates
 
     this.setupEventListeners();
   }
@@ -39,43 +47,13 @@ export class STTService {
   }
 
   setupEventListeners() {
-    // Record button event listeners
+    // Conversation button event listeners - Start/Stop conversation session
     const recordButton = domElements.get("recordButton");
     if (recordButton) {
-      // Mouse events for desktop
-      recordButton.addEventListener("mousedown", (e) => {
+      // Simple click toggle for start/stop conversation
+      recordButton.addEventListener("click", (e) => {
         e.preventDefault();
-        this.startRecording();
-      });
-
-      recordButton.addEventListener("mouseup", (e) => {
-        e.preventDefault();
-        this.stopRecording();
-      });
-
-      recordButton.addEventListener("mouseleave", (e) => {
-        e.preventDefault();
-        if (this.isRecording) {
-          this.stopRecording();
-        }
-      });
-
-      // Touch events for mobile
-      recordButton.addEventListener("touchstart", (e) => {
-        e.preventDefault();
-        this.startRecording();
-      });
-
-      recordButton.addEventListener("touchend", (e) => {
-        e.preventDefault();
-        this.stopRecording();
-      });
-
-      recordButton.addEventListener("touchcancel", (e) => {
-        e.preventDefault();
-        if (this.isRecording) {
-          this.stopRecording();
-        }
+        this.toggleConversation();
       });
     }
 
@@ -140,8 +118,27 @@ export class STTService {
         this.updateStatus(data.message);
         break;
 
+      case "vad_detect_start":
+        console.log("🎤 [STT] VAD: Voice activity detected");
+        uiState.showVADDetected();
+        break;
+
+      case "vad_detect_stop":
+        console.log("🎤 [STT] VAD: Voice activity stopped");
+        if (uiState.getCurrentStates().conversationState === "vad-detected") {
+          uiState.showListening();
+        }
+        break;
+
       case "realtime":
         console.log("⚡ [STT] Real-time transcription:", data.text);
+        // Show thinking state when we get real-time transcription
+        if (data.text && data.text.trim()) {
+          uiState.showThinking("Processing speech...");
+
+          // Check for potential sentence endings for early LLM processing
+          this.checkPotentialSentenceEnd(data.text);
+        }
         // Partial/real-time transcription (gray, italic)
         this.displayPartialTranscription(data.text);
         if (this.onPartialTranscription) {
@@ -151,6 +148,8 @@ export class STTService {
 
       case "fullSentence":
         console.log("📝 [STT] Final transcription received:", data.text);
+        // Show thinking state for LLM processing
+        uiState.showThinking("Processing your request...");
         // Complete sentence transcription (simplified backend)
         this.displayFinalTranscription(data.text);
         if (this.onFinalTranscription) {
@@ -165,175 +164,6 @@ export class STTService {
 
       default:
         console.warn("⚠️ [STT] Unknown message type:", data.type, data);
-    }
-  }
-
-  async startRecording() {
-    if (this.isRecording) return;
-
-    console.log("🎤 [STT] Starting recording process...");
-
-    try {
-      // Connect WebSocket if not connected
-      if (!this.isConnected) {
-        console.log("🔌 [STT] Connecting to WebSocket...");
-        await this.connectWebSocket();
-        // Wait a bit for connection to establish
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
-
-      console.log("🎙️ [STT] Requesting microphone access...");
-      // Request microphone access (following browser client example exactly)
-      this.audioStream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-      });
-      console.log("✅ [STT] Microphone access granted");
-
-      // Create AudioContext for raw PCM processing (like browser client example)
-      this.audioContext = new AudioContext();
-      console.log(
-        `🔊 [STT] AudioContext created, sample rate: ${this.audioContext.sampleRate}Hz`
-      );
-
-      this.source = this.audioContext.createMediaStreamSource(this.audioStream);
-      this.processor = this.audioContext.createScriptProcessor(256, 1, 1);
-
-      this.source.connect(this.processor);
-      this.processor.connect(this.audioContext.destination);
-
-      console.log("🎤 Recording started");
-      this.isRecording = true;
-      this.updateRecordingUI(true);
-
-      // Send start command
-      if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-        console.log("📤 [STT] Sending start command to server...");
-        this.websocket.send(JSON.stringify({ type: "start" }));
-      } else {
-        console.error("❌ [STT] WebSocket not ready for start command");
-      }
-
-      let audioChunkCount = 0;
-      let totalAudioBytes = 0;
-
-      // Process audio data exactly like browser client example
-      this.processor.onaudioprocess = (e) => {
-        if (!this.isRecording) return;
-
-        const inputData = e.inputBuffer.getChannelData(0);
-        const outputData = new Int16Array(inputData.length);
-
-        // Convert to 16-bit PCM (exactly like browser client example)
-        for (let i = 0; i < inputData.length; i++) {
-          outputData[i] = Math.max(
-            -32768,
-            Math.min(32767, Math.floor(inputData[i] * 32768))
-          );
-        }
-
-        audioChunkCount++;
-        totalAudioBytes += outputData.buffer.byteLength;
-
-        // Log every 50th chunk to avoid spam
-        if (audioChunkCount % 50 === 0) {
-          console.log(
-            `🎵 [STT] Processed ${audioChunkCount} audio chunks, ${totalAudioBytes} bytes total`
-          );
-        }
-
-        // Send the 16-bit PCM data to the server (exactly like browser client example)
-        if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-          // Create a JSON string with metadata
-          const metadata = JSON.stringify({
-            sampleRate: this.audioContext.sampleRate,
-          });
-          // Convert metadata to a byte array
-          const metadataBytes = new TextEncoder().encode(metadata);
-          // Create a buffer for metadata length (4 bytes for 32-bit integer)
-          const metadataLength = new ArrayBuffer(4);
-          const metadataLengthView = new DataView(metadataLength);
-          // Set the length of the metadata in the first 4 bytes
-          metadataLengthView.setInt32(0, metadataBytes.byteLength, true); // true for little-endian
-          // Combine metadata length, metadata, and audio data into a single message
-          const combinedData = new Blob([
-            metadataLength,
-            metadataBytes,
-            outputData.buffer,
-          ]);
-
-          // Log first few chunks in detail
-          if (audioChunkCount <= 3) {
-            console.log(`📤 [STT] Sending audio chunk ${audioChunkCount}:`, {
-              metadataLength: metadataBytes.byteLength,
-              audioLength: outputData.buffer.byteLength,
-              totalSize: combinedData.size,
-              sampleRate: this.audioContext.sampleRate,
-            });
-          }
-
-          this.websocket.send(combinedData);
-        } else {
-          console.error("❌ [STT] WebSocket not ready for audio data");
-        }
-      };
-    } catch (error) {
-      console.error("❌ [STT] Failed to start recording:", error);
-      this.handleError("Failed to access microphone");
-    }
-  }
-
-  stopRecording() {
-    if (!this.isRecording) return;
-
-    try {
-      console.log("🛑 [STT] Stopping recording...");
-      this.isRecording = false;
-      this.updateRecordingUI(false);
-
-      // Send stop command
-      if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-        console.log("📤 [STT] Sending stop command to server...");
-        this.websocket.send(JSON.stringify({ type: "stop" }));
-      } else {
-        console.error("❌ [STT] WebSocket not ready for stop command");
-      }
-
-      console.log("🧹 [STT] Cleaning up audio resources...");
-      // Clean up audio processing (following browser client example)
-      if (this.processor) {
-        this.processor.disconnect();
-        this.processor = null;
-      }
-      if (this.source) {
-        this.source.disconnect();
-        this.source = null;
-      }
-      if (this.audioContext) {
-        this.audioContext.close();
-        this.audioContext = null;
-      }
-      if (this.audioStream) {
-        this.audioStream.getTracks().forEach((track) => track.stop());
-        this.audioStream = null;
-      }
-      console.log("✅ [STT] Audio cleanup completed");
-    } catch (error) {
-      console.error("❌ [STT] Error stopping recording:", error);
-    }
-  }
-
-  updateRecordingUI(isRecording) {
-    const recordButton = domElements.get("recordButton");
-    if (recordButton) {
-      if (isRecording) {
-        recordButton.classList.add("recording");
-        recordButton.textContent = "🔴 Recording...";
-        recordButton.style.background = "#ef4444";
-      } else {
-        recordButton.classList.remove("recording");
-        recordButton.textContent = "🎤 Hold to Record";
-        recordButton.style.background = "";
-      }
     }
   }
 
@@ -363,39 +193,16 @@ export class STTService {
     const realtimeElement = document.getElementById("realtimeText");
 
     if (finalElement && text.trim()) {
-      // Add to final text with timestamp and clickable styling
+      // Add to final text with timestamp
       const timestamp = new Date().toLocaleTimeString();
       const transcriptLine = document.createElement("div");
       transcriptLine.className = "transcript-line";
-      transcriptLine.style.cursor = "pointer";
       transcriptLine.style.padding = "0.5rem";
       transcriptLine.style.borderRadius = "8px";
       transcriptLine.style.marginBottom = "0.5rem";
-      transcriptLine.style.transition = "background-color 0.2s";
       transcriptLine.textContent = `[${timestamp}] ${text}`;
 
-      // Add hover effect
-      transcriptLine.addEventListener("mouseenter", () => {
-        transcriptLine.style.backgroundColor = "rgba(126, 212, 173, 0.1)";
-      });
-      transcriptLine.addEventListener("mouseleave", () => {
-        transcriptLine.style.backgroundColor = "";
-      });
-
-      // Add click handler to copy to TTS input
-      transcriptLine.addEventListener("click", () => {
-        const messageText = document.getElementById("messageText");
-        if (messageText) {
-          messageText.value = text.trim();
-          messageText.focus();
-
-          // Visual feedback
-          transcriptLine.style.backgroundColor = "rgba(126, 212, 173, 0.2)";
-          setTimeout(() => {
-            transcriptLine.style.backgroundColor = "";
-          }, 1000);
-        }
-      });
+      // Click-to-copy functionality removed - only automatic STT → LLM → TTS flow
 
       finalElement.appendChild(transcriptLine);
 
@@ -455,5 +262,233 @@ export class STTService {
     }
 
     this.isConnected = false;
+  }
+
+  /**
+   * Check for potential sentence endings in real-time transcription
+   * This enables early LLM processing for faster response times
+   */
+  checkPotentialSentenceEnd(text) {
+    if (!text || text.trim().length < 10) {
+      return; // Too short to be meaningful
+    }
+
+    const trimmedText = text.trim();
+
+    // Check if text ends with sentence punctuation
+    if (this.sentenceEndPattern.test(trimmedText)) {
+      // Avoid processing the same sentence multiple times
+      const textHash = this.hashText(trimmedText);
+      if (this.potentialSentenceCache.has(textHash)) {
+        return;
+      }
+
+      // Add to cache with TTL
+      this.potentialSentenceCache.add(textHash);
+      setTimeout(() => {
+        this.potentialSentenceCache.delete(textHash);
+      }, 5000); // 5 second TTL
+
+      console.log("🎯 [STT] Potential sentence end detected:", trimmedText);
+
+      // Trigger early LLM processing callback
+      if (this.onPotentialSentence) {
+        this.onPotentialSentence(trimmedText);
+      }
+    }
+
+    this.lastPartialText = trimmedText;
+  }
+
+  /**
+   * Simple hash function for text deduplication
+   */
+  hashText(text) {
+    let hash = 0;
+    for (let i = 0; i < text.length; i++) {
+      const char = text.charCodeAt(i);
+      hash = (hash << 5) - hash + char;
+      hash = hash & hash; // Convert to 32-bit integer
+    }
+    return hash.toString();
+  }
+
+  /**
+   * Set callback for potential sentence detection
+   */
+  setOnPotentialSentence(callback) {
+    this.onPotentialSentence = callback;
+  }
+
+  /**
+   * Toggle conversation session - start if stopped, stop if active
+   * Recording is automatic based on VAD when conversation is active
+   */
+  toggleConversation() {
+    if (this.isConversationActive) {
+      this.stopConversation();
+    } else {
+      this.startConversation();
+    }
+  }
+
+  /**
+   * Start conversation session - enables automatic VAD-based recording
+   */
+  async startConversation() {
+    if (this.isConversationActive) return;
+
+    console.log("🎤 [STT] Starting conversation session...");
+
+    try {
+      // Update UI to listening state
+      uiState.showListening("Conversation active - listening for speech...");
+
+      // Connect WebSocket if not connected
+      if (!this.isConnected) {
+        console.log("🔌 [STT] Connecting to WebSocket...");
+        await this.connectWebSocket();
+        // Wait a bit for connection to establish
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+
+      console.log("🎙️ [STT] Requesting microphone access for conversation...");
+      // Request microphone access for VAD-based recording
+      this.audioStream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+      });
+      console.log("✅ [STT] Microphone access granted for conversation");
+
+      // Set up audio processing for VAD
+      this.audioContext = new AudioContext();
+      this.source = this.audioContext.createMediaStreamSource(this.audioStream);
+      this.processor = this.audioContext.createScriptProcessor(256, 1, 1);
+
+      this.source.connect(this.processor);
+      this.processor.connect(this.audioContext.destination);
+
+      console.log(
+        "🎤 Conversation started - VAD will automatically detect speech"
+      );
+      this.isConversationActive = true;
+      this.updateConversationUI(true);
+
+      // Send start command to enable VAD on server
+      if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
+        console.log("📤 [STT] Enabling VAD for conversation...");
+        this.websocket.send(JSON.stringify({ command: "start" }));
+      } else {
+        console.error("❌ [STT] WebSocket not ready for conversation start");
+      }
+
+      let audioChunkCount = 0;
+      let totalAudioBytes = 0;
+
+      // Process audio data for VAD (server handles recording start/stop)
+      this.processor.onaudioprocess = (e) => {
+        if (!this.isConversationActive) return;
+
+        const inputData = e.inputBuffer.getChannelData(0);
+        const outputData = new Int16Array(inputData.length);
+
+        // Convert to 16-bit PCM
+        for (let i = 0; i < inputData.length; i++) {
+          outputData[i] = Math.max(
+            -32768,
+            Math.min(32767, Math.floor(inputData[i] * 32768))
+          );
+        }
+
+        audioChunkCount++;
+        totalAudioBytes += outputData.buffer.byteLength;
+
+        // Send audio data for VAD processing
+        if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
+          const metadata = JSON.stringify({
+            sampleRate: this.audioContext.sampleRate,
+          });
+          const metadataBytes = new TextEncoder().encode(metadata);
+          const metadataLength = new ArrayBuffer(4);
+          const metadataLengthView = new DataView(metadataLength);
+          metadataLengthView.setInt32(0, metadataBytes.byteLength, true);
+
+          const combinedData = new Blob([
+            metadataLength,
+            metadataBytes,
+            outputData.buffer,
+          ]);
+
+          this.websocket.send(combinedData);
+        }
+      };
+    } catch (error) {
+      console.error("❌ [STT] Failed to start conversation:", error);
+      this.handleError("Failed to start conversation");
+    }
+  }
+
+  /**
+   * Stop conversation session - disables VAD and cleans up
+   */
+  stopConversation() {
+    if (!this.isConversationActive) return;
+
+    try {
+      console.log("🛑 [STT] Stopping conversation session...");
+      this.isConversationActive = false;
+      this.isRecording = false; // Also stop any active recording
+      this.updateConversationUI(false);
+
+      // Update UI to standby state
+      uiState.showStandby("Conversation ended");
+
+      // Send stop command to disable VAD
+      if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
+        console.log("📤 [STT] Disabling VAD for conversation...");
+        this.websocket.send(JSON.stringify({ command: "stop" }));
+      }
+
+      console.log("🧹 [STT] Cleaning up conversation resources...");
+      // Clean up audio processing
+      if (this.processor) {
+        this.processor.disconnect();
+        this.processor = null;
+      }
+      if (this.source) {
+        this.source.disconnect();
+        this.source = null;
+      }
+      if (this.audioContext) {
+        this.audioContext.close();
+        this.audioContext = null;
+      }
+      if (this.audioStream) {
+        this.audioStream.getTracks().forEach((track) => track.stop());
+        this.audioStream = null;
+      }
+      console.log("✅ [STT] Conversation cleanup completed");
+    } catch (error) {
+      console.error("❌ [STT] Error stopping conversation:", error);
+    }
+  }
+
+  /**
+   * Update UI for conversation session state
+   */
+  updateConversationUI(isActive) {
+    const recordButton = domElements.get("recordButton");
+    if (recordButton) {
+      if (isActive) {
+        recordButton.classList.add("recording");
+        recordButton.textContent = "🛑 Stop Conversation";
+        recordButton.style.background = "#ef4444";
+        recordButton.style.color = "white";
+      } else {
+        recordButton.classList.remove("recording");
+        recordButton.textContent = "🎤 Start Conversation";
+        recordButton.style.background = "";
+        recordButton.style.color = "";
+      }
+    }
   }
 }

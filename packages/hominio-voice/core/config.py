@@ -48,19 +48,27 @@ class Config:
     STT_REALTIME_ENABLED = True
     STT_REALTIME_MODEL = "tiny"
     STT_REALTIME_PAUSE = 0.02
-    STT_SILERO_SENSITIVITY = 0.05
-    STT_WEBRTC_SENSITIVITY = 3
+    
+    # Enhanced VAD Configuration for better voice activity detection
+    STT_SILERO_SENSITIVITY = 0.4  # Increased from 0.05 for better detection
+    STT_WEBRTC_SENSITIVITY = 2    # Reduced from 3 for more sensitive detection
     STT_POST_SPEECH_SILENCE = 0.7
-    STT_MIN_RECORDING_LENGTH = 1.1
-    STT_MIN_GAP_BETWEEN_RECORDINGS = 0
-    STT_EARLY_TRANSCRIPTION_SILENCE = 0.2
+    STT_MIN_RECORDING_LENGTH = 0.8  # Reduced from 1.1 for faster response
+    STT_MIN_GAP_BETWEEN_RECORDINGS = 0.1  # Small gap to prevent audio artifacts
+    STT_EARLY_TRANSCRIPTION_SILENCE = 0.3  # Increased from 0.2 for better early detection
+    
+    # Dynamic VAD settings for different conversation phases
+    STT_MID_SENTENCE_PAUSE = 0.3      # Shorter pause for mid-sentence detection
+    STT_END_SENTENCE_PAUSE = 0.7      # Standard pause for sentence endings
+    STT_UNKNOWN_SENTENCE_PAUSE = 1.0  # Longer pause for unclear speech patterns
+    
     STT_BEAM_SIZE = 1
     STT_BEAM_SIZE_REALTIME = 1
     STT_DEVICE = 'cpu'
     STT_COMPUTE_TYPE = 'int8'
     
     # LLM Configuration
-    LLM_MODEL = "phala/qwen-2.5-7b-instruct"
+    LLM_MODEL = "phala/llama-3.3-70b-instruct"
     LLM_BASE_URL = "https://api.redpill.ai/v1"
     LLM_API_KEY = os.getenv("REDPILL_API_KEY")
     
@@ -75,9 +83,9 @@ class Config:
     WS_PING_TIMEOUT = 10
     
     @classmethod
-    def get_stt_config(cls) -> Dict[str, Any]:
-        """Get STT engine configuration"""
-        return {
+    def get_stt_config(cls, vad_callbacks: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Get STT engine configuration with optional VAD callbacks"""
+        config = {
             'model': cls.STT_MODEL,
             'language': cls.STT_LANGUAGE,
             'use_microphone': False,
@@ -99,6 +107,12 @@ class Config:
             'compute_type': cls.STT_COMPUTE_TYPE,
             'initial_prompt': "Add periods only for complete sentences. Use ellipsis (...) for unfinished thoughts."
         }
+        
+        # Add VAD callbacks if provided
+        if vad_callbacks:
+            config.update(vad_callbacks)
+        
+        return config
     
     @classmethod
     def get_audio_config(cls) -> Dict[str, Any]:

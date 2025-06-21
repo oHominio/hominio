@@ -1,6 +1,6 @@
 /**
  * Audio Service
- * Handles audio playback and processing
+ * Handles audio playback and processing with visual state integration
  */
 import { domElements } from "../core/dom-elements.js";
 import { uiState } from "../core/ui-state.js";
@@ -10,6 +10,31 @@ export class AudioService {
     this.audioChunks = [];
     this.isReceivingAudio = false;
     this.currentAudioUrl = null;
+    this.lastPlayedText = "";
+    this.lastPlayedTimestamp = 0;
+  }
+
+  /**
+   * Check if we should skip audio to prevent looping
+   */
+  shouldSkipAudio(identifier = null) {
+    const currentTime = Date.now();
+
+    // If we have an identifier (like text hash), check for duplicates
+    if (identifier) {
+      if (
+        identifier === this.lastPlayedText &&
+        currentTime - this.lastPlayedTimestamp < 5000
+      ) {
+        // 5 second window
+        console.warn("🔄 Skipping duplicate audio playback");
+        return true;
+      }
+      this.lastPlayedText = identifier;
+    }
+
+    this.lastPlayedTimestamp = currentTime;
+    return false;
   }
 
   /**
@@ -19,7 +44,8 @@ export class AudioService {
     if (!this.isReceivingAudio) {
       this.isReceivingAudio = true;
       this.audioChunks = [];
-      uiState.updateStatusText("Receiving voice data...", "active");
+      // Update to speaking state when we start receiving audio
+      uiState.showSpeaking("Receiving voice data...");
     }
     this.audioChunks.push(chunk);
   }
@@ -29,13 +55,22 @@ export class AudioService {
    */
   async playAudioChunks() {
     if (this.audioChunks.length === 0) {
-      uiState.updateStatusText("No audio data received");
+      uiState.showStandby("No audio data received");
+      return false;
+    }
+
+    // Check for duplicate audio (simple check based on chunk count and size)
+    const audioIdentifier = `${this.audioChunks.length}_${this.audioChunks[0]?.byteLength || 0}`;
+    if (this.shouldSkipAudio(audioIdentifier)) {
+      uiState.showStandby("Duplicate audio skipped");
+      this.resetAudioState();
       return false;
     }
 
     const audioPlayer = domElements.audioPlayer;
     if (!audioPlayer) {
       console.error("Audio player element not found");
+      uiState.showStandby("Audio player not found");
       return false;
     }
 
@@ -51,10 +86,11 @@ export class AudioService {
       audioPlayer.src = this.currentAudioUrl;
       audioPlayer.style.display = "block";
 
+      // Update to speaking state
+      uiState.showSpeaking("Playing audio");
+
       // Play audio
       await audioPlayer.play();
-
-      uiState.updateStatusText("Playing audio", "active");
 
       // Set up event listeners
       this.setupAudioEventListeners(audioPlayer);
@@ -62,7 +98,7 @@ export class AudioService {
       return true;
     } catch (error) {
       console.error("Error playing audio:", error);
-      uiState.updateStatusText("Audio playback error");
+      uiState.showStandby("Audio playback error");
       this.resetAudioState();
       return false;
     }
@@ -77,16 +113,30 @@ export class AudioService {
     audioPlayer.onerror = null;
 
     audioPlayer.onended = () => {
+      console.log("🔊 Audio playback ended");
       this.cleanupAudioUrl();
       audioPlayer.style.display = "none";
-      uiState.showReady();
+
+      // Return to standby state after audio ends
+      uiState.showStandby();
       this.resetAudioState();
     };
 
     audioPlayer.onerror = (error) => {
       console.error("Audio playback error:", error);
-      uiState.updateStatusText("Audio playback failed");
+      uiState.showStandby("Audio playback failed");
       this.resetAudioState();
+    };
+
+    // Add additional event listeners for better state tracking
+    audioPlayer.onplay = () => {
+      console.log("🔊 Audio playback started");
+      uiState.showSpeaking("Audio playing");
+    };
+
+    audioPlayer.onpause = () => {
+      console.log("🔊 Audio playback paused");
+      uiState.showStandby("Audio paused");
     };
   }
 
@@ -119,6 +169,7 @@ export class AudioService {
       audioPlayer.currentTime = 0;
     }
     this.resetAudioState();
+    uiState.showStandby("Audio stopped");
   }
 
   /**
@@ -137,6 +188,7 @@ export class AudioService {
       isReceivingAudio: this.isReceivingAudio,
       chunksCount: this.audioChunks.length,
       isPlaying: this.isPlaying(),
+      hasCurrentUrl: !!this.currentAudioUrl,
     };
   }
 }

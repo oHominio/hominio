@@ -64,18 +64,6 @@ class HominiVoiceApp {
    * Set up event listeners for UI interactions
    */
   setupEventListeners() {
-    // Send button click
-    const sendButton = domElements.sendButton;
-    if (sendButton) {
-      const sendHandler = () => this.handleSendMessage();
-      sendButton.addEventListener("click", sendHandler);
-      this.eventListeners.push({
-        element: sendButton,
-        event: "click",
-        handler: sendHandler,
-      });
-    }
-
     // Check status button click
     const checkStatusButton = domElements.get("checkStatusButton");
     if (checkStatusButton) {
@@ -85,23 +73,6 @@ class HominiVoiceApp {
         element: checkStatusButton,
         event: "click",
         handler: statusHandler,
-      });
-    }
-
-    // Enter key in textarea
-    const messageText = domElements.messageText;
-    if (messageText) {
-      const keyHandler = (event) => {
-        if (event.key === "Enter" && !event.shiftKey) {
-          event.preventDefault();
-          this.handleSendMessage();
-        }
-      };
-      messageText.addEventListener("keydown", keyHandler);
-      this.eventListeners.push({
-        element: messageText,
-        event: "keydown",
-        handler: keyHandler,
       });
     }
 
@@ -118,19 +89,30 @@ class HominiVoiceApp {
   }
 
   /**
-   * Initialize STT Service
+   * Initialize STT Service with enhanced visual state integration
    */
   initializeSTTService() {
-    // Set up STT callbacks - transcriptions are now displayed directly in STT interface
+    // Set up STT callbacks with visual state management
     this.sttService.setOnPartialTranscription((text) => {
       console.log("Partial:", text);
-      // Display is handled automatically by STT service
+      // Show thinking state when we get partial transcription
+      if (text && text.trim()) {
+        uiState.showThinking("Processing speech...");
+      }
     });
 
     this.sttService.setOnFinalTranscription((text) => {
       console.log("Final:", text);
-      // Display is handled automatically by STT service
-      // Optionally could also copy to TTS input if user wants
+      // Show thinking state for LLM processing
+      uiState.showThinking("Processing your request...");
+    });
+
+    // NEW: Set up potential sentence detection for early LLM processing
+    this.sttService.setOnPotentialSentence((text) => {
+      console.log("🎯 Potential sentence detected for early processing:", text);
+      // This would trigger early LLM processing on the backend
+      // The backend conversation manager handles the actual early processing
+      uiState.showThinking("Early processing detected sentence...");
     });
 
     this.sttService.setOnError((error) => {
@@ -139,9 +121,16 @@ class HominiVoiceApp {
 
     this.sttService.setOnStatusChange((status) => {
       console.log("STT Status:", status);
+      // Update status without changing conversation state if we're in an active conversation
+      const currentState = uiState.getCurrentStates().conversationState;
+      if (currentState === "standby") {
+        uiState.updateStatusText(status);
+      }
     });
 
-    console.log("STT Service initialized");
+    console.log(
+      "STT Service initialized with visual state integration and early sentence detection"
+    );
   }
 
   /**
@@ -159,29 +148,7 @@ class HominiVoiceApp {
     });
   }
 
-  /**
-   * Handle send message button click
-   */
-  async handleSendMessage() {
-    const messageText = domElements.messageText;
-    if (!messageText) return;
-
-    const text = messageText.value.trim();
-    if (!text) {
-      uiState.updateStatusText("Please enter some text to speak");
-      return;
-    }
-
-    try {
-      const success = await ttsService.sendText(text);
-      if (!success) {
-        uiState.showError("Failed to send message");
-      }
-    } catch (error) {
-      console.error("Error sending message:", error);
-      uiState.showError("Error sending message");
-    }
-  }
+  // Manual message sending removed - only automatic STT → LLM → TTS flow
 
   /**
    * Handle check status button click
@@ -233,7 +200,6 @@ class HominiVoiceApp {
 export const app = new HominiVoiceApp();
 
 // Global functions for backward compatibility (if needed)
-window.sendMessage = () => app.handleSendMessage();
 window.checkModelStatus = () => app.handleCheckStatus();
 
 // Auto-initialize when DOM is ready

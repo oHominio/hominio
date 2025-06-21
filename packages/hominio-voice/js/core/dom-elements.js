@@ -10,9 +10,7 @@ export class DOMElements {
 
   initializeElements() {
     const elementIds = [
-      // TTS elements
-      "sendButton",
-      "messageText",
+      // TTS elements (manual input removed - only automatic push)
       "statusText",
       "audioPlayer",
       "voiceAvatar",
@@ -50,14 +48,8 @@ export class DOMElements {
   }
 
   // Convenience getters for commonly used elements
-  get sendButton() {
-    return this.get("sendButton");
-  }
   get recordButton() {
     return this.get("recordButton");
-  }
-  get messageText() {
-    return this.get("messageText");
   }
   get statusText() {
     return this.get("statusText");
