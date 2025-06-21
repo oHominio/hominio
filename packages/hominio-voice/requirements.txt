@@ -5,4 +5,5 @@ RealtimeTTS[kokoro]
 RealtimeSTT
 scipy
 numpy
-python-multipart 
+python-multipart
+openai 

@@ -33,19 +33,30 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Set environment variables for headless operation (RealtimeSTT server example pattern)
+# Set environment variables for headless operation
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
-# Suppress ALSA errors in headless environment
+
+# Comprehensive ALSA and audio suppression for headless environment
 ENV ALSA_PCM_CARD=-1
 ENV ALSA_PCM_DEVICE=-1
 ENV ALSA_MIXER_CARD=-1
 ENV ALSA_MIXER_DEVICE=-1
-# Redirect ALSA errors to null
 ENV ALSA_CARD=none
-# Additional audio suppression
 ENV SDL_AUDIODRIVER=dummy
 ENV PULSE_RUNTIME_PATH=/tmp/pulse-runtime
+
+# Additional audio system suppression
+ENV PA_ALSA_PLUGHW=1
+ENV PULSE_SCRIPT=/dev/null
+ENV PULSE_SYSTEM=0
+ENV PULSE_RUNTIME_PATH=/tmp/pulse-runtime
+ENV XDG_RUNTIME_DIR=/tmp
+
+# Create dummy ALSA config to suppress errors
+RUN mkdir -p /root/.asoundrc.d && \
+    echo "pcm.!default { type plug slave { pcm null } }" > /root/.asoundrc && \
+    echo "ctl.!default { type hw card 0 }" >> /root/.asoundrc
 
 # Expose port
 EXPOSE 8080

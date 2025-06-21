@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, UploadFile, File, HTTPException
+from fastapi import FastAPI, WebSocket, UploadFile, File, HTTPException, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from RealtimeTTS import TextToAudioStream, KokoroEngine
@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Dict, Any
 import json
 import multiprocessing
+import openai
 
 # Additional imports for audio processing (following server examples)
 try:
@@ -65,6 +66,7 @@ def signal_handler(signum, frame):
             kokoro_engine = None
     except:
         pass
+
     sys.exit(0)
 
 # Register signal handlers
@@ -79,6 +81,7 @@ except:
 kokoro_engine = None
 stt_engine = None
 stt_message_queue = None
+llm_client = None
 
 # Initialize status dictionaries
 kokoro_status = {
@@ -90,6 +93,9 @@ kokoro_status = {
 
 stt_status = "initializing"
 stt_ready_event = asyncio.Event()
+
+# Global variable to hold the active TTS WebSocket connection
+active_tts_ws: WebSocket = None
 
 def create_wave_header_for_engine(engine):
     """Create WAV header for the given engine"""
@@ -112,8 +118,8 @@ def create_wave_header_for_engine(engine):
     return wave_header_bytes
 
 async def initialize_kokoro_engine():
-    """Initialize KokoroEngine in background"""
-    global kokoro_status, kokoro_engine, stream
+    """Initialize KokoroEngine for headless operation"""
+    global kokoro_status, kokoro_engine
     
     try:
         kokoro_status.update({
@@ -124,41 +130,43 @@ async def initialize_kokoro_engine():
         })
         
         # Initialize KokoroEngine with American English voice
-        kokoro_engine = KokoroEngine(voice="af_heart")  # American female voice
-        
-        kokoro_status.update({
-            "status": "loading",
-            "progress": 60,
-            "message": "Setting up audio stream...",
-            "last_updated": datetime.now().isoformat()
-        })
-        
-        # Create TextToAudioStream
-        stream = TextToAudioStream(kokoro_engine, muted=True)
+        # No audio device initialization needed for headless operation
+        kokoro_engine = KokoroEngine(voice="af_heart")
         
         kokoro_status.update({
             "status": "loading",
             "progress": 80,
-            "message": "Prewarming engine...",
+            "message": "Testing engine in headless mode...",
             "last_updated": datetime.now().isoformat()
         })
         
-        # Prewarm the engine with a short text
-        stream.feed("Warm up").play(muted=True)
+        # Test the engine by generating a small sample (no playback)
+        test_stream = TextToAudioStream(kokoro_engine, muted=True)
+        test_audio_chunks = []
+        
+        def collect_chunk(chunk):
+            test_audio_chunks.append(chunk)
+        
+        test_stream.feed("Test")
+        test_stream.play(muted=True, on_audio_chunk=collect_chunk)
+        
+        if test_audio_chunks:
+            logger.info(f"✅ Kokoro engine test successful - generated {len(test_audio_chunks)} audio chunks")
         
         kokoro_status.update({
             "status": "ready",
             "progress": 100,
-            "message": "Kokoro TTS engine ready for synthesis",
+            "message": "Kokoro TTS engine ready for headless synthesis",
             "last_updated": datetime.now().isoformat(),
             "model_info": {
                 "engine": "KokoroEngine",
                 "voice": "af_heart",
-                "language": "English (American)"
+                "language": "English (American)",
+                "mode": "headless"
             }
         })
         
-        logger.info("✅ KokoroEngine initialized successfully!")
+        logger.info("✅ KokoroEngine initialized successfully in headless mode!")
         
     except Exception as e:
         logger.error(f"Failed to initialize KokoroEngine: {e}")
@@ -171,31 +179,135 @@ async def initialize_kokoro_engine():
         })
 
 async def initialize_stt_engine():
-    """Initialize the STT engine using RealtimeSTT"""
-    global stt_engine, stt_status, stt_ready_event
+    """Initialize RealtimeSTT engine with proper callback architecture"""
+    global stt_engine, stt_status, stt_message_queue
     
     try:
         print("🎤 Initializing STT engine...")
+        stt_status = "initializing"
         
-        # Import required modules
-        import multiprocessing
-        multiprocessing.set_start_method('spawn', force=True)
-        
-        # Set environment variable to avoid tokenizer warnings
+        # Suppress CUDA warnings and ALSA errors for headless operation
+        os.environ['CUDA_VISIBLE_DEVICES'] = ''
         os.environ['TOKENIZERS_PARALLELISM'] = 'false'
         
-        def create_recorder():
-            from RealtimeSTT import AudioToTextRecorder
-            import asyncio
-            
-            # Get the current event loop for callbacks
+        # Additional audio suppression
+        os.environ['SDL_AUDIODRIVER'] = 'dummy'
+        os.environ['PULSE_RUNTIME_PATH'] = '/tmp/pulse-runtime'
+        os.environ['ALSA_CARD'] = 'none'
+        
+        # Create message queue for STT WebSocket communication first
+        stt_message_queue = asyncio.Queue()
+
+        # Get the current event loop for callbacks
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+
+        # Define callback functions at module level for proper scoping
+        async def trigger_llm_and_tts(text: str):
+            """Triggers the LLM and streams the response to the TTS engine."""
+            logger.info(f"🎤 User said: '{text}'")
+            if not llm_client:
+                logger.error("LLM client not initialized. Cannot process request.")
+                return
+            if not active_tts_ws:
+                logger.warning("No active TTS client. Cannot send audio response.")
+                return
+
             try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-            
-            def preprocess_text(text):
-                """Clean up transcribed text"""
+                # Get LLM response synchronously for RealtimeTTS
+                async def get_llm_response(user_text: str):
+                    """Get complete LLM response as a string."""
+                    try:
+                        response = await llm_client.chat.completions.create(
+                            model="phala/qwen-2.5-7b-instruct",
+                            messages=[{"role": "user", "content": user_text}],
+                            stream=False  # Get complete response
+                        )
+                        content = response.choices[0].message.content
+                        logger.info(f"🤖 LLM response: '{content}'")
+                        return content
+                    except Exception as e:
+                        logger.error(f"Error getting LLM response: {e}")
+                        return "I'm sorry, I encountered an error."
+
+                # Get the LLM response
+                llm_response = await get_llm_response(text)
+                
+                # Create a new stream for this synthesis (headless mode)
+                tts_stream = TextToAudioStream(kokoro_engine, muted=True)
+
+                # Store audio chunks to send them after synthesis
+                audio_chunks = []
+                
+                def on_audio_chunk(chunk):
+                    """Collect audio chunks during synthesis"""
+                    audio_chunks.append(chunk)
+
+                # Send WAV header first for proper audio playback on client
+                if active_tts_ws:
+                    wav_header = create_wave_header_for_engine(kokoro_engine)
+                    await active_tts_ws.send_bytes(wav_header)
+
+                # Feed the LLM response to TTS and synthesize in a thread
+                def synthesize_sync():
+                    tts_stream.feed(llm_response)
+                    tts_stream.play(
+                        muted=True,  # Ensure no local audio playback
+                        on_audio_chunk=on_audio_chunk
+                    )
+                
+                # Run synthesis in a separate thread
+                import threading
+                synthesis_thread = threading.Thread(target=synthesize_sync, daemon=True)
+                synthesis_thread.start()
+                synthesis_thread.join()
+                
+                # Send all collected audio chunks
+                if active_tts_ws:
+                    for chunk in audio_chunks:
+                        await active_tts_ws.send_bytes(chunk)
+                
+                # Send end marker to signal completion
+                if active_tts_ws:
+                    await active_tts_ws.send_text("END")
+                    logger.info("🔊 TTS synthesis completed, audio sent to client")
+
+            except Exception as e:
+                logger.error(f"Error during TTS synthesis: {e}")
+                # Send error marker to client
+                if active_tts_ws:
+                    try:
+                        await active_tts_ws.send_text("ERROR")
+                    except:
+                        pass
+
+        def process_full_sentence(full_sentence: str):
+            """Callback for when a full sentence is transcribed."""
+            logger.info(f"✅ STT Full sentence: {full_sentence}")
+
+            # Schedule the async task in the main event loop
+            if loop and not loop.is_closed():
+                asyncio.run_coroutine_threadsafe(
+                    trigger_llm_and_tts(full_sentence),
+                    loop
+                )
+            else:
+                logger.error("Event loop not available to schedule LLM call.")
+
+            # Send the transcribed sentence to the client for display
+            message = {'type': 'fullSentence', 'text': full_sentence}
+            if loop and not loop.is_closed():
+                asyncio.run_coroutine_threadsafe(
+                    stt_message_queue.put(json.dumps(message)),
+                    loop
+                )
+
+        def on_realtime_transcription(text):
+            """Handle real-time transcription updates"""
+            if loop and not loop.is_closed():
+                # Clean up text
                 text = text.lstrip()
                 if text.startswith("..."):
                     text = text[3:]
@@ -206,108 +318,61 @@ async def initialize_stt_engine():
                 text = text.lstrip()
                 if text:
                     text = text[0].upper() + text[1:]
-                return text
-            
-            def on_realtime_transcription(text):
-                """Handle real-time transcription updates"""
-                if loop and not loop.is_closed():
-                    text = preprocess_text(text)
-                    message = {
-                        'type': 'realtime',
-                        'text': text
-                    }
-                    # Put message in queue for WebSocket broadcast
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            stt_message_queue.put(json.dumps(message)), 
-                            loop
-                        )
-                    except Exception as e:
-                        print(f"❌ Error sending realtime transcription: {e}")
-            
-            # STT configuration matching RealtimeSTT server examples
-            stt_config = {
-                'model': 'tiny',  # Fastest model for real-time processing
-                'language': 'en',
-                'use_microphone': False,  # We feed audio manually
-                'spinner': False,
-                'enable_realtime_transcription': True,
-                'realtime_model_type': 'tiny',
-                'realtime_processing_pause': 0.02,
-                'on_realtime_transcription_update': on_realtime_transcription,
-                'silero_sensitivity': 0.05,
-                'webrtc_sensitivity': 3,
-                'post_speech_silence_duration': 0.7,
-                'min_length_of_recording': 1.1,
-                'min_gap_between_recordings': 0,
-                'silero_deactivity_detection': True,
-                'early_transcription_on_silence': 0.2,
-                'beam_size': 1,  # Minimal beam size for speed
-                'beam_size_realtime': 1,
-                'no_log_file': True,
-                'device': 'cpu',  # Use CPU to avoid CUDA issues
-                'compute_type': 'int8',  # Optimize for CPU
-                'level': logging.WARNING,
-                'initial_prompt': "Add periods only for complete sentences. Use ellipsis (...) for unfinished thoughts."
-            }
-            
-            return AudioToTextRecorder(**stt_config)
+                
+                message = {
+                    'type': 'realtime',
+                    'text': text
+                }
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        stt_message_queue.put(json.dumps(message)), 
+                        loop
+                    )
+                except Exception as e:
+                    print(f"❌ Error sending realtime transcription: {e}")
+        
+        # STT configuration matching RealtimeSTT server examples
+        stt_config = {
+            'model': 'tiny',
+            'language': 'en',
+            'use_microphone': False,
+            'spinner': False,
+            'enable_realtime_transcription': True,
+            'realtime_model_type': 'tiny',
+            'realtime_processing_pause': 0.02,
+            'on_realtime_transcription_update': on_realtime_transcription,
+            'silero_sensitivity': 0.05,
+            'webrtc_sensitivity': 3,
+            'post_speech_silence_duration': 0.7,
+            'min_length_of_recording': 1.1,
+            'min_gap_between_recordings': 0,
+            'silero_deactivity_detection': True,
+            'early_transcription_on_silence': 0.2,
+            'beam_size': 1,
+            'beam_size_realtime': 1,
+            'no_log_file': True,
+            'device': 'cpu',
+            'compute_type': 'int8',
+            'level': logging.WARNING,
+            'initial_prompt': "Add periods only for complete sentences. Use ellipsis (...) for unfinished thoughts."
+        }
         
         # Create recorder
-        stt_engine = create_recorder()
+        from RealtimeSTT import AudioToTextRecorder
+        stt_engine = AudioToTextRecorder(**stt_config)
         
-        # Create message queue for STT WebSocket communication
-        global stt_message_queue
-        stt_message_queue = asyncio.Queue()
-        
-        # Start transcription thread (THIS IS THE MISSING PIECE!)
+        # Start transcription worker thread with proper callback access
         def transcription_worker():
             """Worker thread that continuously processes transcriptions"""
             print("🔄 Starting STT transcription worker thread...")
             
-            def process_full_sentence(full_sentence):
-                """Process complete transcribed sentences"""
-                try:
-                    # Clean up the text
-                    full_sentence = full_sentence.lstrip()
-                    if full_sentence.startswith("..."):
-                        full_sentence = full_sentence[3:]
-                    if full_sentence.endswith("...'."):
-                        full_sentence = full_sentence[:-1]
-                    if full_sentence.endswith("...'"):
-                        full_sentence = full_sentence[:-1]
-                    full_sentence = full_sentence.lstrip()
-                    if full_sentence:
-                        full_sentence = full_sentence[0].upper() + full_sentence[1:]
-                    
-                    # Create message for WebSocket broadcast
-                    message = {
-                        'type': 'fullSentence',
-                        'text': full_sentence
-                    }
-                    
-                    # Send to WebSocket clients
-                    try:
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        loop.run_until_complete(stt_message_queue.put(json.dumps(message)))
-                        loop.close()
-                    except Exception as e:
-                        print(f"❌ Error sending full sentence: {e}")
-                    
-                    print(f"✅ STT Full sentence: {full_sentence}")
-                    
-                except Exception as e:
-                    print(f"❌ Error processing full sentence: {e}")
-            
-            # Main transcription loop - this is what was missing!
             while True:
                 try:
-                    # This call blocks until audio is processed and returns transcribed text
+                    # This call blocks until audio is processed and calls process_full_sentence
                     stt_engine.text(process_full_sentence)
                 except Exception as e:
                     print(f"❌ STT transcription error: {e}")
-                    time.sleep(0.1)  # Brief pause before retrying
+                    time.sleep(0.1)
         
         # Start the transcription worker thread
         import threading
@@ -335,6 +400,22 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting Hominio Voice application...")
     
+    # Initialize LLM Client
+    global llm_client
+    try:
+        api_key = os.getenv("REDPILL_API_KEY")
+        if not api_key:
+            raise ValueError("REDPILL_API_KEY environment variable not set.")
+        
+        llm_client = openai.AsyncOpenAI(
+            api_key=api_key,
+            base_url="https://api.redpill.ai/v1",
+        )
+        logger.info("✅ OpenAI client for RedPill initialized successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize LLM Client: {e}")
+        # Application can continue, but conversational features will fail.
+
     # Initialize engines sequentially to avoid resource conflicts
     try:
         logger.info("Initializing TTS engine...")
@@ -464,19 +545,7 @@ async def stt_websocket_endpoint(websocket: WebSocket):
                 logger.error(f"Error resampling audio: {e}")
                 return audio_data
         
-        def preprocess_text(text):
-            """Clean up transcribed text following RealtimeSTT server example"""
-            text = text.lstrip()
-            if text.startswith("..."):
-                text = text[3:]
-            if text.endswith("...'."):
-                text = text[:-1]
-            if text.endswith("...'"):
-                text = text[:-1]
-            text = text.lstrip()
-            if text:
-                text = text[0].upper() + text[1:]
-            return text
+
         
         # Main message processing loop
         while True:
@@ -583,74 +652,107 @@ async def model_status_websocket(websocket: WebSocket):
     finally:
         logger.info("Model status WebSocket connection closed")
 
+@app.websocket("/ws/tts-push")
+async def tts_push_websocket_endpoint(websocket: WebSocket):
+    """TTS Push WebSocket endpoint - for server-initiated audio streaming (LLM integration)"""
+    global active_tts_ws
+    await websocket.accept()
+    logger.info("TTS Push WebSocket client connected.")
+    active_tts_ws = websocket
+    
+    try:
+        # Keep the connection alive, waiting for the server to push audio
+        while True:
+            # This is a keep-alive loop for server-push audio
+            # The server will push audio via the active_tts_ws global variable
+            try:
+                await websocket.receive_text()  # Just keep connection alive
+            except WebSocketDisconnect:
+                break
+    except WebSocketDisconnect:
+        logger.info("TTS Push WebSocket client disconnected.")
+    except Exception as e:
+        logger.error(f"TTS Push WebSocket error: {e}")
+    finally:
+        if active_tts_ws == websocket:
+            active_tts_ws = None
+        logger.info("Cleaned up TTS Push WebSocket connection.")
+
 @app.websocket("/ws/tts")
 async def websocket_endpoint(websocket: WebSocket):
+    """TTS WebSocket endpoint - receives text and sends audio chunks"""
+    global active_tts_ws
     await websocket.accept()
-    logger.info("WebSocket connection established")
+    logger.info("TTS WebSocket client connected.")
+    active_tts_ws = websocket
     
     try:
         while True:
-            # Check if model is ready before processing
-            if kokoro_status["status"] != "ready" or not kokoro_engine or not stream:
-                await websocket.send_json({
-                    "type": "status",
-                    "message": f"Engine is {kokoro_status['status']}: {kokoro_status['message']}",
-                    "progress": kokoro_status["progress"]
-                })
-                await asyncio.sleep(5)
+            # Receive text from client for synthesis
+            message = await websocket.receive_text()
+            
+            if not message or not message.strip():
+                continue
+                
+            logger.info(f"🔊 Received text for TTS synthesis: {message[:50]}...")
+            
+            # Check if TTS engine is ready
+            if kokoro_status["status"] != "ready":
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "message": "TTS engine not ready"
+                }))
                 continue
             
-            # Receive text from client
-            data = await websocket.receive_text()
-            logger.info(f"Received text: {data}")
-            
-            # Synthesize audio using KokoroEngine for real-time streaming
             try:
-                # Create a new stream for this synthesis to avoid conflicts
-                synthesis_stream = TextToAudioStream(kokoro_engine, muted=True)
+                # Create a new stream for this synthesis (headless mode)
+                tts_stream = TextToAudioStream(kokoro_engine, muted=True)
                 
-                # Store chunks to send after synthesis completes
+                # Store audio chunks to send them after synthesis
                 audio_chunks = []
-                header_sent = False
                 
-                def collect_audio_chunk(chunk):
-                    nonlocal header_sent
-                    # Collect chunks to send later (thread-safe)
-                    if not header_sent:
-                        # Add WAV header for first chunk
-                        wav_header = create_wave_header_for_engine(kokoro_engine)
-                        audio_chunks.append(("header", wav_header))
-                        header_sent = True
-                    audio_chunks.append(("chunk", chunk))
+                def on_audio_chunk(chunk):
+                    """Collect audio chunks during synthesis"""
+                    audio_chunks.append(chunk)
                 
-                # Start synthesis and collect chunks
-                logger.info("🎵 Starting synthesis...")
-                synthesis_stream.feed(data).play(
-                    on_audio_chunk=collect_audio_chunk,
-                    muted=True
-                )
+                # Send WAV header first
+                wav_header = create_wave_header_for_engine(kokoro_engine)
+                await websocket.send_bytes(wav_header)
+                
+                # Feed text to TTS and synthesize (run in thread to avoid blocking)
+                def synthesize_sync():
+                    tts_stream.feed(message)
+                    tts_stream.play(
+                        muted=True,
+                        on_audio_chunk=on_audio_chunk
+                    )
+                
+                # Run synthesis in a separate thread
+                import threading
+                synthesis_thread = threading.Thread(target=synthesize_sync, daemon=True)
+                synthesis_thread.start()
+                synthesis_thread.join()
                 
                 # Send all collected audio chunks
-                logger.info(f"📊 Sending {len(audio_chunks)} audio chunks...")
-                for chunk_type, chunk_data in audio_chunks:
-                    await websocket.send_bytes(chunk_data)
-                    if chunk_type == "header":
-                        logger.info("📊 Sent WAV header")
-                    else:
-                        logger.info(f"📊 Sent audio chunk: {len(chunk_data)} bytes")
+                for chunk in audio_chunks:
+                    await websocket.send_bytes(chunk)
                 
-                # Send end marker
+                # Send completion marker
                 await websocket.send_text("END")
-                logger.info("✅ Synthesis complete")
+                logger.info("🔊 TTS synthesis completed")
                 
             except Exception as e:
-                logger.error(f"Synthesis error: {e}")
+                logger.error(f"Error during TTS synthesis: {e}")
                 await websocket.send_text(f"ERROR: {str(e)}")
                 
+    except WebSocketDisconnect:
+        logger.info("TTS WebSocket client disconnected.")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"TTS WebSocket error: {e}")
     finally:
-        logger.info("WebSocket connection closed")
+        if active_tts_ws == websocket:
+            active_tts_ws = None
+        logger.info("Cleaned up TTS WebSocket connection.")
 
 if __name__ == "__main__":
     import uvicorn
