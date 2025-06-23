@@ -1,5 +1,6 @@
 import { domElements } from "../core/dom-elements.js";
 import { uiState } from "../core/ui-state.js";
+import { wsManager } from "./websocket-manager.js";
 
 /**
  * STT (Speech-to-Text) Service
@@ -8,7 +9,6 @@ import { uiState } from "../core/ui-state.js";
  */
 export class STTService {
   constructor() {
-    this.websocket = null;
     this.audioStream = null;
     this.audioContext = null;
     this.source = null;
@@ -110,54 +110,41 @@ export class STTService {
   }
 
   async connectWebSocket() {
-    if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-      return; // Already connected
+    // Check if unified connection already exists (created by TTS service)
+    const existingConnection = wsManager.connections.get("unified");
+    if (
+      existingConnection &&
+      wsManager.getConnectionStatus("unified") === "connected"
+    ) {
+      console.log("🔌 STT using existing unified WebSocket connection");
+      this.isConnected = true;
+      this.updateStatus("Connected to unified service");
+      return;
     }
 
-    try {
-      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const wsUrl = `${protocol}//${window.location.host}/ws/stt`;
-
-      this.websocket = new WebSocket(wsUrl);
-
-      this.websocket.onopen = () => {
-        console.log("🔌 STT WebSocket connected");
-        this.isConnected = true;
-        this.updateStatus("Connected to STT service");
-      };
-
-      this.websocket.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data);
-          this.handleWebSocketMessage(data);
-        } catch (error) {
-          console.error("Error parsing STT WebSocket message:", error);
-        }
-      };
-
-      this.websocket.onclose = () => {
-        console.log("🔌 STT WebSocket disconnected");
-        this.isConnected = false;
-        this.updateStatus("Disconnected from STT service");
-      };
-
-      this.websocket.onerror = (error) => {
-        console.error("STT WebSocket error:", error);
-        this.handleError("WebSocket connection failed");
-      };
-    } catch (error) {
-      console.error("Failed to connect STT WebSocket:", error);
-      this.handleError("Failed to connect to STT service");
-    }
+    // STT service doesn't create connections - it uses the one created by TTS
+    console.log("🔌 STT waiting for unified WebSocket connection...");
+    this.updateStatus("Waiting for WebSocket connection");
   }
 
   handleWebSocketMessage(data) {
     console.log("📨 [STT] Received message from server:", data);
+    console.log("📨 [STT] Message type:", data.type, "Text:", data.text);
 
     switch (data.type) {
       case "status":
         console.log("ℹ️ [STT] Status update:", data.message);
         this.updateStatus(data.message);
+        break;
+
+      case "stt-status":
+        console.log("ℹ️ [STT] STT Status update:", data.message);
+        this.updateStatus(data.message);
+        break;
+
+      case "model-status":
+        console.log("ℹ️ [WebSocket] Model status update:", data.data);
+        // Handle model status updates
         break;
 
       case "vad_detect_start":
@@ -197,6 +184,10 @@ export class STTService {
         if (this.onFinalTranscription) {
           this.onFinalTranscription(data.text);
         }
+        break;
+
+      case "pong":
+        console.log("🏓 [WebSocket] Pong received");
         break;
 
       case "error":
@@ -298,11 +289,8 @@ export class STTService {
       this.stopRecording();
     }
 
-    if (this.websocket) {
-      this.websocket.close();
-      this.websocket = null;
-    }
-
+    // Note: We don't close the unified WebSocket here as it's shared with TTS
+    // The wsManager handles connection lifecycle
     this.isConnected = false;
   }
 
@@ -416,11 +404,19 @@ export class STTService {
       this.updateConversationUI(true);
 
       // Send start command to enable VAD on server
-      if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
+      if (wsManager.getConnectionStatus("unified") === "connected") {
         console.log("📤 [STT] Enabling VAD for conversation...");
-        this.websocket.send(JSON.stringify({ command: "start" }));
+        wsManager.send(
+          "unified",
+          JSON.stringify({
+            type: "stt-command",
+            command: "start",
+          })
+        );
       } else {
-        console.error("❌ [STT] WebSocket not ready for conversation start");
+        console.error(
+          "❌ [STT] Unified WebSocket not ready for conversation start"
+        );
       }
 
       let audioChunkCount = 0;
@@ -445,7 +441,7 @@ export class STTService {
         totalAudioBytes += outputData.buffer.byteLength;
 
         // Send audio data for VAD processing
-        if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
+        if (wsManager.getConnectionStatus("unified") === "connected") {
           const metadata = JSON.stringify({
             sampleRate: this.audioContext.sampleRate,
           });
@@ -460,7 +456,11 @@ export class STTService {
             outputData.buffer,
           ]);
 
-          this.websocket.send(combinedData);
+          // Send binary data through the unified connection
+          const connection = wsManager.connections.get("unified");
+          if (connection && connection.websocket) {
+            connection.websocket.send(combinedData);
+          }
         }
       };
     } catch (error) {
@@ -485,9 +485,15 @@ export class STTService {
       uiState.showStandby("Conversation ended");
 
       // Send stop command to disable VAD
-      if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
+      if (wsManager.getConnectionStatus("unified") === "connected") {
         console.log("📤 [STT] Disabling VAD for conversation...");
-        this.websocket.send(JSON.stringify({ command: "stop" }));
+        wsManager.send(
+          "unified",
+          JSON.stringify({
+            type: "stt-command",
+            command: "stop",
+          })
+        );
       }
 
       console.log("🧹 [STT] Cleaning up conversation resources...");

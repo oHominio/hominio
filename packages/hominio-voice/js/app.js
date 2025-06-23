@@ -18,6 +18,7 @@ import { uiState } from "./core/ui-state.js";
 import { ttsService } from "./services/tts-service.js";
 import { wsManager } from "./services/websocket-manager.js";
 import { STTService } from "./services/stt-service.js";
+import { messageRouter } from "./services/message-router.js";
 
 console.log("✅ All modules imported successfully");
 
@@ -44,7 +45,10 @@ class HominiVoiceApp {
       await ttsService.initialize();
 
       // Initialize STT service
-      this.initializeSTTService();
+      await this.initializeSTTService();
+
+      // Initialize message router with services
+      messageRouter.initialize(this.sttService, ttsService);
 
       // Set up event listeners
       this.setupEventListeners();
@@ -91,7 +95,7 @@ class HominiVoiceApp {
   /**
    * Initialize STT Service with enhanced visual state integration
    */
-  initializeSTTService() {
+  async initializeSTTService() {
     // Set up STT callbacks with visual state management
     this.sttService.setOnPartialTranscription((text) => {
       console.log("Partial:", text);
@@ -127,6 +131,9 @@ class HominiVoiceApp {
         uiState.updateStatusText(status);
       }
     });
+
+    // Connect STT service to WebSocket (this will register message handlers)
+    await this.sttService.connectWebSocket();
 
     console.log(
       "STT Service initialized with visual state integration and early sentence detection"
@@ -198,6 +205,9 @@ class HominiVoiceApp {
 
 // Create and export app instance
 export const app = new HominiVoiceApp();
+
+// Make app instance globally available for service communication
+window.app = app;
 
 // Global functions for backward compatibility (if needed)
 window.checkModelStatus = () => app.handleCheckStatus();

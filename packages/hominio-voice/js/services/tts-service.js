@@ -6,12 +6,13 @@ import { wsManager } from "./websocket-manager.js";
 import { audioService } from "./audio-service.js";
 import { uiState } from "../core/ui-state.js";
 import { domElements } from "../core/dom-elements.js";
+import { messageRouter } from "./message-router.js";
 
 export class TTSService {
   constructor() {
     this.isInitialized = false;
     this.modelStatus = "unknown";
-    this.isConnectedForPush = false; // Track TTS push connection
+    this.isConnectedForPush = false;
   }
 
   /**
@@ -20,37 +21,24 @@ export class TTSService {
   async initialize() {
     if (this.isInitialized) return;
 
-    // Create TTS push WebSocket connection for automatic conversation responses
-    wsManager.createConnection("tts-push", "/ws/tts-push", {
+    // Create unified WebSocket connection for all communication
+    wsManager.createConnection("unified", "/ws", {
       onOpen: () => {
-        console.log("🔊 [TTS] Connected to TTS push service");
+        console.log("🔊 [TTS] Connected to unified WebSocket service");
         this.isConnectedForPush = true;
-      },
-      onMessage: (event) => this.handleTTSPushMessage(event),
-      onClose: () => {
-        console.log("🔊 [TTS] TTS push service disconnected");
-        this.isConnectedForPush = false;
-      },
-      onError: (error) => {
-        console.error("🔊 [TTS] TTS push WebSocket Error:", error);
-        this.isConnectedForPush = false;
-      },
-      autoReconnect: true,
-    });
-
-    // Create model status WebSocket connection
-    wsManager.createConnection("model-status", "/ws/model-status", {
-      onOpen: () => {
         uiState.updateConnectionStatus("Connected", true);
         uiState.showReady();
       },
-      onMessage: (event) => this.handleModelStatusMessage(event),
+      onMessage: (event) => this.handleUnifiedMessage(event),
       onClose: () => {
+        console.log("🔊 [TTS] Unified WebSocket service disconnected");
+        this.isConnectedForPush = false;
         uiState.updateConnectionStatus("Disconnected");
         uiState.updateStatusText("Connection lost. Reconnecting...");
       },
       onError: (error) => {
-        console.error("Model Status WebSocket Error:", error);
+        console.error("🔊 [TTS] Unified WebSocket Error:", error);
+        this.isConnectedForPush = false;
         uiState.updateConnectionStatus("Error");
         uiState.updateStatusText("Connection error");
       },
@@ -64,72 +52,127 @@ export class TTSService {
   }
 
   /**
-   * Handle TTS push WebSocket messages (automatic conversation responses)
+   * Handle unified WebSocket messages - routes through message router
    */
-  handleTTSPushMessage(event) {
+  handleUnifiedMessage(event) {
     try {
       if (typeof event.data === "string") {
-        if (event.data === "END") {
-          console.log("🔊 [TTS] Audio stream ended, playing accumulated audio");
-          // Play all accumulated audio chunks when stream ends
-          audioService
-            .playAudioChunks()
-            .then(() => {
-              console.log("🔊 [TTS] Audio playback completed");
-              uiState.showListening(
-                "Conversation active - listening for speech..."
-              );
-            })
-            .catch((error) => {
-              console.error("🔊 [TTS] Audio playback failed:", error);
-              uiState.showError("Audio playback failed");
-            });
+        // Check for special string messages first
+        if (messageRouter.handleSpecialString(event.data)) {
           return;
         }
 
-        if (event.data === "ERROR") {
-          console.error("🔊 [TTS] Audio generation error");
-          uiState.showError("Audio generation failed");
-          return;
-        }
-
+        // Try to parse as JSON and route
         try {
           const data = JSON.parse(event.data);
-          if (data.type === "status") {
-            console.log("🔊 [TTS] Status:", data.message);
-            uiState.updateStatusText(data.message);
-          }
+          messageRouter.routeMessage(data);
         } catch (e) {
           console.log("🔊 [TTS] Non-JSON message:", event.data);
         }
       } else {
-        // Binary audio data - add to buffer
-        console.log("🔊 [TTS] Received audio chunk, buffering...");
-        uiState.showSpeaking("AI is responding...");
-        audioService.addAudioChunk(event.data);
+        // Binary audio data - route through message router
+        messageRouter.handleBinaryData(event.data);
       }
     } catch (error) {
-      console.error("🔊 [TTS] Error handling TTS push message:", error);
-      uiState.showError("Audio processing error");
+      console.error("🔊 [TTS] Error handling unified message:", error);
+      uiState.showError("Message processing error");
     }
   }
 
   /**
-   * Handle model status WebSocket messages
+   * Handle TTS-specific messages (called by message router)
    */
-  handleModelStatusMessage(event) {
-    try {
-      const data = JSON.parse(event.data);
-      // Handle nested structure: {tts: {...}, stt: {...}}
-      const ttsStatus = data.tts || data;
-      this.modelStatus = ttsStatus.status;
-      uiState.updateModelStatus(ttsStatus);
-    } catch (e) {
-      console.error("Error parsing model status:", e);
+  handleMessage(data) {
+    switch (data.type) {
+      case "model-status":
+        console.log("🔊 [TTS] Model status update:", data.data);
+        const ttsStatus = data.data?.tts || data.data;
+        if (ttsStatus) {
+          this.modelStatus = ttsStatus.status;
+          uiState.updateModelStatus(ttsStatus);
+        }
+        break;
+
+      case "tts-error":
+        console.error("🔊 [TTS] TTS Error:", data.message);
+        uiState.showError(`TTS Error: ${data.message}`);
+        break;
+
+      default:
+        console.log("🔊 [TTS] Unhandled message type:", data.type);
+        break;
     }
   }
 
-  // Manual TTS synthesis removed - only automatic push from STT → LLM → TTS
+  /**
+   * Handle binary data (called by message router)
+   */
+  handleBinaryData(data) {
+    console.log("🔊 [TTS] Received audio chunk, buffering...");
+    uiState.showSpeaking("AI is responding...");
+    audioService.addAudioChunk(data);
+  }
+
+  /**
+   * Handle special string messages (called by message router)
+   */
+  handleSpecialMessage(message) {
+    if (message === "END") {
+      console.log("🔊 [TTS] Audio stream ended, playing accumulated audio");
+      audioService
+        .playAudioChunks()
+        .then(() => {
+          console.log("🔊 [TTS] Audio playback completed");
+          uiState.showListening(
+            "Conversation active - listening for speech..."
+          );
+        })
+        .catch((error) => {
+          console.error("🔊 [TTS] Audio playback failed:", error);
+          uiState.showError("Audio playback failed");
+        });
+    } else if (message === "ERROR") {
+      console.error("🔊 [TTS] Audio generation error");
+      uiState.showError("Audio generation failed");
+    }
+  }
+
+  /**
+   * Send TTS synthesis request through unified WebSocket
+   */
+  async synthesizeText(text) {
+    if (!text || !text.trim()) {
+      console.warn("🔊 [TTS] Empty text provided for synthesis");
+      return;
+    }
+
+    const connection = wsManager.connections.get("unified");
+    if (
+      !connection ||
+      !connection.websocket ||
+      connection.websocket.readyState !== WebSocket.OPEN
+    ) {
+      console.error("🔊 [TTS] Unified WebSocket not ready for synthesis");
+      uiState.showError("TTS connection not ready");
+      return;
+    }
+
+    try {
+      const message = {
+        type: "tts-synthesize",
+        text: text.trim(),
+      };
+
+      console.log(
+        "🔊 [TTS] Sending synthesis request:",
+        text.substring(0, 50) + "..."
+      );
+      connection.websocket.send(JSON.stringify(message));
+    } catch (error) {
+      console.error("🔊 [TTS] Error sending synthesis request:", error);
+      uiState.showError("Failed to send TTS request");
+    }
+  }
 
   /**
    * Check model status via HTTP
@@ -138,7 +181,6 @@ export class TTSService {
     try {
       const response = await fetch("/model-status");
       const data = await response.json();
-      // Handle nested structure: {tts: {...}, stt: {...}}
       const ttsStatus = data.tts || data;
       this.modelStatus = ttsStatus.status;
       uiState.updateModelStatus(ttsStatus);
@@ -160,8 +202,7 @@ export class TTSService {
     return {
       isInitialized: this.isInitialized,
       modelStatus: this.modelStatus,
-      modelConnectionStatus: wsManager.getConnectionStatus("model-status"),
-      pushConnectionStatus: wsManager.getConnectionStatus("tts-push"),
+      unifiedConnectionStatus: wsManager.getConnectionStatus("unified"),
       isConnectedForPush: this.isConnectedForPush,
     };
   }
@@ -170,8 +211,7 @@ export class TTSService {
    * Shutdown TTS service
    */
   shutdown() {
-    wsManager.close("model-status");
-    wsManager.close("tts-push");
+    wsManager.close("unified");
     audioService.stopAudio();
     this.isInitialized = false;
     this.isConnectedForPush = false;

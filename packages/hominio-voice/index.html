@@ -18,6 +18,8 @@
         background: linear-gradient(135deg, #f5f1e8 0%, #ede7db 100%);
         color: #1e3a5f;
         min-height: 100vh;
+        max-height: 100vh;
+        overflow: hidden;
         display: flex;
         flex-direction: column;
       }
@@ -86,10 +88,12 @@
         flex: 1;
         display: flex;
         gap: 2rem;
-        padding: 2rem;
+        padding: 1.5rem;
         max-width: 1400px;
         margin: 0 auto;
         width: 100%;
+        min-height: 0;
+        overflow: hidden;
       }
 
       .stt-interface {
@@ -97,11 +101,13 @@
         background: rgba(255, 255, 255, 0.8);
         backdrop-filter: blur(20px);
         border-radius: 24px;
-        padding: 2rem;
+        padding: 1.5rem;
         box-shadow: 0 20px 40px rgba(30, 58, 95, 0.1);
         border: 1px solid rgba(255, 255, 255, 0.5);
         display: flex;
         flex-direction: column;
+        min-height: 0;
+        overflow: hidden;
       }
 
       .tts-interface {
@@ -109,12 +115,14 @@
         background: rgba(255, 255, 255, 0.8);
         backdrop-filter: blur(20px);
         border-radius: 24px;
-        padding: 2rem;
+        padding: 1.5rem;
         box-shadow: 0 20px 40px rgba(30, 58, 95, 0.1);
         text-align: center;
         border: 1px solid rgba(255, 255, 255, 0.5);
         display: flex;
         flex-direction: column;
+        min-height: 0;
+        overflow: hidden;
       }
 
       .voice-avatar {
@@ -254,16 +262,22 @@
 
       .controls {
         display: flex;
-        gap: 1rem;
+        flex-wrap: wrap;
+        gap: 0.75rem;
         justify-content: center;
-        margin-bottom: 2rem;
+        margin-bottom: 1.5rem;
+      }
+
+      .controls .btn {
+        flex: 0 1 auto;
+        min-width: 140px;
       }
 
       .btn {
-        padding: 1rem 2rem;
+        padding: 0.75rem 1.5rem;
         border: none;
         border-radius: 50px;
-        font-size: 1rem;
+        font-size: 0.9rem;
         font-weight: 600;
         cursor: pointer;
         transition: all 0.3s ease;
@@ -272,6 +286,7 @@
         gap: 0.5rem;
         text-decoration: none;
         font-family: inherit;
+        white-space: nowrap;
       }
 
       .btn-primary {
@@ -449,7 +464,7 @@
         padding: 1.5rem;
         margin: 1rem 0;
         border: 1px solid rgba(0, 0, 0, 0.1);
-        min-height: 300px;
+        min-height: 200px;
         overflow-y: auto;
         font-family:
           "Inter",
@@ -478,11 +493,21 @@
       }
 
       .stt-controls {
-        text-align: center;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+        justify-content: center;
         margin-top: 1rem;
       }
 
+      .stt-controls .btn {
+        flex: 0 1 auto;
+        min-width: 140px;
+      }
+
       .stt-controls .status-text {
+        width: 100%;
+        text-align: center;
         margin-top: 1rem;
         font-size: 0.9rem;
       }
@@ -533,21 +558,38 @@
 
         .stt-interface,
         .tts-interface {
-          padding: 1.5rem;
+          padding: 1.25rem;
         }
 
         .transcript-display {
-          min-height: 200px;
+          min-height: 150px;
+        }
+
+        .stt-controls {
+          flex-direction: column;
+          gap: 0.5rem;
+        }
+
+        .stt-controls .btn {
+          width: 100%;
+          min-width: auto;
+          justify-content: center;
         }
 
         .controls {
           flex-direction: column;
+          gap: 0.5rem;
+        }
+
+        .controls .btn {
+          width: 100%;
+          min-width: auto;
+          justify-content: center;
         }
 
         .btn {
-          width: 100%;
-          justify-content: center;
-          margin-bottom: 0.5rem;
+          font-size: 0.8rem;
+          padding: 0.6rem 1.2rem;
         }
 
         .connection-status {

@@ -1,24 +1,18 @@
 from fastapi import FastAPI, WebSocket, UploadFile, File, HTTPException, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from RealtimeTTS import TextToAudioStream, KokoroEngine
-from RealtimeSTT import AudioToTextRecorder
 import logging
 import asyncio
 import os
 import signal
 import sys
 import time
-import wave
-import io
 import tempfile
 import threading
 from datetime import datetime
 from typing import Dict, Any
 import json
 import multiprocessing
-import openai
-import torch
 
 # Additional imports for audio processing (following server examples)
 try:
@@ -31,6 +25,12 @@ except ImportError:
 
 # Import CUDA environment setup and Config from the new config
 from core.config import setup_environment, Config
+
+# Import service classes
+from services.stt_service import STTService
+from services.tts_service import TTSService
+from services.llm_service import LLMService
+from services.message_router import MessageRouter
 
 # CRITICAL: Setup environment FIRST before any other imports
 try:
@@ -66,19 +66,39 @@ logger = logging.getLogger(__name__)
 # CUDA validation is now handled by setup_environment() - no need to repeat
 logger.info("✅ CUDA validation completed during environment setup")
 
+# Initialize service instances
+stt_service = STTService()
+tts_service = TTSService()
+llm_service = LLMService()
+message_router = MessageRouter()
+
+# Legacy global variables for backward compatibility
+kokoro_engine = None
+stt_engine = None
+stt_message_queue = None
+llm_client = None
+
+# Initialize status dictionaries - now using service status
+kokoro_status = {}
+stt_status = "initializing"
+stt_ready_event = asyncio.Event()
+
+# Global variable to hold the active TTS WebSocket connection
+active_tts_ws: WebSocket = None
+
 # Signal handlers for graceful shutdown
 def signal_handler(signum, frame):
     logger.info(f"Received signal {signum}, shutting down gracefully...")
-    # Cleanup global variables
-    global kokoro_engine, stream, stt_engine, stt_message_queue
+    # Cleanup global variables and services
+    global stt_service, tts_service, llm_service
     try:
-        if stt_engine:
-            stt_engine.shutdown()
+        if stt_service and stt_service.stt_engine:
+            stt_service.stt_engine.shutdown()
     except:
         pass
     try:
-        if kokoro_engine:
-            kokoro_engine = None
+        if tts_service:
+            tts_service.kokoro_engine = None
     except:
         pass
 
@@ -92,339 +112,72 @@ try:
 except:
     pass  # SIGABRT may not be available on all systems
 
-# Initialize engines as None
-kokoro_engine = None
-stt_engine = None
-stt_message_queue = None
-llm_client = None
-
-# Initialize status dictionaries
-kokoro_status = {
-    "status": "initializing",
-    "progress": 0,
-    "message": "Starting TTS engine...",
-    "last_updated": datetime.now().isoformat()
-}
-
-stt_status = "initializing"
-stt_ready_event = asyncio.Event()
-
-# Global variable to hold the active TTS WebSocket connection
-active_tts_ws: WebSocket = None
-
-# Global conversation history
-conversation_history = []
-processed_sentences = set()  # Track processed sentences to avoid duplicates
-
-def create_wave_header_for_engine(engine):
-    """Create WAV header for the given engine"""
-    _, channels, sample_rate = engine.get_stream_info()
-    
-    num_channels = channels
-    sample_width = 2  # 16-bit audio
-    frame_rate = sample_rate
-
-    wav_header = io.BytesIO()
-    with wave.open(wav_header, "wb") as wav_file:
-        wav_file.setnchannels(num_channels)
-        wav_file.setsampwidth(sample_width)
-        wav_file.setframerate(frame_rate)
-
-    wav_header.seek(0)
-    wave_header_bytes = wav_header.read()
-    wav_header.close()
-
-    return wave_header_bytes
-
 async def initialize_kokoro_engine():
-    """Initialize KokoroEngine for headless operation"""
+    """Initialize KokoroEngine using TTS service"""
     global kokoro_status, kokoro_engine
     
-    try:
-        kokoro_status.update({
-            "status": "loading",
-            "progress": 20,
-            "message": "Loading Kokoro TTS model...",
-            "last_updated": datetime.now().isoformat()
-        })
-        
-        # Initialize KokoroEngine with voice from config
-        # No audio device initialization needed for headless operation
-        kokoro_engine = KokoroEngine(voice=Config.TTS_VOICE)
-        
-        kokoro_status.update({
-            "status": "loading",
-            "progress": 80,
-            "message": "Testing engine in headless mode...",
-            "last_updated": datetime.now().isoformat()
-        })
-        
-        # Test the engine by generating a small sample (no playback)
-        test_stream = TextToAudioStream(kokoro_engine, muted=True)
-        test_audio_chunks = []
-        
-        def collect_chunk(chunk):
-            test_audio_chunks.append(chunk)
-        
-        test_stream.feed("Test")
-        test_stream.play(muted=True, on_audio_chunk=collect_chunk)
-        
-        if test_audio_chunks:
-            logger.info(f"✅ Kokoro engine test successful - generated {len(test_audio_chunks)} audio chunks")
-        
-        kokoro_status.update({
-            "status": "ready",
-            "progress": 100,
-            "message": "Kokoro TTS engine ready for headless synthesis",
-            "last_updated": datetime.now().isoformat(),
-            "model_info": {
-                "engine": "KokoroEngine",
-                "voice": "af_heart",
-                "language": "English (American)",
-                "mode": "headless"
-            }
-        })
-        
-        logger.info("✅ KokoroEngine initialized successfully in headless mode!")
-        
-    except Exception as e:
-        logger.error(f"Failed to initialize KokoroEngine: {e}")
-        kokoro_status.update({
-            "status": "error",
-            "progress": 0,
-            "message": f"Failed to initialize Kokoro engine: {str(e)}",
-            "last_updated": datetime.now().isoformat(),
-            "error": str(e)
-        })
-
+    await tts_service.initialize_kokoro_engine()
+    kokoro_status = tts_service.get_status()
+    kokoro_engine = tts_service.kokoro_engine  # For backward compatibility
+    
 async def initialize_stt_engine():
-    """Initialize RealtimeSTT engine with proper callback architecture"""
-    global stt_engine, stt_status, stt_message_queue, conversation_history, processed_sentences
+    """Initialize RealtimeSTT engine using STT service with message router"""
+    global stt_engine, stt_status, stt_message_queue
     
     try:
         print("🎤 Initializing STT engine...")
         stt_status = "initializing"
         
         # Reset conversation history and processed sentences on initialization
-        conversation_history.clear()
-        processed_sentences.clear()
+        llm_service.clear_conversation()
         
-        # Suppress ALSA errors for headless operation (KEEP CUDA ENABLED)
-        os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-        
-        # Additional audio suppression
-        os.environ['SDL_AUDIODRIVER'] = 'dummy'
-        os.environ['PULSE_RUNTIME_PATH'] = '/tmp/pulse-runtime'
-        os.environ['ALSA_CARD'] = 'none'
-        
-        # Create message queue for STT WebSocket communication first
+        # Create message queue for STT WebSocket communication
         stt_message_queue = asyncio.Queue()
 
-        # Get the current event loop for callbacks
+        # Get the current event loop
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = asyncio.get_event_loop()
 
-        # Define callback functions at module level for proper scoping
-        async def trigger_llm_and_tts(text: str):
-            """Triggers the LLM and streams the response to the TTS engine."""
-            global conversation_history, processed_sentences
-            
-            # Check if we've already processed this exact sentence
-            if text in processed_sentences:
-                logger.info(f"🔄 Skipping duplicate sentence: '{text}'")
-                return
-                
-            # Add to processed sentences to avoid future duplicates
-            processed_sentences.add(text)
-            
-            logger.info(f"🎤 User said: '{text}'")
-            if not llm_client:
-                logger.error("LLM client not initialized. Cannot process request.")
-                return
-            if not active_tts_ws:
-                logger.warning("No active TTS client. Cannot send audio response.")
-                return
-
-            try:
-                # Add user message to conversation history
-                conversation_history.append({"role": "user", "content": text})
-                
-                # Keep conversation history manageable (last 10 exchanges = 20 messages)
-                if len(conversation_history) > 20:
-                    conversation_history = conversation_history[-20:]
-
-                # Get LLM response with conversation context
-                async def get_llm_response(user_text: str):
-                    """Get complete LLM response as a string with conversation context."""
-                    try:
-                        # Use the full conversation history for context
-                        response = await llm_client.chat.completions.create(
-                            model="phala/llama-3.3-70b-instruct",
-                            messages=conversation_history,  # Send full conversation context
-                            stream=False  # Get complete response
-                        )
-                        content = response.choices[0].message.content
-                        logger.info(f"🤖 LLM response: '{content}'")
-                        
-                        # Add assistant response to conversation history
-                        conversation_history.append({"role": "assistant", "content": content})
-                        
-                        return content
-                    except Exception as e:
-                        logger.error(f"Error getting LLM response: {e}")
-                        return "I'm sorry, I encountered an error."
-
-                # Get the LLM response
-                llm_response = await get_llm_response(text)
-                
-                # Create a new stream for this synthesis (headless mode)
-                tts_stream = TextToAudioStream(kokoro_engine, muted=Config.TTS_MUTED)
-
-                # Store audio chunks to send them after synthesis
-                audio_chunks = []
-                
-                def on_audio_chunk(chunk):
-                    """Collect audio chunks during synthesis"""
-                    audio_chunks.append(chunk)
-
-                # Send WAV header first for proper audio playback on client
-                if active_tts_ws:
-                    wav_header = create_wave_header_for_engine(kokoro_engine)
-                    await active_tts_ws.send_bytes(wav_header)
-
-                # Feed the LLM response to TTS and synthesize in a thread
-                def synthesize_sync():
-                    tts_stream.feed(llm_response)
-                    tts_stream.play(
-                        muted=Config.TTS_MUTED,  # Use config value
-                        on_audio_chunk=on_audio_chunk
-                    )
-                
-                # Run synthesis in a separate thread
-                import threading
-                synthesis_thread = threading.Thread(target=synthesize_sync, daemon=True)
-                synthesis_thread.start()
-                synthesis_thread.join()
-                
-                # Send all collected audio chunks
-                if active_tts_ws:
-                    for chunk in audio_chunks:
-                        await active_tts_ws.send_bytes(chunk)
-                
-                # Send end marker to signal completion
-                if active_tts_ws:
-                    await active_tts_ws.send_text("END")
-                    logger.info("🔊 TTS synthesis completed, audio sent to client")
-
-            except Exception as e:
-                logger.error(f"Error during TTS synthesis: {e}")
-                # Send error marker to client
-                if active_tts_ws:
-                    try:
-                        await active_tts_ws.send_text("ERROR")
-                    except:
-                        pass
-
-        def process_full_sentence(full_sentence: str):
-            """Callback for when a full sentence is transcribed."""
-            logger.info(f"✅ STT Full sentence: {full_sentence}")
-
-            # Schedule the async task in the main event loop
-            if loop and not loop.is_closed():
-                asyncio.run_coroutine_threadsafe(
-                    trigger_llm_and_tts(full_sentence),
-                    loop
-                )
-            else:
-                logger.error("Event loop not available to schedule LLM call.")
-
-            # Send the transcribed sentence to the client for display
-            message = {'type': 'fullSentence', 'text': full_sentence}
-            if loop and not loop.is_closed():
-                asyncio.run_coroutine_threadsafe(
-                    stt_message_queue.put(json.dumps(message)),
-                    loop
-                )
-
-        def on_realtime_transcription(text):
-            """Handle real-time transcription updates"""
-            if loop and not loop.is_closed():
-                # Clean up text
-                text = text.lstrip()
-                if text.startswith("..."):
-                    text = text[3:]
-                if text.endswith("...'."):
-                    text = text[:-1]
-                if text.endswith("...'"):
-                    text = text[:-1]
-                text = text.lstrip()
-                if text:
-                    text = text[0].upper() + text[1:]
-                
-                message = {
-                    'type': 'realtime',
-                    'text': text
-                }
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        stt_message_queue.put(json.dumps(message)), 
-                        loop
-                    )
-                except Exception as e:
-                    print(f"❌ Error sending realtime transcription: {e}")
+        # Initialize message router with all services
+        message_router.initialize(
+            stt_service=stt_service,
+            tts_service=tts_service,
+            llm_service=llm_service,
+            websocket_queue=stt_message_queue,
+            event_loop=loop
+        )
         
-        # STT configuration using Config class values instead of hardcoded
-        stt_config = {
-            'model': Config.STT_MODEL,
-            'language': Config.STT_LANGUAGE,
-            'use_microphone': Config.STT_USE_MICROPHONE,
-            'spinner': Config.STT_SPINNER,
-            'enable_realtime_transcription': Config.STT_REALTIME_ENABLED,
-            'realtime_model_type': Config.STT_REALTIME_MODEL,
-            'realtime_processing_pause': Config.STT_REALTIME_PAUSE,
-            'on_realtime_transcription_update': on_realtime_transcription,
-            'silero_sensitivity': Config.STT_SILERO_SENSITIVITY,
-            'webrtc_sensitivity': Config.STT_WEBRTC_SENSITIVITY,
-            'post_speech_silence_duration': Config.STT_POST_SPEECH_SILENCE,
-            'min_length_of_recording': Config.STT_MIN_RECORDING_LENGTH,
-            'min_gap_between_recordings': Config.STT_MIN_GAP_BETWEEN_RECORDINGS,
-            'silero_deactivity_detection': Config.STT_SILERO_DEACTIVITY_DETECTION,
-            'early_transcription_on_silence': Config.STT_EARLY_TRANSCRIPTION_SILENCE,
-            'beam_size': Config.STT_BEAM_SIZE,
-            'beam_size_realtime': Config.STT_BEAM_SIZE_REALTIME,
-            'no_log_file': Config.STT_NO_LOG_FILE,
-            'device': Config.STT_DEVICE,
-            'compute_type': Config.STT_COMPUTE_TYPE,
-            'level': logging.WARNING,
-            'initial_prompt': Config.STT_INITIAL_PROMPT
-        }
+        # Initialize STT service
+        await stt_service.initialize_stt_engine()
         
-        # Create recorder
-        from RealtimeSTT import AudioToTextRecorder
-        stt_engine = AudioToTextRecorder(**stt_config)
-        
-        # Start transcription worker thread with proper callback access
+        # Start transcription worker thread
         def transcription_worker():
             """Worker thread that continuously processes transcriptions"""
             print("🔄 Starting STT transcription worker thread...")
             
             while True:
                 try:
-                    # This call blocks until audio is processed and calls process_full_sentence
-                    stt_engine.text(process_full_sentence)
+                    # Get text from STT engine
+                    text = stt_service.stt_engine.text()
+                    if text and text.strip():
+                        # Let the message router handle full sentence processing
+                        asyncio.run_coroutine_threadsafe(
+                            message_router._handle_full_sentence(text),
+                            loop
+                        )
                 except Exception as e:
                     print(f"❌ STT transcription error: {e}")
                     time.sleep(0.1)
         
         # Start the transcription worker thread
-        import threading
         transcription_thread = threading.Thread(target=transcription_worker, daemon=True)
         transcription_thread.start()
         
         stt_status = "ready"
         stt_ready_event.set()
+        stt_engine = stt_service.stt_engine  # For backward compatibility
         print("✅ STT engine initialized successfully")
         
     except Exception as e:
@@ -441,68 +194,28 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
-    # Startup
-    logger.info("Starting Hominio Voice application...")
-    
-    # Initialize LLM Client
-    global llm_client
+    # Initialize LLM client
     try:
-        api_key = os.getenv("REDPILL_API_KEY")
-        if not api_key:
-            raise ValueError("REDPILL_API_KEY environment variable not set.")
-        
-        llm_client = openai.AsyncOpenAI(
-            api_key=api_key,
-            base_url="https://api.redpill.ai/v1",
-        )
-        logger.info("✅ OpenAI client for RedPill initialized successfully")
+        await llm_service.initialize_llm_client()
+        global llm_client
+        llm_client = llm_service.llm_client  # For backward compatibility
     except Exception as e:
-        logger.error(f"❌ Failed to initialize LLM Client: {e}")
-        # Application can continue, but conversational features will fail.
-
-    # Initialize engines sequentially to avoid resource conflicts
+        logger.error(f"Failed to initialize LLM client: {e}")
+        raise
+    
+    # Initialize STT and TTS engines
     try:
-        logger.info("Initializing TTS engine...")
         await initialize_kokoro_engine()
-        logger.info("TTS engine initialization completed")
-    except Exception as e:
-        logger.error(f"TTS initialization failed: {e}")
-        # Continue - TTS will show error status
-    
-    try:
-        logger.info("Initializing STT engine...")
         await initialize_stt_engine()
-        logger.info("STT engine initialization completed")
     except Exception as e:
-        logger.error(f"STT initialization failed: {e}")
-        # Continue - STT will show error status
+        logger.error(f"Failed to initialize engines: {e}")
+        raise
     
-    logger.info("Application startup completed")
-    
+    logger.info("🚀 All services initialized successfully")
     yield
     
-    # Shutdown
-    logger.info("Shutting down Hominio Voice application...")
-    
-    # Cleanup resources
-    global kokoro_engine, stream, stt_engine, stt_message_queue
-    try:
-        if stt_engine:
-            logger.info("Cleaning up STT recorder...")
-            stt_engine.shutdown()
-            stt_engine = None
-    except Exception as e:
-        logger.error(f"Error cleaning up STT: {e}")
-    
-    try:
-        if kokoro_engine:
-            logger.info("Cleaning up TTS engine...")
-            # KokoroEngine cleanup if needed
-            kokoro_engine = None
-    except Exception as e:
-        logger.error(f"Error cleaning up TTS: {e}")
-    
-    logger.info("Application shutdown completed")
+    # Cleanup on shutdown
+    logger.info("🛑 Shutting down services...")
 
 # Create FastAPI app with lifespan
 app = FastAPI(lifespan=lifespan)
@@ -533,55 +246,85 @@ async def health_check():
 async def get_model_status():
     """Get real-time model loading status"""
     return {
-        "tts": kokoro_status,
-        "stt": stt_status
+        "tts": tts_service.get_status(),
+        "stt": stt_service.get_status(),
+        "llm": {"status": "ready" if llm_service.is_ready() else "error", "model": "phala/llama-3.3-70b-instruct"}
     }
 
 @app.post("/clear-conversation")
 async def clear_conversation():
     """Clear conversation history and processed sentences"""
-    global conversation_history, processed_sentences
-    conversation_history.clear()
-    processed_sentences.clear()
+    llm_service.clear_conversation()
     logger.info("🧹 Conversation history and processed sentences cleared")
     return {"status": "cleared", "message": "Conversation history has been reset"}
 
 @app.get("/conversation-status")
 async def get_conversation_status():
     """Get current conversation status"""
-    global conversation_history, processed_sentences
     return {
-        "conversation_length": len(conversation_history),
-        "processed_sentences_count": len(processed_sentences),
-        "conversation_history": conversation_history[-10:] if conversation_history else []  # Last 10 messages for preview
+        "conversation_length": len(llm_service.conversation_history),
+        "processed_sentences_count": len(llm_service.processed_sentences),
+        "conversation_history": llm_service.conversation_history[-10:] if llm_service.conversation_history else []  # Last 10 messages for preview
     }
 
-@app.websocket("/ws/stt")
-async def stt_websocket_endpoint(websocket: WebSocket):
-    """STT WebSocket endpoint - receives audio and sends transcriptions"""
+@app.websocket("/ws")
+async def unified_websocket_endpoint(websocket: WebSocket):
+    """Unified WebSocket endpoint - handles STT, TTS, and model status communication"""
+    global active_tts_ws
     await websocket.accept()
-    logger.info("STT WebSocket client connected")
+    logger.info("Unified WebSocket client connected")
+    
+    # Set this as the active TTS connection for server-initiated audio
+    active_tts_ws = websocket
     
     try:
         # Send initial status
         await websocket.send_text(json.dumps({
             "type": "status",
-            "message": "STT engine ready for audio processing"
+            "message": "WebSocket connected - all services ready"
         }))
         
-        # Create a task to broadcast messages from the queue
+        # Create background tasks
         async def message_broadcaster():
-            """Broadcast STT messages to the WebSocket client"""
+            """Broadcast messages to the WebSocket client"""
             try:
                 while True:
                     # Get message from queue
                     message = await stt_message_queue.get()
                     await websocket.send_text(message)
             except Exception as e:
-                logger.error(f"Error in STT message broadcaster: {e}")
+                logger.error(f"Error in message broadcaster: {e}")
         
-        # Start the broadcaster task
-        broadcaster_task = asyncio.create_task(message_broadcaster())
+        async def status_broadcaster():
+            """Broadcast model status updates"""
+            try:
+                last_sent_status = None
+                while True:
+                    # Combine all service statuses
+                    combined_status = {
+                        "type": "model-status",
+                        "data": {
+                            "tts": tts_service.get_status(),
+                            "stt": stt_service.get_status(),
+                            "llm": {"status": "ready" if llm_service.is_ready() else "error", "model": "phala/llama-3.3-70b-instruct"}
+                        }
+                    }
+                    
+                    # Only send updates when status changes
+                    if combined_status != last_sent_status:
+                        await websocket.send_text(json.dumps(combined_status))
+                        last_sent_status = combined_status.copy()
+                    
+                    # Adjust polling frequency based on status
+                    tts_status = tts_service.get_status()
+                    stt_status = stt_service.get_status()
+                    if (tts_status.get("status") in ["ready", "error"] and 
+                        stt_status.get("status") in ["ready", "error"]):
+                        await asyncio.sleep(30)  # Check every 30 seconds when stable
+                    else:
+                        await asyncio.sleep(2)   # Check every 2 seconds during loading
+            except Exception as e:
+                logger.error(f"Error in status broadcaster: {e}")
         
         # Audio processing functions
         def decode_and_resample(audio_data, original_sample_rate, target_sample_rate=16000):
@@ -608,6 +351,10 @@ async def stt_websocket_endpoint(websocket: WebSocket):
                 logger.error(f"Error resampling audio: {e}")
                 return audio_data
         
+        # Start background tasks
+        broadcaster_task = asyncio.create_task(message_broadcaster())
+        status_task = asyncio.create_task(status_broadcaster())
+        
         # Main message processing loop
         while True:
             try:
@@ -616,7 +363,7 @@ async def stt_websocket_endpoint(websocket: WebSocket):
                 
                 if message["type"] == "websocket.receive":
                     if "bytes" in message:
-                        # Binary message - audio data
+                        # Binary message - audio data for STT
                         audio_data = message["bytes"]
                         
                         try:
@@ -634,8 +381,8 @@ async def stt_websocket_endpoint(websocket: WebSocket):
                                 chunk = decode_and_resample(chunk, sample_rate, 16000)
                             
                             # Feed audio to STT engine
-                            if stt_engine:
-                                stt_engine.feed_audio(chunk)
+                            if stt_service.is_ready():
+                                stt_service.stt_engine.feed_audio(chunk)
                                 logger.debug(f"Fed audio chunk: {len(chunk)} bytes")
                             else:
                                 logger.warning("STT engine not available")
@@ -645,180 +392,36 @@ async def stt_websocket_endpoint(websocket: WebSocket):
                             continue
                 
                     elif "text" in message:
-                        # Text message - control commands
+                        # Text message - handle different message types
                         try:
                             data = json.loads(message["text"])
-                            command = data.get("command")
+                            message_type = data.get("type", "unknown")
                             
-                            if command == "start":
-                                logger.info("STT recording started")
-                                await websocket.send_text(json.dumps({
-                                    "type": "status",
-                                    "message": "Recording started"
-                                }))
-                            elif command == "stop":
-                                logger.info("STT recording stopped")
-                                await websocket.send_text(json.dumps({
-                                    "type": "status", 
-                                    "message": "Recording stopped"
-                                }))
-                            else:
-                                logger.warning(f"Unknown STT command: {command}")
+                            # Route message through the message router
+                            await message_router.route_websocket_message(message_type, data, websocket)
                                 
                         except json.JSONDecodeError:
-                            logger.warning("Invalid JSON in STT text message")
+                            logger.warning("Invalid JSON in WebSocket text message")
                             continue
                 
             except Exception as e:
-                logger.error(f"Error in STT WebSocket message processing: {e}")
+                logger.error(f"Error in WebSocket message processing: {e}")
                 break
                 
     except Exception as e:
-        logger.error(f"STT WebSocket error: {e}")
+        logger.error(f"Unified WebSocket error: {e}")
     finally:
-        # Clean up
+        # Clean up background tasks
         if 'broadcaster_task' in locals():
             broadcaster_task.cancel()
-        logger.info("STT WebSocket client disconnected")
-
-@app.websocket("/ws/model-status")
-async def model_status_websocket(websocket: WebSocket):
-    """WebSocket endpoint for real-time model status updates"""
-    await websocket.accept()
-    logger.info("Model status WebSocket connection established")
-    
-    try:
-        last_sent_status = None
-        while True:
-            # Combine TTS and STT status
-            combined_status = {
-                "tts": kokoro_status,
-                "stt": stt_status
-            }
-            
-            # Only send updates when status changes
-            if combined_status != last_sent_status:
-                await websocket.send_json(combined_status)
-                last_sent_status = combined_status.copy()
-            
-            # If both models are ready or errored, we can slow down updates
-            if (kokoro_status["status"] in ["ready", "error"] and 
-                stt_status in ["ready", "error"]):
-                await asyncio.sleep(30)  # Check every 30 seconds
-            else:
-                await asyncio.sleep(2)   # Check every 2 seconds during loading
-                
-    except Exception as e:
-        logger.error(f"Model status WebSocket error: {e}")
-    finally:
-        logger.info("Model status WebSocket connection closed")
-
-@app.websocket("/ws/tts-push")
-async def tts_push_websocket_endpoint(websocket: WebSocket):
-    """TTS Push WebSocket endpoint - for server-initiated audio streaming (LLM integration)"""
-    global active_tts_ws
-    await websocket.accept()
-    logger.info("TTS Push WebSocket client connected.")
-    active_tts_ws = websocket
-    
-    try:
-        # Keep the connection alive, waiting for the server to push audio
-        while True:
-            # This is a keep-alive loop for server-push audio
-            # The server will push audio via the active_tts_ws global variable
-            try:
-                await websocket.receive_text()  # Just keep connection alive
-            except WebSocketDisconnect:
-                break
-    except WebSocketDisconnect:
-        logger.info("TTS Push WebSocket client disconnected.")
-    except Exception as e:
-        logger.error(f"TTS Push WebSocket error: {e}")
-    finally:
+        if 'status_task' in locals():
+            status_task.cancel()
+        
+        # Clear active TTS connection
         if active_tts_ws == websocket:
             active_tts_ws = None
-        logger.info("Cleaned up TTS Push WebSocket connection.")
-
-@app.websocket("/ws/tts")
-async def websocket_endpoint(websocket: WebSocket):
-    """TTS WebSocket endpoint - receives text and sends audio chunks"""
-    global active_tts_ws
-    await websocket.accept()
-    logger.info("TTS WebSocket client connected.")
-    active_tts_ws = websocket
-    
-    try:
-        while True:
-            # Receive text from client for synthesis
-            message = await websocket.receive_text()
             
-            if not message or not message.strip():
-                continue
-                
-            logger.info(f"🔊 Received text for TTS synthesis: {message[:50]}...")
-            
-            # Check if TTS engine is ready
-            if kokoro_status["status"] != "ready":
-                await websocket.send_text(json.dumps({
-                    "type": "error",
-                    "message": "TTS engine not ready"
-                }))
-                continue
-            
-            try:
-                # Create a new stream for this synthesis (headless mode)
-                tts_stream = TextToAudioStream(kokoro_engine, muted=True)
-                
-                # Store audio chunks to send them after synthesis
-                audio_chunks = []
-                
-                def on_audio_chunk(chunk):
-                    """Collect audio chunks during synthesis"""
-                    audio_chunks.append(chunk)
-                
-                # Send WAV header first
-                wav_header = create_wave_header_for_engine(kokoro_engine)
-                await websocket.send_bytes(wav_header)
-                
-                # Feed text to TTS and synthesize (run in thread to avoid blocking)
-                def synthesize_sync():
-                    tts_stream.feed(message)
-                    tts_stream.play(
-                        muted=True,
-                        on_audio_chunk=on_audio_chunk
-                    )
-                
-                # Run synthesis in a separate thread
-                import threading
-                synthesis_thread = threading.Thread(target=synthesize_sync, daemon=True)
-                synthesis_thread.start()
-                synthesis_thread.join()
-                
-                # Send all collected audio chunks
-                for chunk in audio_chunks:
-                    await websocket.send_bytes(chunk)
-                
-                # Send completion marker
-                await websocket.send_text("END")
-                logger.info("🔊 TTS synthesis completed")
-                
-            except Exception as e:
-                logger.error(f"Error during TTS synthesis: {e}")
-                # Send error marker to client
-                if active_tts_ws:
-                    try:
-                        await active_tts_ws.send_text("ERROR")
-                    except:
-                        pass
-                
-    except WebSocketDisconnect:
-        logger.info("TTS WebSocket client disconnected.")
-    except Exception as e:
-        logger.error(f"TTS WebSocket error: {e}")
-    finally:
-        if active_tts_ws == websocket:
-            active_tts_ws = None
-        logger.info("Cleaned up TTS WebSocket connection.")
+        logger.info("Unified WebSocket client disconnected")
 
 if __name__ == "__main__":
     import uvicorn

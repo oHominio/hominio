@@ -18,6 +18,27 @@ def setup_environment():
     os.environ['SDL_AUDIODRIVER'] = 'dummy'
     os.environ['PULSE_RUNTIME_PATH'] = '/tmp/pulse-runtime'
     
+    # Additional ALSA suppression for headless operation
+    os.environ['ALSA_MIXER_CARD'] = 'none'
+    os.environ['ALSA_MIXER_DEVICE'] = '-1'
+    os.environ['ALSA_SEQ_CARD'] = 'none'
+    os.environ['ALSA_SEQ_DEVICE'] = '-1'
+    
+    # Redirect ALSA error output to null
+    try:
+        import ctypes
+        import ctypes.util
+        
+        # Try to suppress ALSA errors at the C library level
+        alsa_lib = ctypes.util.find_library('asound')
+        if alsa_lib:
+            libasound = ctypes.CDLL(alsa_lib)
+            # Set ALSA error handler to null to suppress warnings
+            libasound.snd_lib_error_set_handler(None)
+            print("✅ ALSA error handler suppressed")
+    except Exception as e:
+        print(f"⚠️ Could not suppress ALSA errors: {e}")
+    
     # Prevent multiprocessing resource leaks and SIGABRT crashes
     os.environ['PYTHONUNBUFFERED'] = '1'
     os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
