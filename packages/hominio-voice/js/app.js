@@ -35,20 +35,42 @@ class HominiVoiceApp {
   async initialize() {
     if (this.isInitialized) return;
 
-    console.log("Initializing Hominio Voice App...");
+    console.log("🔧 Initializing Hominio Voice App...");
 
     try {
       // Initialize UI state (sets greeting)
       uiState.initializeGreeting();
 
-      // Initialize TTS service
+      // Wait for user gesture before initializing audio contexts
+      console.log("👆 Waiting for user interaction to enable audio...");
+      uiState.updateStatusText("Click anywhere to enable audio");
+      await this.waitForUserGesture();
+      console.log(
+        "👆 User gesture received - proceeding with audio initialization"
+      );
+
+      // Initialize TTS service (after user gesture)
       await ttsService.initialize();
 
-      // Initialize STT service
-      await this.initializeSTTService();
+      // Initialize message router with services (master coordinator)
+      messageRouter.setServices(this.sttService, ttsService);
 
-      // Initialize message router with services
-      messageRouter.initialize(this.sttService, ttsService);
+      // Connect message router to unified WebSocket (master connection) and wait for connection
+      console.log("🔗 Connecting message router to WebSocket...");
+      const connected = await messageRouter.connectToUnifiedEndpoint();
+
+      if (!connected) {
+        console.warn(
+          "⚠️ Failed to connect message router to WebSocket - continuing with local processing"
+        );
+      } else {
+        // Wait a bit more to ensure connection is stable
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        console.log("✅ Message router connected and ready");
+      }
+
+      // Initialize STT service (whether router is ready or not)
+      await this.initializeSTTService();
 
       // Set up event listeners
       this.setupEventListeners();
@@ -57,11 +79,41 @@ class HominiVoiceApp {
       this.setupErrorHandling();
 
       this.isInitialized = true;
-      console.log("Hominio Voice App initialized successfully");
+      console.log("✅ Hominio Voice App initialized successfully");
+
+      // Update UI to ready state
+      uiState.showStandby("Ready - Click 'Start Conversation' to begin");
     } catch (error) {
-      console.error("Failed to initialize Hominio Voice App:", error);
+      console.error("❌ Failed to initialize Hominio Voice App:", error);
       uiState.showError("Failed to initialize voice interface");
     }
+  }
+
+  /**
+   * Wait for user gesture to enable audio contexts (required by browser autoplay policy)
+   */
+  waitForUserGesture() {
+    return new Promise((resolve) => {
+      const handleUserGesture = () => {
+        console.log("👆 User gesture detected - enabling audio");
+        document.removeEventListener("click", handleUserGesture);
+        document.removeEventListener("keydown", handleUserGesture);
+        document.removeEventListener("touchstart", handleUserGesture);
+        resolve();
+      };
+
+      // Check if we already have user activation
+      if (navigator.userActivation && navigator.userActivation.hasBeenActive) {
+        console.log("👆 User activation already present");
+        resolve();
+        return;
+      }
+
+      // Add event listeners for user interaction
+      document.addEventListener("click", handleUserGesture);
+      document.addEventListener("keydown", handleUserGesture);
+      document.addEventListener("touchstart", handleUserGesture);
+    });
   }
 
   /**
@@ -163,7 +215,13 @@ class HominiVoiceApp {
   async handleCheckStatus() {
     try {
       uiState.showLoading("Checking status...");
-      await ttsService.checkModelStatus();
+      const status = ttsService.getStatus();
+      const routerStatus = messageRouter.getConnectionStatus();
+      console.log("TTS Status:", status);
+      console.log("Router Status:", routerStatus);
+      uiState.updateStatusText(
+        `TTS: ${status.status}, WebSocket: ${routerStatus.isConnected ? "Connected" : "Disconnected"}`
+      );
     } catch (error) {
       console.error("Error checking status:", error);
       uiState.showError("Error checking status");
@@ -177,6 +235,7 @@ class HominiVoiceApp {
     return {
       isInitialized: this.isInitialized,
       ttsService: ttsService.getStatus(),
+      messageRouter: messageRouter.getConnectionStatus(),
       uiState: uiState.getCurrentStates(),
     };
   }
@@ -194,9 +253,8 @@ class HominiVoiceApp {
     this.eventListeners = [];
 
     // Shutdown services
-    ttsService.shutdown();
     this.sttService.disconnect();
-    wsManager.closeAll();
+    messageRouter.disconnect();
 
     this.isInitialized = false;
     console.log("Hominio Voice App shut down");

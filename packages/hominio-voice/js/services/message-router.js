@@ -1,90 +1,229 @@
 /**
- * Frontend Message Router
- * Routes WebSocket messages to appropriate services (STT, TTS, etc.)
+ * Message Router (Master Coordinator)
+ * Single source of truth for all WebSocket communication
+ * Owns the WebSocket connection and routes all messages
  */
 import { uiState } from "../core/ui-state.js";
+import { wsManager } from "./websocket-manager.js";
 
 export class MessageRouter {
   constructor() {
     this.sttService = null;
     this.ttsService = null;
-    this.messageHandlers = new Map();
-
-    // Register default handlers
-    this.registerHandler("realtime", (data) => this.routeToSTT(data));
-    this.registerHandler("fullSentence", (data) => this.routeToSTT(data));
-    this.registerHandler("stt-status", (data) => this.routeToSTT(data));
-    this.registerHandler("vad_detect_start", (data) => this.routeToSTT(data));
-    this.registerHandler("vad_detect_stop", (data) => this.routeToSTT(data));
-
-    this.registerHandler("tts-error", (data) => this.routeToTTS(data));
-    this.registerHandler("model-status", (data) => this.routeToTTS(data));
-    this.registerHandler("status", (data) => this.handleGeneralStatus(data));
-    this.registerHandler("pong", (data) => this.handlePong(data));
+    this.isConnected = false;
   }
 
   /**
-   * Initialize with service references
+   * Set service references and establish proper coordination
    */
-  initialize(sttService, ttsService) {
+  setServices(sttService, ttsService) {
     this.sttService = sttService;
     this.ttsService = ttsService;
-    console.log("✅ Frontend message router initialized");
+
+    // Set message router reference in each service (single source of truth)
+    if (this.sttService && this.sttService.setMessageRouter) {
+      this.sttService.setMessageRouter(this);
+    }
+    if (this.ttsService && this.ttsService.setMessageRouter) {
+      this.ttsService.setMessageRouter(this);
+    }
+
+    console.log(
+      "✅ [Router] Service coordination established - router is master coordinator"
+    );
   }
 
   /**
-   * Register a message handler for a specific message type
+   * Initialize and connect to unified WebSocket endpoint (master connection)
    */
-  registerHandler(messageType, handler) {
-    this.messageHandlers.set(messageType, handler);
+  async connectToUnifiedEndpoint() {
+    try {
+      console.log("🔗 [Router] Connecting to unified WebSocket endpoint...");
+
+      // Create the master WebSocket connection
+      const connection = wsManager.createConnection("unified", "/ws", {
+        onOpen: () => {
+          console.log("🔗 [Router] Master WebSocket connection established");
+          this.isConnected = true;
+          uiState.updateConnectionStatus("Connected", true);
+
+          // Notify services that connection is ready
+          if (this.sttService) {
+            this.sttService.isConnected = true;
+            this.sttService.updateStatus("Connected through message router");
+          }
+        },
+        onMessage: (event) => this.handleMessage(event),
+        onClose: () => {
+          console.log("🔗 [Router] Master WebSocket connection closed");
+          this.isConnected = false;
+          uiState.updateConnectionStatus("Disconnected");
+
+          // Notify services of disconnection
+          if (this.sttService) {
+            this.sttService.isConnected = false;
+            this.sttService.updateStatus("Disconnected");
+          }
+        },
+        onError: (error) => {
+          console.error("🔗 [Router] Master WebSocket error:", error);
+          this.isConnected = false;
+          uiState.updateConnectionStatus("Error");
+
+          // Notify services of error
+          if (this.sttService) {
+            this.sttService.isConnected = false;
+            this.sttService.updateStatus("Connection error");
+          }
+        },
+        autoReconnect: true,
+      });
+
+      console.log("✅ [Router] Master WebSocket connection created");
+      return true;
+    } catch (error) {
+      console.error(
+        "❌ [Router] Failed to connect to unified endpoint:",
+        error
+      );
+      return false;
+    }
   }
 
   /**
-   * Route incoming WebSocket message to appropriate handler
+   * Master message handler - routes all WebSocket messages
    */
-  routeMessage(data) {
-    if (!data || !data.type) {
-      console.warn("⚠️ [Router] Invalid message format:", data);
+  handleMessage(event) {
+    try {
+      if (typeof event.data === "string") {
+        try {
+          const data = JSON.parse(event.data);
+          this.routeMessage(data);
+        } catch (e) {
+          // Ignore non-JSON messages
+          console.log("🔗 [Router] Non-JSON message received:", event.data);
+        }
+      } else {
+        // Binary data - route to STT service
+        console.log("🔗 [Router] Binary data received, routing to STT");
+        if (this.sttService && this.sttService.handleBinaryData) {
+          this.sttService.handleBinaryData(event.data);
+        }
+      }
+    } catch (error) {
+      console.error("❌ [Router] Error handling message:", error);
+    }
+  }
+
+  /**
+   * Route incoming messages to appropriate services
+   */
+  routeMessage(message) {
+    if (!message || typeof message !== "object") {
+      console.warn("⚠️ [Router] Invalid message format:", message);
       return false;
     }
 
-    const handler = this.messageHandlers.get(data.type);
-    if (handler) {
-      console.log(`🔄 [Router] Routing ${data.type} message`);
-      try {
-        handler(data);
+    const { type, ...data } = message;
+    console.log("🔗 [Router] Routing message:", type);
+
+    // Route message to appropriate service
+    switch (type) {
+      case "stt-result":
+      case "stt-status":
+      case "stt-error":
+      case "status":
+      case "model-status":
+      case "vad_detect_start":
+      case "vad_detect_stop":
+      case "realtime":
+      case "fullSentence":
+      case "pong":
+      case "error":
+        if (this.sttService) {
+          this.sttService.handleWebSocketMessage(message);
+        }
         return true;
-      } catch (error) {
-        console.error(`❌ [Router] Error handling ${data.type}:`, error);
+
+      case "tts_chunk":
+        if (this.ttsService) {
+          this.ttsService.handleTtsChunk(message.content);
+        }
+        return true;
+
+      case "streamingToken":
+        // LLM is streaming tokens - this is normal flow, just log for debugging
+        console.log("🤖 [Router] LLM streaming token received");
+        return true;
+
+      case "quickContext":
+        // Quick context detected - first part of response ready for TTS
+        console.log(
+          "⚡ [Router] Quick context detected - first TTS phase starting"
+        );
+        return true;
+
+      case "text":
+        // Text message from LLM streaming - part of the generation process
+        console.log("📝 [Router] LLM text chunk received");
+        return true;
+
+      case "streamingComplete":
+        // LLM streaming is complete - final TTS should continue until all audio is sent
+        console.log(
+          "✅ [Router] LLM streaming complete - waiting for final TTS to finish"
+        );
+        return true;
+
+      default:
+        console.warn(`⚠️ [Router] Unknown message type: ${type}`);
         return false;
+    }
+  }
+
+  /**
+   * Send message through master WebSocket connection (single source of truth)
+   */
+  sendMessage(message) {
+    if (!this.isConnected) {
+      console.error("❌ [Router] Cannot send message - not connected");
+      return false;
+    }
+
+    try {
+      const messageStr =
+        typeof message === "string" ? message : JSON.stringify(message);
+      const sent = wsManager.send("unified", messageStr);
+      if (sent) {
+        console.log(`📤 [Router] Sent message: ${message.type || "string"}`);
       }
-    }
-
-    console.warn(`⚠️ [Router] No handler for message type: ${data.type}`);
-    return false;
-  }
-
-  /**
-   * Route message to STT service
-   */
-  routeToSTT(data) {
-    if (this.sttService && this.sttService.handleWebSocketMessage) {
-      console.log(`📥 [Router] → STT: ${data.type}`);
-      this.sttService.handleWebSocketMessage(data);
-    } else {
-      console.warn("⚠️ [Router] STT service not available");
+      return sent;
+    } catch (error) {
+      console.error("❌ [Router] Error sending message:", error);
+      return false;
     }
   }
 
   /**
-   * Route message to TTS service
+   * Send binary data through master WebSocket connection (single source of truth)
    */
-  routeToTTS(data) {
-    if (this.ttsService && this.ttsService.handleMessage) {
-      console.log(`📥 [Router] → TTS: ${data.type}`);
-      this.ttsService.handleMessage(data);
-    } else {
-      console.warn("⚠️ [Router] TTS service not available");
+  sendBinaryData(data) {
+    if (!this.isConnected) {
+      console.error("❌ [Router] Cannot send binary data - not connected");
+      return false;
+    }
+
+    try {
+      const connection = wsManager.connections.get("unified");
+      if (connection && connection.websocket) {
+        connection.websocket.send(data);
+        console.log("📤 [Router] Sent binary data");
+        return true;
+      }
+      return false;
+    } catch (error) {
+      console.error("❌ [Router] Error sending binary data:", error);
+      return false;
     }
   }
 
@@ -92,57 +231,42 @@ export class MessageRouter {
    * Handle general status messages
    */
   handleGeneralStatus(data) {
-    console.log("ℹ️ [Router] General status:", data.message);
-    uiState.updateStatusText(data.message);
-  }
-
-  /**
-   * Handle pong messages
-   */
-  handlePong(data) {
-    console.log("🏓 [Router] Pong received");
-  }
-
-  /**
-   * Handle binary data (audio)
-   */
-  handleBinaryData(data) {
-    // Route binary data to TTS service (audio chunks)
-    if (this.ttsService && this.ttsService.handleBinaryData) {
-      console.log("🔊 [Router] → TTS: Binary audio data");
-      this.ttsService.handleBinaryData(data);
-    } else {
-      console.warn("⚠️ [Router] TTS service not available for binary data");
+    if (data.status) {
+      uiState.updateStatusText(data.status);
+    }
+    if (data.message) {
+      uiState.updateStatusText(data.message);
     }
   }
 
   /**
-   * Handle special string messages (END, ERROR)
+   * Get connection status
    */
-  handleSpecialString(message) {
-    if (message === "END" || message === "ERROR") {
-      // Route to TTS service
-      if (this.ttsService && this.ttsService.handleSpecialMessage) {
-        console.log(`🔊 [Router] → TTS: ${message}`);
-        this.ttsService.handleSpecialMessage(message);
-      }
-      return true;
-    }
-    return false;
-  }
-
-  /**
-   * Get router status
-   */
-  getStatus() {
+  getConnectionStatus() {
     return {
-      sttConnected: !!this.sttService,
-      ttsConnected: !!this.ttsService,
-      handlersCount: this.messageHandlers.size,
-      registeredTypes: Array.from(this.messageHandlers.keys()),
+      isConnected: this.isConnected,
+      wsStatus: wsManager.getConnectionStatus("unified"),
+      hasServices: !!(this.sttService && this.ttsService),
+      coordination: "master",
+      role: "single_source_of_truth",
     };
+  }
+
+  /**
+   * Close master connection
+   */
+  disconnect() {
+    console.log("🔗 [Router] Disconnecting master WebSocket");
+    wsManager.close("unified");
+    this.isConnected = false;
+
+    // Notify services of disconnection
+    if (this.sttService) {
+      this.sttService.isConnected = false;
+      this.sttService.updateStatus("Disconnected");
+    }
   }
 }
 
-// Export singleton instance
+// Create and export singleton instance
 export const messageRouter = new MessageRouter();

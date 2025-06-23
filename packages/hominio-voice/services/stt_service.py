@@ -1,6 +1,7 @@
 """
 Speech-to-Text Service
 Handles RealtimeSTT engine initialization and speech recognition
+Routes all communication through message router as single source of truth
 """
 import logging
 import json
@@ -19,40 +20,49 @@ class STTService:
             "message": "Starting STT engine...",
             "last_updated": datetime.now().isoformat()
         }
-        # Shared state - these will be updated by main.py callbacks
+        # Shared state - these will be updated by callbacks
         self.current_transcript = ""
         self.current_full_sentence = ""
         self.current_realtime_text = ""
         
-        # Callback functions - will be set by main.py to handle inter-service communication
+        # Callback functions - will be set by message router for coordination
         self.on_full_sentence_callback = None
         self.on_realtime_transcription_callback = None
+        
+        # Message router reference (set by message router during initialization)
+        self.message_router = None
+    
+    def set_message_router(self, router):
+        """Set message router reference for coordination"""
+        self.message_router = router
+        logger.info("✅ [STT] Message router reference set - routing through master coordinator")
     
     def set_callbacks(self, on_full_sentence=None, on_realtime_transcription=None):
-        """Set callback functions for STT events"""
+        """Set callback functions for STT events (called by message router)"""
         self.on_full_sentence_callback = on_full_sentence
         self.on_realtime_transcription_callback = on_realtime_transcription
+        logger.info("✅ [STT] Callbacks set by message router")
     
     async def process_full_sentence(self, text: str):
-        """Process a complete sentence from STT"""
+        """Process a complete sentence from STT - routes through message router"""
         self.current_full_sentence = text
-        logger.info(f"📝 Full sentence: '{text}'")
+        logger.info(f"📝 [STT] Full sentence: '{text}'")
         
-        # Call the callback if set (this will trigger LLM processing)
+        # Call the callback if set (this routes through message router)
         if self.on_full_sentence_callback:
             await self.on_full_sentence_callback(text)
     
     def on_realtime_transcription(self, text: str):
-        """Handle realtime transcription updates"""
+        """Handle realtime transcription updates - routes through message router"""
         self.current_realtime_text = text
-        logger.debug(f"🔄 Realtime transcription: '{text}'")
+        logger.debug(f"🔄 [STT] Realtime transcription: '{text}'")
         
-        # Call the callback if set
+        # Call the callback if set (this routes through message router)
         if self.on_realtime_transcription_callback:
             try:
                 self.on_realtime_transcription_callback(text)
             except Exception as e:
-                logger.error(f"Error in realtime transcription callback: {e}")
+                logger.error(f"❌ [STT] Error in realtime transcription callback: {e}")
     
     async def initialize_stt_engine(self):
         """Initialize RealtimeSTT engine"""
@@ -67,9 +77,9 @@ class STTService:
             # Create VAD callbacks for different states
             vad_callbacks = {
                 'on_realtime_transcription_update': self.on_realtime_transcription,
-                'on_recording_start': lambda *args: logger.info("🎤 Recording started"),
-                'on_recording_stop': lambda *args: logger.info("⏹️ Recording stopped"),
-                'on_transcription_start': lambda *args: logger.info("🔄 Transcription started"),
+                'on_recording_start': lambda *args: logger.info("🎤 [STT] Recording started"),
+                'on_recording_stop': lambda *args: logger.info("⏹️ [STT] Recording stopped"),
+                'on_transcription_start': lambda *args: logger.info("🔄 [STT] Transcription started"),
             }
             
             # Get STT configuration from config
@@ -97,9 +107,9 @@ class STTService:
                 if hasattr(self.stt_engine, 'set_log_level'):
                     self.stt_engine.set_log_level(logging.WARNING)
                 else:
-                    logger.info("STT engine doesn't support set_log_level method")
+                    logger.info("[STT] Engine doesn't support set_log_level method")
             except Exception as e:
-                logger.warning(f"Could not set STT log level: {e}")
+                logger.warning(f"[STT] Could not set log level: {e}")
             
             # Engine is ready
             self.status.update({
@@ -115,10 +125,10 @@ class STTService:
                 }
             })
             
-            logger.info("✅ RealtimeSTT initialized successfully!")
+            logger.info("✅ [STT] RealtimeSTT initialized successfully!")
             
         except Exception as e:
-            logger.error(f"Failed to initialize RealtimeSTT: {e}")
+            logger.error(f"❌ [STT] Failed to initialize RealtimeSTT: {e}")
             self.status.update({
                 "status": "error",
                 "progress": 0,
@@ -141,10 +151,15 @@ class STTService:
         self.current_transcript = ""
         self.current_full_sentence = ""
         self.current_realtime_text = ""
-        logger.info("🧹 Transcript cleared")
+        logger.info("🧹 [STT] Transcript cleared")
     
-    async def process_audio_async(self, websocket):
-        """Process audio in an async loop"""
+    async def process_audio_async(self, message_router_callback=None):
+        """
+        Process audio in an async loop - routes through message router
+        
+        Args:
+            message_router_callback: Callback to send messages through message router
+        """
         if not self.stt_engine:
             raise RuntimeError("STT engine not initialized")
         
@@ -156,31 +171,34 @@ class STTService:
                 
                 if transcription.strip():
                     self.current_transcript = transcription
-                    logger.info(f"🎙️ Transcription: '{transcription}'")
+                    logger.info(f"🎙️ [STT] Transcription: '{transcription}'")
                     
-                    # Send transcription to client via WebSocket
-                    if websocket:
-                        await websocket.send_text(json.dumps({
+                    # Send transcription through message router (single source of truth)
+                    if message_router_callback:
+                        await message_router_callback({
                             "type": "transcription",
                             "text": transcription,
                             "timestamp": datetime.now().isoformat()
-                        }))
+                        })
                     
-                    # Process as full sentence (trigger LLM)
+                    # Process as full sentence (routes through message router)
                     await self.process_full_sentence(transcription)
                     
         except Exception as e:
-            logger.error(f"Error in STT processing: {e}")
-            if websocket:
-                await websocket.send_text(json.dumps({
+            logger.error(f"❌ [STT] Error in audio processing: {e}")
+            if message_router_callback:
+                await message_router_callback({
                     "type": "error",
                     "message": str(e),
                     "timestamp": datetime.now().isoformat()
-                }))
+                })
     
     def get_status(self):
         """Get current STT status"""
-        return self.status
+        status = self.status.copy()
+        status["message_router_connected"] = self.message_router is not None
+        status["callbacks_set"] = bool(self.on_full_sentence_callback and self.on_realtime_transcription_callback)
+        return status
     
     def get_current_transcript(self):
         """Get current transcript data"""

@@ -1,197 +1,287 @@
 /**
- * Audio Service
- * Handles audio playback and processing with visual state integration
+ * Audio Service (Reference Implementation Only)
+ * Handles AudioWorklet for direct PCM streaming exactly like RealtimeVoiceChat
  */
-import { domElements } from "../core/dom-elements.js";
 import { uiState } from "../core/ui-state.js";
 
 export class AudioService {
   constructor() {
-    this.audioChunks = [];
-    this.isReceivingAudio = false;
-    this.currentAudioUrl = null;
-    this.lastPlayedText = "";
-    this.lastPlayedTimestamp = 0;
+    // Reference-style AudioWorklet implementation only
+    this.audioContext = null;
+    this.ttsWorkletNode = null;
+    this.isAudioInitialized = false;
+    this.isInitializing = false; // Lock to prevent concurrent initialization
+    this.isPlayingTTS = false;
   }
 
   /**
-   * Check if we should skip audio to prevent looping
+   * Initialize audio service (main initialization method)
    */
-  shouldSkipAudio(identifier = null) {
-    const currentTime = Date.now();
+  async initialize() {
+    try {
+      console.log("🎵 [Audio] Initializing audio service...");
 
-    // If we have an identifier (like text hash), check for duplicates
-    if (identifier) {
-      if (
-        identifier === this.lastPlayedText &&
-        currentTime - this.lastPlayedTimestamp < 5000
-      ) {
-        // 5 second window
-        console.warn("🔄 Skipping duplicate audio playback");
+      // Initialize AudioWorklet for PCM streaming
+      const success = await this.initializeAudioWorklet();
+
+      if (success) {
+        console.log("✅ [Audio] Audio service initialized successfully");
         return true;
+      } else {
+        console.error("❌ [Audio] Failed to initialize audio service");
+        return false;
       }
-      this.lastPlayedText = identifier;
+    } catch (error) {
+      console.error("❌ [Audio] Error initializing audio service:", error);
+      return false;
     }
-
-    this.lastPlayedTimestamp = currentTime;
-    return false;
   }
 
   /**
-   * Add audio chunk to buffer
+   * Initialize AudioWorklet for PCM audio streaming (reference implementation)
    */
-  addAudioChunk(chunk) {
-    if (!this.isReceivingAudio) {
-      this.isReceivingAudio = true;
-      this.audioChunks = [];
-      // Update to speaking state when we start receiving audio
-      uiState.showSpeaking("Receiving voice data...");
-    }
-    this.audioChunks.push(chunk);
-  }
-
-  /**
-   * Play accumulated audio chunks
-   */
-  async playAudioChunks() {
-    if (this.audioChunks.length === 0) {
-      uiState.showStandby("No audio data received");
-      return false;
+  async initializeAudioWorklet() {
+    if (this.isAudioInitialized) {
+      return true;
     }
 
-    // Check for duplicate audio (simple check based on chunk count and size)
-    const audioIdentifier = `${this.audioChunks.length}_${this.audioChunks[0]?.byteLength || 0}`;
-    if (this.shouldSkipAudio(audioIdentifier)) {
-      uiState.showStandby("Duplicate audio skipped");
-      this.resetAudioState();
-      return false;
+    // Prevent concurrent initialization
+    if (this.isInitializing) {
+      console.log(
+        "🎵 [Audio] AudioWorklet initialization already in progress, waiting..."
+      );
+      // Wait for current initialization to complete
+      while (this.isInitializing && !this.isAudioInitialized) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      return this.isAudioInitialized;
     }
 
-    const audioPlayer = domElements.audioPlayer;
-    if (!audioPlayer) {
-      console.error("Audio player element not found");
-      uiState.showStandby("Audio player not found");
-      return false;
-    }
+    this.isInitializing = true;
 
     try {
-      // Clean up previous audio URL
-      this.cleanupAudioUrl();
+      console.log("🎵 [Audio] Initializing AudioWorklet for PCM streaming...");
 
-      // Create new audio blob
-      const audioBlob = new Blob(this.audioChunks, { type: "audio/wav" });
-      this.currentAudioUrl = URL.createObjectURL(audioBlob);
+      // Check if AudioWorklet is supported and we're in a secure context
+      if (!window.AudioContext && !window.webkitAudioContext) {
+        throw new Error("AudioContext not supported in this browser");
+      }
 
-      // Set up audio player
-      audioPlayer.src = this.currentAudioUrl;
-      audioPlayer.style.display = "block";
+      if (
+        !window.isSecureContext &&
+        location.protocol !== "http:" &&
+        location.hostname !== "localhost"
+      ) {
+        console.warn(
+          "⚠️ [Audio] AudioWorklet requires a secure context (HTTPS or localhost)"
+        );
+      }
 
-      // Update to speaking state
-      uiState.showSpeaking("Playing audio");
+      // Create AudioContext
+      this.audioContext = new (window.AudioContext ||
+        window.webkitAudioContext)();
 
-      // Play audio
-      await audioPlayer.play();
+      // Check if AudioWorklet is available
+      if (!this.audioContext.audioWorklet) {
+        throw new Error("AudioWorklet not supported in this browser");
+      }
 
-      // Set up event listeners
-      this.setupAudioEventListeners(audioPlayer);
+      // Resume context if needed (required for some browsers)
+      if (this.audioContext.state === "suspended") {
+        await this.audioContext.resume();
+      }
 
+      // Add TTS processor to AudioWorklet
+      await this.addTTSProcessor();
+
+      // Create the worklet node (timing fix: ensure processor is loaded first)
+      try {
+        this.ttsWorkletNode = new AudioWorkletNode(
+          this.audioContext,
+          "tts-playback-processor"
+        );
+      } catch (nodeError) {
+        console.warn(
+          "❌ [Audio] First attempt to create worklet node failed, retrying...",
+          nodeError
+        );
+        // Wait a bit more and retry
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        this.ttsWorkletNode = new AudioWorkletNode(
+          this.audioContext,
+          "tts-playback-processor"
+        );
+      }
+
+      // Set up message handling from worklet
+      this.ttsWorkletNode.port.onmessage = (event) => {
+        const { type } = event.data;
+        if (type === "ttsPlaybackStarted") {
+          console.log("🎵 [Audio] TTS playback started");
+          this.isPlayingTTS = true;
+          uiState.showSpeaking("Audio playing");
+        } else if (type === "ttsPlaybackStopped") {
+          console.log("🎵 [Audio] TTS playback stopped");
+          this.isPlayingTTS = false;
+          uiState.showListening("Ready for speech");
+        }
+      };
+
+      // Connect to audio output
+      this.ttsWorkletNode.connect(this.audioContext.destination);
+
+      this.isAudioInitialized = true;
+      console.log("✅ [Audio] AudioWorklet initialized successfully");
       return true;
     } catch (error) {
-      console.error("Error playing audio:", error);
-      uiState.showStandby("Audio playback error");
-      this.resetAudioState();
+      console.error("❌ [Audio] Failed to initialize AudioWorklet:", error);
+      this.isAudioInitialized = false;
       return false;
+    } finally {
+      this.isInitializing = false;
     }
   }
 
   /**
-   * Set up audio player event listeners
+   * Add TTS processor to AudioWorklet (reference implementation)
    */
-  setupAudioEventListeners(audioPlayer) {
-    // Remove existing listeners to prevent duplicates
-    audioPlayer.onended = null;
-    audioPlayer.onerror = null;
+  async addTTSProcessor() {
+    const processorCode = `
+class TTSPlaybackProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.bufferQueue = [];
+    this.readOffset = 0;
+    this.samplesRemaining = 0;
+    this.isPlaying = false;
 
-    audioPlayer.onended = () => {
-      console.log("🔊 Audio playback ended");
-      this.cleanupAudioUrl();
-      audioPlayer.style.display = "none";
-
-      // Return to standby state after audio ends
-      uiState.showStandby();
-      this.resetAudioState();
-    };
-
-    audioPlayer.onerror = (error) => {
-      console.error("Audio playback error:", error);
-      uiState.showStandby("Audio playback failed");
-      this.resetAudioState();
-    };
-
-    // Add additional event listeners for better state tracking
-    audioPlayer.onplay = () => {
-      console.log("🔊 Audio playback started");
-      uiState.showSpeaking("Audio playing");
-    };
-
-    audioPlayer.onpause = () => {
-      console.log("🔊 Audio playback paused");
-      uiState.showStandby("Audio paused");
+    // Listen for incoming messages
+    this.port.onmessage = (event) => {
+      // Check if this is a control message (object with a "type" property)
+      if (event.data && typeof event.data === "object" && event.data.type === "clear") {
+        // Clear the TTS buffer and reset playback state
+        this.bufferQueue = [];
+        this.readOffset = 0;
+        this.samplesRemaining = 0;
+        this.isPlaying = false;
+        return;
+      }
+      
+      // Otherwise assume it's a PCM chunk (e.g., an Int16Array)
+      if (event.data && event.data.length > 0) {
+        this.bufferQueue.push(event.data);
+        this.samplesRemaining += event.data.length;
+      }
     };
   }
 
-  /**
-   * Clean up audio URL to prevent memory leaks
-   */
-  cleanupAudioUrl() {
-    if (this.currentAudioUrl) {
-      URL.revokeObjectURL(this.currentAudioUrl);
-      this.currentAudioUrl = null;
+  process(inputs, outputs, parameters) {
+    const output = outputs[0];
+    
+    // Ensure we have at least one output channel
+    if (!output || output.length === 0) {
+      return true;
+    }
+    
+    const outputChannel = output[0];
+
+    if (this.samplesRemaining === 0) {
+      // Fill with silence
+      outputChannel.fill(0);
+      if (this.isPlaying) {
+        this.isPlaying = false;
+        this.port.postMessage({ type: 'ttsPlaybackStopped' });
+      }
+      return true;
+    }
+
+    if (!this.isPlaying) {
+      this.isPlaying = true;
+      this.port.postMessage({ type: 'ttsPlaybackStarted' });
+    }
+
+    let outIdx = 0;
+    while (outIdx < outputChannel.length && this.bufferQueue.length > 0) {
+      const currentBuffer = this.bufferQueue[0];
+      
+      // Convert PCM16 to float32 (-1.0 to 1.0 range)
+      const sampleValue = currentBuffer[this.readOffset] / 32768.0;
+      outputChannel[outIdx++] = sampleValue;
+
+      this.readOffset++;
+      this.samplesRemaining--;
+
+      // Move to next buffer when current one is exhausted
+      if (this.readOffset >= currentBuffer.length) {
+        this.bufferQueue.shift();
+        this.readOffset = 0;
+      }
+    }
+
+    // Fill remaining samples with silence
+    while (outIdx < outputChannel.length) {
+      outputChannel[outIdx++] = 0;
+    }
+
+    // Keep processor alive
+    return true;
+  }
+}
+
+registerProcessor('tts-playback-processor', TTSPlaybackProcessor);
+    `;
+
+    try {
+      // Create blob URL for the processor
+      const blob = new Blob([processorCode], {
+        type: "application/javascript",
+      });
+      const processorUrl = URL.createObjectURL(blob);
+
+      // Add module to AudioWorklet
+      await this.audioContext.audioWorklet.addModule(processorUrl);
+
+      // Clean up blob URL immediately after loading
+      URL.revokeObjectURL(processorUrl);
+
+      // Small delay to ensure processor is fully registered
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      console.log("✅ [Audio] TTS processor registered successfully");
+    } catch (error) {
+      console.error("❌ [Audio] Failed to add TTS processor:", error);
+      throw error;
     }
   }
 
   /**
-   * Reset audio state
+   * Clear audio buffer (reference implementation)
    */
-  resetAudioState() {
-    this.audioChunks = [];
-    this.isReceivingAudio = false;
-    this.cleanupAudioUrl();
-  }
-
-  /**
-   * Stop current audio playback
-   */
-  stopAudio() {
-    const audioPlayer = domElements.audioPlayer;
-    if (audioPlayer && !audioPlayer.paused) {
-      audioPlayer.pause();
-      audioPlayer.currentTime = 0;
+  clearAudio() {
+    if (this.ttsWorkletNode) {
+      this.ttsWorkletNode.port.postMessage({ type: "clear" });
+      console.log("🎵 [Audio] Audio buffer cleared");
     }
-    this.resetAudioState();
-    uiState.showStandby("Audio stopped");
   }
 
   /**
    * Check if audio is currently playing
    */
   isPlaying() {
-    const audioPlayer = domElements.audioPlayer;
-    return audioPlayer && !audioPlayer.paused;
+    return this.isPlayingTTS;
   }
 
   /**
-   * Get audio processing state
+   * Get audio service state
    */
   getState() {
     return {
-      isReceivingAudio: this.isReceivingAudio,
-      chunksCount: this.audioChunks.length,
-      isPlaying: this.isPlaying(),
-      hasCurrentUrl: !!this.currentAudioUrl,
+      isInitialized: this.isAudioInitialized,
+      isPlaying: this.isPlayingTTS,
+      contextState: this.audioContext?.state || "unknown",
     };
   }
 }
 
-// Export singleton instance
+// Create and export singleton instance
 export const audioService = new AudioService();

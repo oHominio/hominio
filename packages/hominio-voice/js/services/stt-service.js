@@ -9,27 +9,36 @@ import { wsManager } from "./websocket-manager.js";
  */
 export class STTService {
   constructor() {
+    this.isConnected = false;
+    this.isRecording = false;
+    this.isConversationActive = false;
+    this.conversationStartTime = null;
     this.audioStream = null;
     this.audioContext = null;
     this.source = null;
     this.processor = null;
-    this.isRecording = false;
-    this.isConnected = false;
-    this.isConversationActive = false; // New: tracks if conversation session is active
+    this.sentenceEndPattern = /[.!?]+\s*$/;
+    this.sentenceHashes = new Set();
 
-    // Callbacks
+    // Message router reference (set by router during initialization)
+    this.messageRouter = null;
+
+    // Callback functions
     this.onPartialTranscription = null;
     this.onFinalTranscription = null;
     this.onError = null;
     this.onStatusChange = null;
-    this.onPotentialSentence = null; // New callback for potential sentence detection
-
-    // Potential sentence detection
-    this.lastPartialText = "";
-    this.sentenceEndPattern = /[.!?]+\s*$/; // Pattern for sentence endings
-    this.potentialSentenceCache = new Set(); // Cache to avoid duplicates
+    this.onPotentialSentence = null;
 
     this.setupEventListeners();
+  }
+
+  /**
+   * Set message router reference (called by message router)
+   */
+  setMessageRouter(router) {
+    this.messageRouter = router;
+    console.log("✅ [STT] Message router reference set");
   }
 
   clearTranscript() {
@@ -78,7 +87,7 @@ export class STTService {
   }
 
   setupEventListeners() {
-    // Conversation button event listeners - Start/Stop conversation session
+    // Conversation button event listeners - Start/Stop conversation
     const recordButton = domElements.get("recordButton");
     if (recordButton) {
       // Simple click toggle for start/stop conversation
@@ -109,22 +118,49 @@ export class STTService {
     }
   }
 
+  /**
+   * Handle WebSocket connection through message router only
+   */
   async connectWebSocket() {
-    // Check if unified connection already exists (created by TTS service)
-    const existingConnection = wsManager.connections.get("unified");
-    if (
-      existingConnection &&
-      wsManager.getConnectionStatus("unified") === "connected"
-    ) {
-      console.log("🔌 STT using existing unified WebSocket connection");
+    // STT service doesn't manage connections - message router does
+    if (this.messageRouter && this.messageRouter.isConnected) {
+      console.log("🔌 [STT] Using message router's WebSocket connection");
       this.isConnected = true;
-      this.updateStatus("Connected to unified service");
-      return;
-    }
+      this.updateStatus("Connected through message router");
+      return true;
+    } else {
+      console.log("🔌 [STT] Waiting for message router connection...");
+      this.updateStatus("Waiting for message router connection");
 
-    // STT service doesn't create connections - it uses the one created by TTS
-    console.log("🔌 STT waiting for unified WebSocket connection...");
-    this.updateStatus("Waiting for WebSocket connection");
+      // Wait for message router to be ready (with reduced timeout)
+      let attempts = 0;
+      const maxAttempts = 5; // Reduced from 10
+
+      while (
+        attempts < maxAttempts &&
+        (!this.messageRouter || !this.messageRouter.isConnected)
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 200)); // Reduced from 500ms
+        attempts++;
+        console.log(
+          `🔌 [STT] Waiting for message router... (${attempts}/${maxAttempts})`
+        );
+      }
+
+      if (this.messageRouter && this.messageRouter.isConnected) {
+        console.log("✅ [STT] Message router connection established");
+        this.isConnected = true;
+        this.updateStatus("Connected through message router");
+        return true;
+      } else {
+        console.warn(
+          "⚠️ [STT] Message router connection timeout - will proceed with local processing"
+        );
+        this.updateStatus("Local processing only - WebSocket not connected");
+        this.isConnected = false;
+        return false;
+      }
+    }
   }
 
   handleWebSocketMessage(data) {
@@ -289,8 +325,7 @@ export class STTService {
       this.stopRecording();
     }
 
-    // Note: We don't close the unified WebSocket here as it's shared with TTS
-    // The wsManager handles connection lifecycle
+    // STT service doesn't manage WebSocket - message router does
     this.isConnected = false;
   }
 
@@ -309,14 +344,14 @@ export class STTService {
     if (this.sentenceEndPattern.test(trimmedText)) {
       // Avoid processing the same sentence multiple times
       const textHash = this.hashText(trimmedText);
-      if (this.potentialSentenceCache.has(textHash)) {
+      if (this.sentenceHashes.has(textHash)) {
         return;
       }
 
       // Add to cache with TTL
-      this.potentialSentenceCache.add(textHash);
+      this.sentenceHashes.add(textHash);
       setTimeout(() => {
-        this.potentialSentenceCache.delete(textHash);
+        this.sentenceHashes.delete(textHash);
       }, 5000); // 5 second TTL
 
       console.log("🎯 [STT] Potential sentence end detected:", trimmedText);
@@ -326,8 +361,6 @@ export class STTService {
         this.onPotentialSentence(trimmedText);
       }
     }
-
-    this.lastPartialText = trimmedText;
   }
 
   /**
@@ -374,25 +407,54 @@ export class STTService {
       // Update UI to listening state
       uiState.showListening("Conversation active - listening for speech...");
 
-      // Connect WebSocket if not connected
+      // Ensure message router connection is ready
       if (!this.isConnected) {
-        console.log("🔌 [STT] Connecting to WebSocket...");
+        console.log(
+          "🔌 [STT] Message router not connected, attempting connection..."
+        );
         await this.connectWebSocket();
-        // Wait a bit for connection to establish
-        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        // If still not connected after waiting, continue anyway for local audio processing
+        if (!this.isConnected) {
+          console.warn("⚠️ [STT] Proceeding with local audio processing only");
+          uiState.updateStatusText(
+            "Audio processing only - WebSocket not connected"
+          );
+        }
       }
 
       console.log("🎙️ [STT] Requesting microphone access for conversation...");
+
       // Request microphone access for VAD-based recording
       this.audioStream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          sampleRate: 16000,
+        },
       });
       console.log("✅ [STT] Microphone access granted for conversation");
 
       // Set up audio processing for VAD
       this.audioContext = new AudioContext();
+
+      // Resume context if suspended (required for autoplay policy)
+      if (this.audioContext.state === "suspended") {
+        await this.audioContext.resume();
+        console.log("🎵 [STT] AudioContext resumed");
+      }
+
       this.source = this.audioContext.createMediaStreamSource(this.audioStream);
-      this.processor = this.audioContext.createScriptProcessor(256, 1, 1);
+
+      // Use ScriptProcessor with proper error handling
+      try {
+        console.log("🎤 [STT] Setting up audio processing...");
+        this.processor = this.audioContext.createScriptProcessor(4096, 1, 1); // Larger buffer for stability
+      } catch (error) {
+        console.error("❌ [STT] Failed to create audio processor:", error);
+        throw error;
+      }
 
       this.source.connect(this.processor);
       this.processor.connect(this.audioContext.destination);
@@ -403,19 +465,16 @@ export class STTService {
       this.isConversationActive = true;
       this.updateConversationUI(true);
 
-      // Send start command to enable VAD on server
-      if (wsManager.getConnectionStatus("unified") === "connected") {
+      // Send start command through message router (if available)
+      if (this.messageRouter && this.messageRouter.isConnected) {
         console.log("📤 [STT] Enabling VAD for conversation...");
-        wsManager.send(
-          "unified",
-          JSON.stringify({
-            type: "stt-command",
-            command: "start",
-          })
-        );
+        this.messageRouter.sendMessage({
+          type: "stt-command",
+          command: "start",
+        });
       } else {
-        console.error(
-          "❌ [STT] Unified WebSocket not ready for conversation start"
+        console.warn(
+          "⚠️ [STT] Message router not available - audio processing only"
         );
       }
 
@@ -440,32 +499,48 @@ export class STTService {
         audioChunkCount++;
         totalAudioBytes += outputData.buffer.byteLength;
 
-        // Send audio data for VAD processing
-        if (wsManager.getConnectionStatus("unified") === "connected") {
-          const metadata = JSON.stringify({
-            sampleRate: this.audioContext.sampleRate,
-          });
-          const metadataBytes = new TextEncoder().encode(metadata);
-          const metadataLength = new ArrayBuffer(4);
-          const metadataLengthView = new DataView(metadataLength);
-          metadataLengthView.setInt32(0, metadataBytes.byteLength, true);
+        // Send audio data through message router (if available)
+        if (this.messageRouter && this.messageRouter.isConnected) {
+          try {
+            const metadata = JSON.stringify({
+              sampleRate: this.audioContext.sampleRate,
+            });
+            const metadataBytes = new TextEncoder().encode(metadata);
+            const metadataLength = new ArrayBuffer(4);
+            const metadataLengthView = new DataView(metadataLength);
+            metadataLengthView.setInt32(0, metadataBytes.byteLength, true);
 
-          const combinedData = new Blob([
-            metadataLength,
-            metadataBytes,
-            outputData.buffer,
-          ]);
+            const combinedData = new Blob([
+              metadataLength,
+              metadataBytes,
+              outputData.buffer,
+            ]);
 
-          // Send binary data through the unified connection
-          const connection = wsManager.connections.get("unified");
-          if (connection && connection.websocket) {
-            connection.websocket.send(combinedData);
+            // Send binary data through message router
+            this.messageRouter.sendBinaryData(combinedData);
+          } catch (error) {
+            console.error("❌ [STT] Error sending audio data:", error);
           }
         }
+
+        // Log audio processing status periodically
+        if (audioChunkCount % 100 === 0) {
+          console.log(
+            `🎤 [STT] Processed ${audioChunkCount} audio chunks (${totalAudioBytes} bytes)`
+          );
+        }
       };
+
+      // Update status
+      uiState.updateStatusText("Conversation active - listening for speech");
     } catch (error) {
       console.error("❌ [STT] Failed to start conversation:", error);
-      this.handleError("Failed to start conversation");
+      this.handleError("Failed to start conversation: " + error.message);
+
+      // Clean up on error
+      this.isConversationActive = false;
+      this.updateConversationUI(false);
+      uiState.showError("Failed to start conversation");
     }
   }
 
@@ -484,16 +559,13 @@ export class STTService {
       // Update UI to standby state
       uiState.showStandby("Conversation ended");
 
-      // Send stop command to disable VAD
-      if (wsManager.getConnectionStatus("unified") === "connected") {
+      // Send stop command through message router (single source of truth)
+      if (this.messageRouter && this.messageRouter.isConnected) {
         console.log("📤 [STT] Disabling VAD for conversation...");
-        wsManager.send(
-          "unified",
-          JSON.stringify({
-            type: "stt-command",
-            command: "stop",
-          })
-        );
+        this.messageRouter.sendMessage({
+          type: "stt-command",
+          command: "stop",
+        });
       }
 
       console.log("🧹 [STT] Cleaning up conversation resources...");
