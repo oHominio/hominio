@@ -87,30 +87,42 @@ class Config:
     TTS_VOICE = "af_heart"
     TTS_MUTED = True  # Always muted for headless operation
     
-    # STT Configuration - MATCHED TO REFERENCE IMPLEMENTATION
-    STT_MODEL = "base.en"  # Changed from "tiny" to match reference
+    # STT Configuration - MATCHED TO MAIN.PY HARDCODED VALUES
+    STT_MODEL = "tiny"  # Matches main.py hardcoded value
     STT_LANGUAGE = "en"
     STT_REALTIME_ENABLED = True
-    STT_REALTIME_MODEL = "base.en"  # Changed from "tiny" to match reference
-    STT_REALTIME_PAUSE = 0.03  # Changed from 0.02 to match reference
+    STT_REALTIME_MODEL = "tiny"  # Matches main.py hardcoded value
+    STT_REALTIME_PAUSE = 0.02  # Matches main.py hardcoded value
     
-    # VAD Configuration - MATCHED TO REFERENCE IMPLEMENTATION
-    STT_SILERO_SENSITIVITY = 0.05  # Changed back to reference value
-    STT_WEBRTC_SENSITIVITY = 3     # Changed back to reference value
+    # VAD Configuration - MATCHED TO MAIN.PY HARDCODED VALUES
+    STT_SILERO_SENSITIVITY = 0.05  # Matches main.py hardcoded value
+    STT_WEBRTC_SENSITIVITY = 3     # Matches main.py hardcoded value
     STT_POST_SPEECH_SILENCE = 0.7
-    STT_MIN_RECORDING_LENGTH = 0.5  # Changed to match reference
-    STT_MIN_GAP_BETWEEN_RECORDINGS = 0  # Changed to match reference
-    STT_EARLY_TRANSCRIPTION_SILENCE = 0  # Changed to match reference
+    STT_MIN_RECORDING_LENGTH = 1.1  # Matches main.py hardcoded value
+    STT_MIN_GAP_BETWEEN_RECORDINGS = 0  # Matches main.py hardcoded value
+    STT_EARLY_TRANSCRIPTION_SILENCE = 0.2  # Matches main.py hardcoded value
     
     # Dynamic VAD settings for different conversation phases
     STT_MID_SENTENCE_PAUSE = 0.3      # Shorter pause for mid-sentence detection
     STT_END_SENTENCE_PAUSE = 0.7      # Standard pause for sentence endings
     STT_UNKNOWN_SENTENCE_PAUSE = 1.0  # Longer pause for unclear speech patterns
     
-    STT_BEAM_SIZE = 3  # Changed from 1 to match reference
-    STT_BEAM_SIZE_REALTIME = 3  # Changed from 1 to match reference
+    STT_BEAM_SIZE = 1  # Matches main.py hardcoded value
+    STT_BEAM_SIZE_REALTIME = 1  # Matches main.py hardcoded value
     STT_DEVICE = 'cuda'  # Force GPU usage - NO CPU FALLBACK
     STT_COMPUTE_TYPE = 'int8'
+    
+    # Additional STT Configuration from main.py
+    STT_USE_MICROPHONE = False
+    STT_SPINNER = False
+    STT_SILERO_USE_ONNX = True
+    STT_SILERO_DEACTIVITY_DETECTION = True
+    STT_NO_LOG_FILE = True
+    STT_DEBUG_MODE = False  # main.py doesn't set this
+    STT_INITIAL_PROMPT = "Add periods only for complete sentences. Use ellipsis (...) for unfinished thoughts."
+    STT_USE_MAIN_MODEL_FOR_REALTIME = False
+    STT_FASTER_WHISPER_VAD_FILTER = False
+    STT_ALLOWED_LATENCY_LIMIT = 500
     
     # LLM Configuration
     LLM_MODEL = "phala/llama-3.3-70b-instruct"
@@ -129,33 +141,29 @@ class Config:
     
     @classmethod
     def get_stt_config(cls, vad_callbacks: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Get STT engine configuration with optional VAD callbacks"""
+        """Get STT engine configuration matching main.py hardcoded values exactly"""
         config = {
             'model': cls.STT_MODEL,
             'language': cls.STT_LANGUAGE,
-            'use_microphone': False,
-            'spinner': False,
+            'use_microphone': cls.STT_USE_MICROPHONE,
+            'spinner': cls.STT_SPINNER,
             'enable_realtime_transcription': cls.STT_REALTIME_ENABLED,
             'realtime_model_type': cls.STT_REALTIME_MODEL,
-            'use_main_model_for_realtime': False,  # Added from reference
             'realtime_processing_pause': cls.STT_REALTIME_PAUSE,
             'silero_sensitivity': cls.STT_SILERO_SENSITIVITY,
             'webrtc_sensitivity': cls.STT_WEBRTC_SENSITIVITY,
             'post_speech_silence_duration': cls.STT_POST_SPEECH_SILENCE,
             'min_length_of_recording': cls.STT_MIN_RECORDING_LENGTH,
             'min_gap_between_recordings': cls.STT_MIN_GAP_BETWEEN_RECORDINGS,
-            'silero_use_onnx': True,  # Added from reference
-            'silero_deactivity_detection': True,
+            'silero_deactivity_detection': cls.STT_SILERO_DEACTIVITY_DETECTION,
             'early_transcription_on_silence': cls.STT_EARLY_TRANSCRIPTION_SILENCE,
             'beam_size': cls.STT_BEAM_SIZE,
             'beam_size_realtime': cls.STT_BEAM_SIZE_REALTIME,
-            'no_log_file': True,
+            'no_log_file': cls.STT_NO_LOG_FILE,
             'device': cls.STT_DEVICE,
             'compute_type': cls.STT_COMPUTE_TYPE,
-            'debug_mode': True,  # Added from reference
-            'initial_prompt_realtime': "The sky is blue. When the sky... She walked home. Because he... Today is sunny. If only I...",  # Changed to match reference
-            'faster_whisper_vad_filter': False,  # Added from reference
-            'allowed_latency_limit': 500  # Added from reference
+            'initial_prompt': cls.STT_INITIAL_PROMPT,
+            # Note: level and on_realtime_transcription_update will be added when used
         }
         
         # Add VAD callbacks if provided

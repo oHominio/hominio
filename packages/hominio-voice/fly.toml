@@ -2,7 +2,6 @@ app = "hominio-voice"
 primary_region = "ord"
 vm.size = "a100-40gb"
 
-
 [build]
 dockerfile = "Dockerfile"
 
@@ -23,7 +22,6 @@ internal_port = 8080
 force_https = true
 auto_stop_machines = "stop"
 auto_start_machines = false
-min_machines_running = 0
 processes = ["app"]
 
 [[http_service.checks]]
