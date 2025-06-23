@@ -196,7 +196,7 @@ export class STTService {
         break;
 
       case "realtime":
-        console.log("⚡ [STT] Real-time transcription:", data.text);
+        // console.log("⚡ [STT] Real-time transcription:", data.text); // Too noisy
         // Show thinking state when we get real-time transcription
         if (data.text && data.text.trim()) {
           uiState.showThinking("Processing speech...");
@@ -251,15 +251,28 @@ export class STTService {
   }
 
   displayPartialTranscription(text) {
+    console.log(`⚡ [STT] Displaying partial transcription: "${text}"`);
     const realtimeElement = document.getElementById("realtimeText");
     if (realtimeElement) {
       realtimeElement.textContent = text;
+    } else {
+      console.error(
+        "❌ [STT] Could not find 'realtimeText' element to display transcription."
+      );
     }
   }
 
   displayFinalTranscription(text) {
+    console.log(`📝 [STT] Displaying final transcription: "${text}"`);
     const finalElement = document.getElementById("finalText");
     const realtimeElement = document.getElementById("realtimeText");
+
+    if (!finalElement) {
+      console.error(
+        "❌ [STT] Could not find 'finalText' element to display transcription."
+      );
+      return;
+    }
 
     if (finalElement && text.trim()) {
       // Add to final text with timestamp
@@ -471,6 +484,10 @@ export class STTService {
         this.messageRouter.sendMessage({
           type: "stt-command",
           command: "start",
+          context: {
+            // Provide context for the backend pipeline
+            transcript: document.getElementById("finalText")?.innerText || "",
+          },
         });
       } else {
         console.warn(
@@ -523,12 +540,7 @@ export class STTService {
           }
         }
 
-        // Log audio processing status periodically
-        if (audioChunkCount % 100 === 0) {
-          console.log(
-            `🎤 [STT] Processed ${audioChunkCount} audio chunks (${totalAudioBytes} bytes)`
-          );
-        }
+        // Log audio processing status periodically - REMOVED as it's too noisy
       };
 
       // Update status

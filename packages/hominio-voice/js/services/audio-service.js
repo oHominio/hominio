@@ -42,6 +42,7 @@ export class AudioService {
    */
   async initializeAudioWorklet() {
     if (this.isAudioInitialized) {
+      console.log("🎵 [Audio] AudioWorklet already initialized.");
       return true;
     }
 
@@ -80,6 +81,9 @@ export class AudioService {
       // Create AudioContext
       this.audioContext = new (window.AudioContext ||
         window.webkitAudioContext)();
+      console.log(
+        `🎵 [Audio] AudioContext created. State: ${this.audioContext.state}`
+      );
 
       // Check if AudioWorklet is available
       if (!this.audioContext.audioWorklet) {
@@ -89,29 +93,16 @@ export class AudioService {
       // Resume context if needed (required for some browsers)
       if (this.audioContext.state === "suspended") {
         await this.audioContext.resume();
+        console.log(
+          `🎵 [Audio] AudioContext resumed. New state: ${this.audioContext.state}`
+        );
       }
 
       // Add TTS processor to AudioWorklet
       await this.addTTSProcessor();
 
-      // Create the worklet node (timing fix: ensure processor is loaded first)
-      try {
-        this.ttsWorkletNode = new AudioWorkletNode(
-          this.audioContext,
-          "tts-playback-processor"
-        );
-      } catch (nodeError) {
-        console.warn(
-          "❌ [Audio] First attempt to create worklet node failed, retrying...",
-          nodeError
-        );
-        // Wait a bit more and retry
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        this.ttsWorkletNode = new AudioWorkletNode(
-          this.audioContext,
-          "tts-playback-processor"
-        );
-      }
+      // Create the worklet node with retry logic
+      await this.createWorkletNode();
 
       // Set up message handling from worklet
       this.ttsWorkletNode.port.onmessage = (event) => {
@@ -139,6 +130,40 @@ export class AudioService {
       return false;
     } finally {
       this.isInitializing = false;
+    }
+  }
+
+  /**
+   * Create worklet node with improved retry logic
+   */
+  async createWorkletNode() {
+    const maxRetries = 3;
+    let retryCount = 0;
+
+    while (retryCount < maxRetries) {
+      try {
+        this.ttsWorkletNode = new AudioWorkletNode(
+          this.audioContext,
+          "tts-playback-processor"
+        );
+        console.log("✅ [Audio] AudioWorklet node created successfully");
+        return;
+      } catch (nodeError) {
+        retryCount++;
+        console.warn(
+          `⚠️ [Audio] Attempt ${retryCount}/${maxRetries} to create worklet node failed:`,
+          nodeError
+        );
+
+        if (retryCount < maxRetries) {
+          // Wait progressively longer between retries
+          await new Promise((resolve) => setTimeout(resolve, retryCount * 200));
+        } else {
+          throw new Error(
+            `Failed to create AudioWorklet node after ${maxRetries} attempts: ${nodeError.message}`
+          );
+        }
+      }
     }
   }
 
@@ -237,15 +262,17 @@ registerProcessor('tts-playback-processor', TTSPlaybackProcessor);
         type: "application/javascript",
       });
       const processorUrl = URL.createObjectURL(blob);
+      console.log("🎵 [Audio] Created TTS processor blob URL:", processorUrl);
 
       // Add module to AudioWorklet
       await this.audioContext.audioWorklet.addModule(processorUrl);
 
       // Clean up blob URL immediately after loading
       URL.revokeObjectURL(processorUrl);
+      console.log("🎵 [Audio] Revoked TTS processor blob URL.");
 
       // Small delay to ensure processor is fully registered
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await new Promise((resolve) => setTimeout(resolve, 100));
 
       console.log("✅ [Audio] TTS processor registered successfully");
     } catch (error) {
@@ -260,7 +287,7 @@ registerProcessor('tts-playback-processor', TTSPlaybackProcessor);
   clearAudio() {
     if (this.ttsWorkletNode) {
       this.ttsWorkletNode.port.postMessage({ type: "clear" });
-      console.log("🎵 [Audio] Audio buffer cleared");
+      console.log("🎵 [Audio] Audio buffer cleared via postMessage.");
     }
   }
 

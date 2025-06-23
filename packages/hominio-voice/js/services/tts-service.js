@@ -1,6 +1,6 @@
 /**
- * TTS Service
- * Handles text-to-speech synthesis and audio playback using reference implementation
+ * TTS Service (Simplified Reference Implementation)
+ * Handles text-to-speech synthesis and audio playback exactly like RealtimeVoiceChat
  */
 import { uiState } from "../core/ui-state.js";
 import { audioService } from "./audio-service.js";
@@ -41,9 +41,20 @@ export class TTSService {
   }
 
   /**
-   * Handle tts_chunk messages (reference implementation)
+   * Handle tts_chunk messages (exact reference implementation)
    */
   handleTtsChunk(base64Content) {
+    if (!this.isInitialized) {
+      console.warn(
+        "🔊 [TTS] Received chunk but service not initialized. Initializing now..."
+      );
+      this.initialize().then(() => this.processTtsChunk(base64Content));
+      return;
+    }
+    this.processTtsChunk(base64Content);
+  }
+
+  processTtsChunk(base64Content) {
     try {
       // Validate input
       if (!base64Content || typeof base64Content !== "string") {
@@ -55,43 +66,69 @@ export class TTSService {
         return;
       }
 
-      // Log chunk info for debugging
-      console.log(
-        `🔊 [TTS] Processing chunk: length=${base64Content.length}, first10=${base64Content.substring(0, 10)}`
-      );
+      // Log chunk info for debugging - REMOVED as too noisy
+      // console.log(`🔊 [TTS] Processing chunk: length=${base64Content.length}`);
 
-      // Convert base64 to Int16Array (reference format)
-      const binaryString = atob(base64Content);
-      const bytes = new Uint8Array(binaryString.length);
-      for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
+      // Convert base64 to Int16Array (exact reference implementation)
+      const int16Data = this.base64ToInt16Array(base64Content);
+
+      if (!int16Data || int16Data.length === 0) {
+        // console.warn("🔊 [TTS] Empty or invalid audio data after conversion"); // Also too noisy
+        return;
       }
-      const int16Array = new Int16Array(bytes.buffer);
 
-      console.log(
-        `🔊 [TTS] Converted to Int16Array: length=${int16Array.length}`
-      );
+      // console.log(
+      //   `🔊 [TTS] Converted to Int16Array: length=${int16Data.length}`
+      // );
 
       // Send directly to AudioWorklet (reference-style)
       if (audioService.ttsWorkletNode) {
-        audioService.ttsWorkletNode.port.postMessage(int16Array);
-        console.log(
-          `🔊 [TTS] Sent ${int16Array.length} samples to AudioWorklet`
-        );
+        audioService.ttsWorkletNode.port.postMessage(int16Data);
+        // console.log(
+        //   `🔊 [TTS] Sent ${int16Data.length} samples to AudioWorklet`
+        // );
       } else {
         console.log("🔊 [TTS] AudioWorklet not ready, initializing...");
         // Initialize AudioWorklet if not ready
         audioService.initializeAudioWorklet().then(() => {
           if (audioService.ttsWorkletNode) {
-            audioService.ttsWorkletNode.port.postMessage(int16Array);
-            console.log(
-              `🔊 [TTS] Sent ${int16Array.length} samples to AudioWorklet (after init)`
-            );
+            audioService.ttsWorkletNode.port.postMessage(int16Data);
+            // console.log(
+            //   `🔊 [TTS] Sent ${int16Data.length} samples to AudioWorklet (after init)`
+            // );
           }
         });
       }
     } catch (error) {
       console.error("❌ [TTS] Error processing tts_chunk:", error);
+    }
+  }
+
+  /**
+   * Convert base64 to Int16Array (exact reference implementation)
+   */
+  base64ToInt16Array(base64String) {
+    try {
+      if (!base64String) {
+        console.warn("🔊 [TTS] base64ToInt16Array received empty string.");
+        return new Int16Array(0);
+      }
+      // Decode base64 to binary string
+      const binaryString = atob(base64String);
+
+      // Create Uint8Array from binary string
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+
+      // Convert to Int16Array (PCM audio data)
+      const int16Array = new Int16Array(bytes.buffer);
+
+      return int16Array;
+    } catch (error) {
+      console.error("❌ [TTS] Error converting base64 to Int16Array:", error);
+      return null;
     }
   }
 

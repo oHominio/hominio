@@ -1,7 +1,8 @@
 """
-Text-to-Speech Service (Reference-style implementation)
-Handles Kokoro TTS engine with PCM processing and base64 encoding like RealtimeVoiceChat
+Text-to-Speech Service (Simplified Reference Implementation)
+Handles ONLY Kokoro TTS engine with PCM processing and base64 encoding
 Routes all communication through message router as single source of truth
+NO pipeline logic - only audio synthesis and streaming
 """
 import logging
 import base64
@@ -9,7 +10,7 @@ import numpy as np
 import threading
 import asyncio
 from datetime import datetime
-from typing import AsyncGenerator, Optional, Callable
+from typing import Optional, Callable
 from scipy.signal import resample_poly
 from RealtimeTTS import TextToAudioStream, KokoroEngine
 from core.config import Config
@@ -65,6 +66,10 @@ class UpsampleOverlap:
         return None
 
 class TTSService:
+    """
+    Simplified TTS Service - ONLY handles audio synthesis and streaming
+    NO pipeline logic, NO complex generators, NO coordination logic
+    """
     def __init__(self):
         self.kokoro_engine = None
         self.status = {
@@ -73,11 +78,8 @@ class TTSService:
             "message": "Starting TTS engine...",
             "last_updated": datetime.now().isoformat()
         }
-        # Streaming state
-        self.current_synthesis_task = None
+        # Simple synthesis state
         self.is_synthesizing = False
-        # Upsampling processor (reference implementation)
-        self.upsampler = UpsampleOverlap()
         
         # Message router reference (set by message router during initialization)
         self.message_router = None
@@ -100,8 +102,9 @@ class TTSService:
             Base64 encoded upsampled PCM data (48kHz) for frontend AudioWorklet
         """
         try:
-            # Use reference implementation upsampling (24kHz → 48kHz)
-            base64_chunk = self.upsampler.get_base64_chunk(audio_data)
+            # Create new upsampler for each synthesis to prevent artifacts
+            upsampler = UpsampleOverlap()
+            base64_chunk = upsampler.get_base64_chunk(audio_data)
             return base64_chunk
             
         except Exception as e:
@@ -119,7 +122,6 @@ class TTSService:
             })
             
             # Initialize KokoroEngine with voice from config
-            # No audio device initialization needed for headless operation
             self.kokoro_engine = KokoroEngine(voice=Config.TTS_VOICE)
             
             self.status.update({
@@ -170,71 +172,90 @@ class TTSService:
 
     async def synthesize_text_streaming(self, text: str, websocket=None):
         """
-        Synthesize text to audio and stream as base64 PCM chunks (reference-style)
-        Routes all communication through message router
+        SIMPLE text to audio synthesis with immediate streaming (reference-style)
+        NO complex pipeline logic - just synthesize and stream
         
         Args:
             text: Text to synthesize
-            websocket: WebSocket connection (for backward compatibility, but routed through message router)
+            websocket: WebSocket connection (for backward compatibility)
         """
         if not self.kokoro_engine:
             raise RuntimeError("TTS engine not initialized")
             
-        logger.info(f"🔊 [TTS] Starting reference-style synthesis: '{text[:50]}...'")
+        logger.info(f"🔊 [TTS] Starting simple synthesis: '{text[:50]}...'")
         
-        # Reset upsampler state for new synthesis (prevent artifacts)
-        self.upsampler = UpsampleOverlap()
+        # Create upsampler for this synthesis
+        upsampler = UpsampleOverlap()
         
         # Create a new stream for this synthesis (headless mode)
         tts_stream = TextToAudioStream(self.kokoro_engine, muted=Config.TTS_MUTED)
 
-        # Store audio chunks to process them
-        audio_chunks = []
+        # Streaming chunk counter
+        chunk_count = 0
         
-        def on_audio_chunk(chunk):
-            """Collect audio chunks during synthesis"""
-            audio_chunks.append(chunk)
+        async def on_audio_chunk(chunk):
+            """Stream audio chunks immediately as they're generated (reference pattern)"""
+            nonlocal chunk_count
+            
+            if not self.websocket_send_callback:
+                logger.warning(f"🔊 [TTS] No WebSocket callback available - chunk {chunk_count} not sent")
+                return
+                
+            # Process chunk immediately (reference-style)
+            base64_chunk = upsampler.get_base64_chunk(chunk)
+            if base64_chunk and len(base64_chunk) > 0:
+                try:
+                    # Validate base64 encoding before sending
+                    base64.b64decode(base64_chunk)
+                    chunk_count += 1
+                    
+                    # Stream immediately through message router (reference pattern)
+                    await self.websocket_send_callback({
+                        "type": "tts_chunk",
+                        "content": base64_chunk
+                    })
+                    
+                    logger.debug(f"🔊 [TTS] Streamed chunk {chunk_count} immediately")
+                    
+                except Exception as e:
+                    logger.error(f"❌ [TTS] Invalid base64 chunk {chunk_count} detected, skipping: {e}")
 
-        # Feed the text to TTS and synthesize in a thread
+        # Create async-compatible synthesis function
         def synthesize_sync():
+            """Synchronous synthesis that calls async chunk handler"""
+            def sync_chunk_handler(chunk):
+                """Synchronous wrapper for async chunk handler"""
+                # Create new event loop for this thread if needed
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                
+                # Run the async handler
+                loop.run_until_complete(on_audio_chunk(chunk))
+            
             tts_stream.feed(text)
             tts_stream.play(
                 muted=Config.TTS_MUTED,
-                on_audio_chunk=on_audio_chunk
+                on_audio_chunk=sync_chunk_handler  # Stream chunks immediately
             )
         
-        # Run synthesis in a separate thread
+        # Run synthesis in a separate thread (reference pattern)
         synthesis_thread = threading.Thread(target=synthesize_sync, daemon=True)
         synthesis_thread.start()
-        synthesis_thread.join()
+        logger.debug(f"🔊 [TTS] Synthesis thread started for: '{text[:30]}...'")
+        synthesis_thread.join()  # Wait for synthesis to complete
+        logger.debug(f"🔊 [TTS] Synthesis thread finished for: '{text[:30]}...'")
         
-        # Process and send all audio chunks as base64 PCM through message router
+        # Send final upsampled chunk (reference-style flush)
         if self.websocket_send_callback:
-            valid_chunks = 0
-            for chunk in audio_chunks:
-                base64_chunk = self.process_audio_chunk(chunk)
-                if base64_chunk and len(base64_chunk) > 0:  # Only send non-empty chunks
-                    # Validate base64 encoding before sending
-                    try:
-                        # Test decode to ensure it's valid base64
-                        base64.b64decode(base64_chunk)
-                        valid_chunks += 1
-                        
-                        # Route through message router (single source of truth)
-                        await self.websocket_send_callback({
-                            "type": "tts_chunk",
-                            "content": base64_chunk
-                        })
-                    except Exception as e:
-                        logger.error(f"❌ [TTS] Invalid base64 chunk detected, skipping: {e}")
-                        
-            # Send final upsampled chunk (reference-style flush)
-            final_chunk = self.upsampler.flush_base64_chunk()
+            final_chunk = upsampler.flush_base64_chunk()
             if final_chunk and len(final_chunk) > 0:
                 try:
                     # Test decode to ensure it's valid base64
                     base64.b64decode(final_chunk)
-                    valid_chunks += 1
+                    chunk_count += 1
                     
                     # Route through message router (single source of truth)
                     await self.websocket_send_callback({
@@ -245,10 +266,9 @@ class TTSService:
                 except Exception as e:
                     logger.error(f"❌ [TTS] Invalid final base64 chunk detected, skipping: {e}")
                     
-            logger.info(f"🔊 [TTS] Reference-style synthesis completed, sent {valid_chunks} valid PCM chunks")
+            logger.info(f"🔊 [TTS] Simple synthesis completed, sent {chunk_count} chunks immediately")
         else:
-            # No WebSocket callback available - log warning
-            logger.warning(f"🔊 [TTS] No WebSocket callback available - {len(audio_chunks)} audio chunks not sent")
+            logger.warning(f"🔊 [TTS] No WebSocket callback available - synthesis completed but chunks not sent")
 
     async def synthesize_text(self, text: str, websocket=None, end_marker: str = "END"):
         """
@@ -273,6 +293,7 @@ class TTSService:
         status["is_synthesizing"] = self.is_synthesizing
         status["message_router_connected"] = self.message_router is not None
         status["routing_method"] = "message_router" if self.websocket_send_callback else "direct_websocket"
+        status["responsibility"] = "audio_synthesis_only"
         return status
     
     def is_ready(self):

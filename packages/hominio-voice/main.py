@@ -31,6 +31,7 @@ from services.stt_service import STTService
 from services.tts_service import TTSService
 from services.llm_service import LLMService
 from services.message_router import MessageRouter
+from services.speech_pipeline import SpeechPipeline
 
 # CRITICAL: Setup environment FIRST before any other imports
 try:
@@ -59,9 +60,19 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging with detailed output
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
+
+# Enable debug logging for our services to see pipeline activity
+logging.getLogger('services.speech_pipeline').setLevel(logging.INFO)
+logging.getLogger('services.message_router').setLevel(logging.INFO)
+logging.getLogger('services.tts_service').setLevel(logging.INFO)
+logging.getLogger('services.llm_service').setLevel(logging.INFO)
+logging.getLogger('services.stt_service').setLevel(logging.INFO)
 
 # CUDA validation is now handled by setup_environment() - no need to repeat
 logger.info("✅ CUDA validation completed during environment setup")
@@ -71,6 +82,7 @@ stt_service = STTService()
 tts_service = TTSService()
 llm_service = LLMService()
 message_router = MessageRouter()
+speech_pipeline = SpeechPipeline()  # The orchestrator
 
 # Legacy global variables for backward compatibility
 kokoro_engine = None
@@ -140,17 +152,21 @@ async def initialize_stt_engine():
         except RuntimeError:
             loop = asyncio.get_event_loop()
 
-        # Initialize message router with all services
-        message_router.initialize(
-            stt_service=stt_service,
-            tts_service=tts_service,
-            llm_service=llm_service,
-            websocket_queue=stt_message_queue,
-            event_loop=loop
-        )
-        
-        # Initialize STT service
+        # Initialize services with complex pipeline architecture
         await stt_service.initialize_stt_engine()
+        await tts_service.initialize_kokoro_engine()
+        await llm_service.initialize_llm_client()
+        
+        # Set up complex pipeline architecture coordination
+        # 1. Speech pipeline coordinates all services (complex orchestrator with threading)
+        speech_pipeline.set_services(stt_service, tts_service, llm_service)
+        speech_pipeline.set_message_router(message_router)
+        
+        # 2. Message router handles all communication (pure communication hub)
+        message_router.initialize_services(stt_service, tts_service, llm_service, speech_pipeline)
+        message_router.set_websocket_queue(stt_message_queue, loop)
+        
+        logger.info("✅ Complex pipeline architecture initialized - Speech pipeline orchestrates with threading, Message router communicates")
         
         # Start transcription worker thread
         def transcription_worker():
@@ -162,11 +178,17 @@ async def initialize_stt_engine():
                     # Get text from STT engine
                     text = stt_service.stt_engine.text()
                     if text and text.strip():
-                        # Let the message router handle full sentence processing
+                        print(f"🎤 STT detected text: '{text}'")
+                        # FIXED: Use STT service callback system to trigger speech pipeline
                         asyncio.run_coroutine_threadsafe(
-                            message_router._handle_full_sentence(text),
+                            stt_service.process_full_sentence(text),
                             loop
                         )
+                    else:
+                        # Log periodically to show the worker is alive
+                        import time
+                        if int(time.time()) % 30 == 0:  # Every 30 seconds
+                            print("🔄 STT transcription worker is running...")
                 except Exception as e:
                     print(f"❌ STT transcription error: {e}")
                     time.sleep(0.1)
@@ -383,7 +405,7 @@ async def unified_websocket_endpoint(websocket: WebSocket):
                             # Feed audio to STT engine
                             if stt_service.is_ready():
                                 stt_service.stt_engine.feed_audio(chunk)
-                                logger.debug(f"Fed audio chunk: {len(chunk)} bytes")
+                                print(f"🎵 Fed audio chunk: {len(chunk)} bytes, sample_rate: {sample_rate}")
                             else:
                                 logger.warning("STT engine not available")
                                 
@@ -397,12 +419,15 @@ async def unified_websocket_endpoint(websocket: WebSocket):
                             data = json.loads(message["text"])
                             message_type = data.get("type", "unknown")
                             
-                            # Route message through the message router
-                            await message_router.route_websocket_message(message_type, data, websocket)
-                                
+                            logger.info(f"📥 WebSocket message received: {message_type} - {data}")
+                            
+                            # Route all messages through the message router (clean architecture)
+                            await message_router.handle_websocket_message(data)
+                            
                         except json.JSONDecodeError:
-                            logger.warning("Invalid JSON in WebSocket text message")
-                            continue
+                            logger.error(f"❌ Invalid JSON received: {message}")
+                        except Exception as e:
+                            logger.error(f"❌ Error handling message: {e}")
                 
             except Exception as e:
                 logger.error(f"Error in WebSocket message processing: {e}")

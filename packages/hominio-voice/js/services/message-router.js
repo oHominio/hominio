@@ -39,6 +39,7 @@ export class MessageRouter {
   async connectToUnifiedEndpoint() {
     try {
       console.log("🔗 [Router] Connecting to unified WebSocket endpoint...");
+      uiState.updateConnectionStatus("Connecting...", false);
 
       // Create the master WebSocket connection
       const connection = wsManager.createConnection("unified", "/ws", {
@@ -57,7 +58,7 @@ export class MessageRouter {
         onClose: () => {
           console.log("🔗 [Router] Master WebSocket connection closed");
           this.isConnected = false;
-          uiState.updateConnectionStatus("Disconnected");
+          uiState.updateConnectionStatus("Disconnected", false);
 
           // Notify services of disconnection
           if (this.sttService) {
@@ -68,7 +69,7 @@ export class MessageRouter {
         onError: (error) => {
           console.error("🔗 [Router] Master WebSocket error:", error);
           this.isConnected = false;
-          uiState.updateConnectionStatus("Error");
+          uiState.updateConnectionStatus("Error", false);
 
           // Notify services of error
           if (this.sttService) {
@@ -79,7 +80,10 @@ export class MessageRouter {
         autoReconnect: true,
       });
 
-      console.log("✅ [Router] Master WebSocket connection created");
+      console.log(
+        "✅ [Router] Master WebSocket connection created. Current state:",
+        wsManager.getConnectionStatus("unified")
+      );
       return true;
     } catch (error) {
       console.error(
@@ -125,7 +129,7 @@ export class MessageRouter {
     }
 
     const { type, ...data } = message;
-    console.log("🔗 [Router] Routing message:", type);
+    // console.log("🔗 [Router] Routing message:", type, data); // Too noisy
 
     // Route message to appropriate service
     switch (type) {
@@ -147,6 +151,7 @@ export class MessageRouter {
 
       case "tts_chunk":
         if (this.ttsService) {
+          // this.ttsService.handleTtsChunk(message.content); // Logging is inside the handler
           this.ttsService.handleTtsChunk(message.content);
         }
         return true;
@@ -217,7 +222,7 @@ export class MessageRouter {
       const connection = wsManager.connections.get("unified");
       if (connection && connection.websocket) {
         connection.websocket.send(data);
-        console.log("📤 [Router] Sent binary data");
+        // console.log("📤 [Router] Sent binary data"); // Too noisy
         return true;
       }
       return false;
