@@ -19,6 +19,7 @@ export class DOMElements {
       // STT elements
       "recordButton",
       "clearTranscriptButton",
+      "clearConversationButton",
       "transcriptContent",
       "realtimeText",
       "finalText",
@@ -83,6 +84,9 @@ export class DOMElements {
   }
   get clearTranscriptButton() {
     return this.get("clearTranscriptButton");
+  }
+  get clearConversationButton() {
+    return this.get("clearConversationButton");
   }
 
   // Static methods for external services

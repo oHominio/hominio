@@ -23,7 +23,7 @@
       }
 
       .header {
-        padding: 2rem;
+        padding: 1rem;
         text-align: center;
         background: rgba(255, 255, 255, 0.7);
         backdrop-filter: blur(10px);
@@ -34,15 +34,15 @@
         display: flex;
         align-items: center;
         justify-content: center;
-        gap: 1rem;
-        margin-bottom: 1rem;
+        gap: 0.5rem;
+        margin-bottom: 0.5rem;
       }
 
       .logo-icon {
-        width: 60px;
-        height: 60px;
+        width: 40px;
+        height: 40px;
         background: #1e3a5f;
-        border-radius: 16px;
+        border-radius: 12px;
         display: flex;
         align-items: center;
         justify-content: center;
@@ -51,26 +51,26 @@
 
       .logo-icon::before {
         content: "";
-        width: 20px;
-        height: 20px;
+        width: 14px;
+        height: 14px;
         background: #f5f1e8;
         border-radius: 50%;
         position: absolute;
-        top: 12px;
+        top: 8px;
       }
 
       .logo-icon::after {
         content: "";
-        width: 30px;
-        height: 20px;
+        width: 20px;
+        height: 14px;
         background: #f5f1e8;
-        border-radius: 15px 15px 0 0;
+        border-radius: 10px 10px 0 0;
         position: absolute;
-        bottom: 8px;
+        bottom: 6px;
       }
 
       .logo h1 {
-        font-size: 2.5rem;
+        font-size: 1.8rem;
         font-weight: 700;
         color: #1e3a5f;
         letter-spacing: -0.02em;
@@ -78,8 +78,8 @@
 
       .subtitle {
         color: #6b7280;
-        font-size: 1.1rem;
-        margin-top: 0.5rem;
+        font-size: 0.9rem;
+        margin-top: 0.25rem;
       }
 
       .main-container {
@@ -514,11 +514,15 @@
 
       @media (max-width: 768px) {
         .header {
-          padding: 1rem;
+          padding: 0.75rem;
         }
 
         .logo h1 {
-          font-size: 2rem;
+          font-size: 1.5rem;
+        }
+
+        .subtitle {
+          font-size: 0.8rem;
         }
 
         .main-container {
@@ -543,6 +547,7 @@
         .btn {
           width: 100%;
           justify-content: center;
+          margin-bottom: 0.5rem;
         }
 
         .connection-status {
@@ -597,7 +602,13 @@
             id="clearTranscriptButton"
             class="btn btn-secondary"
             style="margin-left: 1rem">
-            🗑️ Clear
+            🗑️ Clear Transcript
+          </button>
+          <button
+            id="clearConversationButton"
+            class="btn btn-secondary"
+            style="margin-left: 1rem">
+            🧹 Clear Conversation
           </button>
           <div class="status-text" id="sttStatusText">Ready to listen</div>
         </div>

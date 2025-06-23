@@ -87,28 +87,28 @@ class Config:
     TTS_VOICE = "af_heart"
     TTS_MUTED = True  # Always muted for headless operation
     
-    # STT Configuration - MATCHED TO MAIN.PY HARDCODED VALUES
-    STT_MODEL = "tiny"  # Matches main.py hardcoded value
+    # STT Configuration - MATCHED TO REFERENCE IMPLEMENTATION (RealtimeVoiceChat)
+    STT_MODEL = "base.en"  # Changed from "tiny" to match reference implementation
     STT_LANGUAGE = "en"
     STT_REALTIME_ENABLED = True
-    STT_REALTIME_MODEL = "tiny"  # Matches main.py hardcoded value
-    STT_REALTIME_PAUSE = 0.02  # Matches main.py hardcoded value
+    STT_REALTIME_MODEL = "base.en"  # Changed from "tiny" to match reference implementation
+    STT_REALTIME_PAUSE = 0.2  # RealtimeSTT README default (was 0.02)
     
-    # VAD Configuration - MATCHED TO MAIN.PY HARDCODED VALUES
-    STT_SILERO_SENSITIVITY = 0.05  # Matches main.py hardcoded value
+    # VAD Configuration - MATCHED TO REFERENCE IMPLEMENTATION BEST PRACTICES
+    STT_SILERO_SENSITIVITY = 0.6  # RealtimeSTT README default (was 0.05)
     STT_WEBRTC_SENSITIVITY = 3     # Matches main.py hardcoded value
-    STT_POST_SPEECH_SILENCE = 0.7
-    STT_MIN_RECORDING_LENGTH = 1.1  # Matches main.py hardcoded value
-    STT_MIN_GAP_BETWEEN_RECORDINGS = 0  # Matches main.py hardcoded value
-    STT_EARLY_TRANSCRIPTION_SILENCE = 0.2  # Matches main.py hardcoded value
+    STT_POST_SPEECH_SILENCE = 0.2  # RealtimeSTT README default (was 0.7)
+    STT_MIN_RECORDING_LENGTH = 1.0  # RealtimeSTT README default (was 1.1)
+    STT_MIN_GAP_BETWEEN_RECORDINGS = 1.0  # RealtimeSTT README default (was 0)
+    STT_EARLY_TRANSCRIPTION_SILENCE = 0  # RealtimeSTT README default (was 0.2)
     
     # Dynamic VAD settings for different conversation phases
     STT_MID_SENTENCE_PAUSE = 0.3      # Shorter pause for mid-sentence detection
     STT_END_SENTENCE_PAUSE = 0.7      # Standard pause for sentence endings
     STT_UNKNOWN_SENTENCE_PAUSE = 1.0  # Longer pause for unclear speech patterns
     
-    STT_BEAM_SIZE = 1  # Matches main.py hardcoded value
-    STT_BEAM_SIZE_REALTIME = 1  # Matches main.py hardcoded value
+    STT_BEAM_SIZE = 5  # RealtimeSTT README default (was 1)
+    STT_BEAM_SIZE_REALTIME = 3  # RealtimeSTT README default (was 1)
     STT_DEVICE = 'cuda'  # Force GPU usage - NO CPU FALLBACK
     STT_COMPUTE_TYPE = 'int8'
     

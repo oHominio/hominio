@@ -33,17 +33,48 @@ export class STTService {
   }
 
   clearTranscript() {
-    const finalElement = document.getElementById("finalText");
-    const realtimeElement = document.getElementById("realtimeText");
+    console.log("🗑️ Clearing transcript display");
 
-    if (finalElement) {
-      finalElement.innerHTML = "";
-    }
+    const realtimeElement = document.getElementById("realtimeText");
+    const finalElement = document.getElementById("finalText");
+
     if (realtimeElement) {
       realtimeElement.textContent = "";
     }
 
+    if (finalElement) {
+      finalElement.innerHTML = "";
+    }
+
     this.updateStatus("Transcript cleared");
+  }
+
+  async clearConversation() {
+    console.log("🧹 Clearing conversation history");
+
+    try {
+      const response = await fetch("/clear-conversation", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+
+      if (response.ok) {
+        const result = await response.json();
+        console.log("✅ Conversation cleared:", result.message);
+        this.updateStatus("Conversation history cleared");
+
+        // Also clear the transcript display
+        this.clearTranscript();
+      } else {
+        console.error("❌ Failed to clear conversation:", response.statusText);
+        this.updateStatus("Failed to clear conversation");
+      }
+    } catch (error) {
+      console.error("❌ Error clearing conversation:", error);
+      this.updateStatus("Error clearing conversation");
+    }
   }
 
   setupEventListeners() {
@@ -63,6 +94,17 @@ export class STTService {
       clearButton.addEventListener("click", (e) => {
         e.preventDefault();
         this.clearTranscript();
+      });
+    }
+
+    // Clear conversation button event listener
+    const clearConversationButton = document.getElementById(
+      "clearConversationButton"
+    );
+    if (clearConversationButton) {
+      clearConversationButton.addEventListener("click", (e) => {
+        e.preventDefault();
+        this.clearConversation();
       });
     }
   }

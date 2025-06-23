@@ -112,6 +112,10 @@ stt_ready_event = asyncio.Event()
 # Global variable to hold the active TTS WebSocket connection
 active_tts_ws: WebSocket = None
 
+# Global conversation history
+conversation_history = []
+processed_sentences = set()  # Track processed sentences to avoid duplicates
+
 def create_wave_header_for_engine(engine):
     """Create WAV header for the given engine"""
     _, channels, sample_rate = engine.get_stream_info()
@@ -195,14 +199,17 @@ async def initialize_kokoro_engine():
 
 async def initialize_stt_engine():
     """Initialize RealtimeSTT engine with proper callback architecture"""
-    global stt_engine, stt_status, stt_message_queue
+    global stt_engine, stt_status, stt_message_queue, conversation_history, processed_sentences
     
     try:
         print("🎤 Initializing STT engine...")
         stt_status = "initializing"
         
+        # Reset conversation history and processed sentences on initialization
+        conversation_history.clear()
+        processed_sentences.clear()
+        
         # Suppress ALSA errors for headless operation (KEEP CUDA ENABLED)
-# os.environ['CUDA_VISIBLE_DEVICES'] = ''  # REMOVED - We want CUDA!
         os.environ['TOKENIZERS_PARALLELISM'] = 'false'
         
         # Additional audio suppression
@@ -222,6 +229,16 @@ async def initialize_stt_engine():
         # Define callback functions at module level for proper scoping
         async def trigger_llm_and_tts(text: str):
             """Triggers the LLM and streams the response to the TTS engine."""
+            global conversation_history, processed_sentences
+            
+            # Check if we've already processed this exact sentence
+            if text in processed_sentences:
+                logger.info(f"🔄 Skipping duplicate sentence: '{text}'")
+                return
+                
+            # Add to processed sentences to avoid future duplicates
+            processed_sentences.add(text)
+            
             logger.info(f"🎤 User said: '{text}'")
             if not llm_client:
                 logger.error("LLM client not initialized. Cannot process request.")
@@ -231,17 +248,29 @@ async def initialize_stt_engine():
                 return
 
             try:
-                # Get LLM response synchronously for RealtimeTTS
+                # Add user message to conversation history
+                conversation_history.append({"role": "user", "content": text})
+                
+                # Keep conversation history manageable (last 10 exchanges = 20 messages)
+                if len(conversation_history) > 20:
+                    conversation_history = conversation_history[-20:]
+
+                # Get LLM response with conversation context
                 async def get_llm_response(user_text: str):
-                    """Get complete LLM response as a string."""
+                    """Get complete LLM response as a string with conversation context."""
                     try:
+                        # Use the full conversation history for context
                         response = await llm_client.chat.completions.create(
                             model="phala/llama-3.3-70b-instruct",
-                            messages=[{"role": "user", "content": user_text}],
+                            messages=conversation_history,  # Send full conversation context
                             stream=False  # Get complete response
                         )
                         content = response.choices[0].message.content
                         logger.info(f"🤖 LLM response: '{content}'")
+                        
+                        # Add assistant response to conversation history
+                        conversation_history.append({"role": "assistant", "content": content})
+                        
                         return content
                     except Exception as e:
                         logger.error(f"Error getting LLM response: {e}")
@@ -251,7 +280,7 @@ async def initialize_stt_engine():
                 llm_response = await get_llm_response(text)
                 
                 # Create a new stream for this synthesis (headless mode)
-                tts_stream = TextToAudioStream(kokoro_engine, muted=True)
+                tts_stream = TextToAudioStream(kokoro_engine, muted=Config.TTS_MUTED)
 
                 # Store audio chunks to send them after synthesis
                 audio_chunks = []
@@ -269,7 +298,7 @@ async def initialize_stt_engine():
                 def synthesize_sync():
                     tts_stream.feed(llm_response)
                     tts_stream.play(
-                        muted=True,  # Ensure no local audio playback
+                        muted=Config.TTS_MUTED,  # Use config value
                         on_audio_chunk=on_audio_chunk
                     )
                 
@@ -346,30 +375,30 @@ async def initialize_stt_engine():
                 except Exception as e:
                     print(f"❌ Error sending realtime transcription: {e}")
         
-        # STT configuration matching RealtimeSTT server examples
+        # STT configuration using Config class values instead of hardcoded
         stt_config = {
-            'model': 'tiny',
-            'language': 'en',
-            'use_microphone': False,
-            'spinner': False,
-            'enable_realtime_transcription': True,
-            'realtime_model_type': 'tiny',
-            'realtime_processing_pause': 0.02,
+            'model': Config.STT_MODEL,
+            'language': Config.STT_LANGUAGE,
+            'use_microphone': Config.STT_USE_MICROPHONE,
+            'spinner': Config.STT_SPINNER,
+            'enable_realtime_transcription': Config.STT_REALTIME_ENABLED,
+            'realtime_model_type': Config.STT_REALTIME_MODEL,
+            'realtime_processing_pause': Config.STT_REALTIME_PAUSE,
             'on_realtime_transcription_update': on_realtime_transcription,
-            'silero_sensitivity': 0.05,
-            'webrtc_sensitivity': 3,
-            'post_speech_silence_duration': 0.7,
-            'min_length_of_recording': 1.1,
-            'min_gap_between_recordings': 0,
-            'silero_deactivity_detection': True,
-            'early_transcription_on_silence': 0.2,
-            'beam_size': 1,
-            'beam_size_realtime': 1,
-            'no_log_file': True,
-            'device': 'cuda',  # Force GPU usage - NO CPU FALLBACK
-            'compute_type': 'int8',
+            'silero_sensitivity': Config.STT_SILERO_SENSITIVITY,
+            'webrtc_sensitivity': Config.STT_WEBRTC_SENSITIVITY,
+            'post_speech_silence_duration': Config.STT_POST_SPEECH_SILENCE,
+            'min_length_of_recording': Config.STT_MIN_RECORDING_LENGTH,
+            'min_gap_between_recordings': Config.STT_MIN_GAP_BETWEEN_RECORDINGS,
+            'silero_deactivity_detection': Config.STT_SILERO_DEACTIVITY_DETECTION,
+            'early_transcription_on_silence': Config.STT_EARLY_TRANSCRIPTION_SILENCE,
+            'beam_size': Config.STT_BEAM_SIZE,
+            'beam_size_realtime': Config.STT_BEAM_SIZE_REALTIME,
+            'no_log_file': Config.STT_NO_LOG_FILE,
+            'device': Config.STT_DEVICE,
+            'compute_type': Config.STT_COMPUTE_TYPE,
             'level': logging.WARNING,
-            'initial_prompt': "Add periods only for complete sentences. Use ellipsis (...) for unfinished thoughts."
+            'initial_prompt': Config.STT_INITIAL_PROMPT
         }
         
         # Create recorder
@@ -492,13 +521,13 @@ async def api_info():
     return {
         "message": "Hominio Voice API with KokoroEngine TTS and RealtimeSTT", 
         "tts_engine": "kokoro", 
-        "stt_engine": "whisper-tiny",
+        "stt_engine": "whisper-base.en",
         "language": "English"
     }
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "tts_engine": "kokoro", "stt_engine": "whisper-tiny"}
+    return {"status": "healthy", "tts_engine": "kokoro", "stt_engine": "whisper-base.en"}
 
 @app.get("/model-status")
 async def get_model_status():
@@ -506,6 +535,25 @@ async def get_model_status():
     return {
         "tts": kokoro_status,
         "stt": stt_status
+    }
+
+@app.post("/clear-conversation")
+async def clear_conversation():
+    """Clear conversation history and processed sentences"""
+    global conversation_history, processed_sentences
+    conversation_history.clear()
+    processed_sentences.clear()
+    logger.info("🧹 Conversation history and processed sentences cleared")
+    return {"status": "cleared", "message": "Conversation history has been reset"}
+
+@app.get("/conversation-status")
+async def get_conversation_status():
+    """Get current conversation status"""
+    global conversation_history, processed_sentences
+    return {
+        "conversation_length": len(conversation_history),
+        "processed_sentences_count": len(processed_sentences),
+        "conversation_history": conversation_history[-10:] if conversation_history else []  # Last 10 messages for preview
     }
 
 @app.websocket("/ws/stt")
