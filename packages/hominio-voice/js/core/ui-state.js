@@ -198,6 +198,52 @@ export class UIState {
   }
 
   /**
+   * Set interruption state - VAD detected and audio stopped
+   * CRITICAL: Shows immediate user feedback when VAD triggers audio interruption
+   */
+  showInterrupted(reason = "Voice detected") {
+    console.log(`🎭🛑 [UI] INTERRUPTION STATE: ${reason}`);
+
+    // Update to interrupted state with visual feedback
+    this.updateConversationState("interrupted", `Interrupted: ${reason}`);
+
+    // Set special interrupted avatar class for distinct visual feedback
+    const voiceAvatar = domElements.voiceAvatar;
+    if (voiceAvatar) {
+      voiceAvatar.className = "voice-avatar interrupted";
+    }
+
+    // Auto-transition back to listening after brief feedback
+    setTimeout(() => {
+      if (this.currentConversationState === "interrupted") {
+        this.showListening();
+        console.log(
+          "🎭🔄 [UI] Auto-transitioning from interrupted to listening"
+        );
+      }
+    }, 800); // Brief interruption feedback
+  }
+
+  /**
+   * Handle audio buffer clear notification
+   * Called when backend/frontend clears audio buffers
+   */
+  handleAudioBufferCleared(source = "unknown") {
+    console.log(`🎭🧹 [UI] Audio buffers cleared by: ${source}`);
+
+    // Show brief visual feedback
+    const currentMessage = domElements.statusText?.textContent || "";
+    this.updateStatusText(`Audio cleared (${source})`, "standby");
+
+    // Reset to appropriate state after brief feedback
+    setTimeout(() => {
+      if (this.currentConversationState === "standby") {
+        this.showListening();
+      }
+    }, 500);
+  }
+
+  /**
    * Get current states
    */
   getCurrentStates() {

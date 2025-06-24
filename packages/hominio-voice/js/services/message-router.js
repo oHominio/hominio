@@ -142,6 +142,8 @@ export class MessageRouter {
       case "vad_detect_stop":
       case "realtime":
       case "fullSentence":
+      case "intelligent_interrupt":
+      case "clear_audio_buffers":
       case "pong":
       case "error":
         if (this.sttService) {

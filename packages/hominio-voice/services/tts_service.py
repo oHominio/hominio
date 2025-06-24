@@ -81,6 +81,9 @@ class TTSService:
         # Simple synthesis state
         self.is_synthesizing = False
         
+        # Audio cache management
+        self.active_streams = []  # Track active TTS streams for interruption
+        
         # Message router reference (set by message router during initialization)
         self.message_router = None
         self.websocket_send_callback = None
@@ -91,6 +94,48 @@ class TTSService:
         self.websocket_send_callback = websocket_send_callback
         logger.info("✅ [TTS] Message router reference set - routing through master coordinator")
     
+    def clear_audio_caches(self):
+        """
+        Clear any internal TTS engine buffers and stop ongoing synthesis
+        CRITICAL: Called during VAD interruption to stop audio immediately
+        """
+        logger.info("🔊🛑 [TTS] CLEARING ALL AUDIO CACHES - interruption triggered")
+        
+        try:
+            # 1. Stop any active synthesis
+            self.is_synthesizing = False
+            
+            # 2. Clear active streams (if any are tracked) - CRITICAL FIX
+            if self.active_streams:
+                logger.info(f"🔊🧹 [TTS] Clearing {len(self.active_streams)} active streams")
+                streams_to_clear = self.active_streams.copy()  # Create copy to avoid modification during iteration
+                self.active_streams.clear()  # Clear immediately to prevent new registrations
+                
+                for stream in streams_to_clear:
+                    try:
+                        # Try to stop the stream if it has a stop method
+                        if hasattr(stream, 'stop'):
+                            logger.info(f"🔊🛑 [TTS] Calling stop() on active stream: {type(stream)}")
+                            stream.stop()
+                        elif hasattr(stream, 'close'):
+                            logger.info(f"🔊🛑 [TTS] Calling close() on active stream: {type(stream)}")
+                            stream.close()
+                    except Exception as e:
+                        logger.warning(f"🔊⚠️ [TTS] Error stopping stream {type(stream)}: {e}")
+            
+            # 3. Clear any Kokoro engine internal buffers (if available)
+            if self.kokoro_engine:
+                # Note: Kokoro engine may not have explicit clear methods
+                # But creating new streams will naturally clear old state
+                logger.info("🔊🔄 [TTS] Kokoro engine still active (will clear on next synthesis)")
+            
+            logger.info("✅ [TTS] Audio cache clearing completed")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ [TTS] Error clearing audio caches: {e}")
+            return False
+
     def process_audio_chunk(self, audio_data: bytes) -> str:
         """
         Process audio chunk with upsampling (reference-style)
@@ -189,6 +234,9 @@ class TTSService:
         
         # Create a new stream for this synthesis (headless mode)
         tts_stream = TextToAudioStream(self.kokoro_engine, muted=Config.TTS_MUTED)
+        
+        # Track this stream for interruption handling
+        self.active_streams.append(tts_stream)
 
         # Streaming chunk counter
         chunk_count = 0
@@ -247,6 +295,10 @@ class TTSService:
         logger.debug(f"🔊 [TTS] Synthesis thread started for: '{text[:30]}...'")
         synthesis_thread.join()  # Wait for synthesis to complete
         logger.debug(f"🔊 [TTS] Synthesis thread finished for: '{text[:30]}...'")
+        
+        # Remove this stream from tracking (synthesis completed)
+        if tts_stream in self.active_streams:
+            self.active_streams.remove(tts_stream)
         
         # Send final upsampled chunk (reference-style flush)
         if self.websocket_send_callback:

@@ -45,7 +45,7 @@ class RunningGeneration:
         self.quick_answer: str = ""
         self.quick_answer_provided: bool = False
         self.quick_answer_first_chunk_ready: bool = False
-        self.quick_answer_overhang: str = ""
+        self.quick_answer_overhang: str = ""  # Text after the quick answer boundary
         self.tts_quick_started: bool = False
 
         self.tts_quick_allowed_event = threading.Event()
@@ -143,7 +143,8 @@ class SpeechPipeline:
         if self.stt_service:
             self.stt_service.set_callbacks(
                 on_full_sentence=self._handle_full_sentence_from_stt,
-                on_realtime_transcription=self._handle_realtime_transcription
+                on_realtime_transcription=self._handle_realtime_transcription,
+                on_vad_interruption=self._handle_vad_interruption  # NEW: VAD interruption
             )
         
         logger.info("✅ [Pipeline] Hominio Voice services connected to complex pipeline")
@@ -186,6 +187,63 @@ class SpeechPipeline:
                 self.message_router.event_loop
             )
 
+    def _handle_vad_interruption(self, interruption_type: str):
+        """Handle VAD interruption - CRITICAL: Immediately abort TTS synthesis and clear audio caches"""
+        logger.info(f"🎤🛑 [Pipeline] VAD interruption received: {interruption_type}")
+        
+        if interruption_type == "vad_interruption_start":
+            # IMMEDIATE abort with cache clearing
+            logger.info("🎤🛑 [Pipeline] IMMEDIATE TTS abort triggered by VAD detection")
+            
+            # Clear ALL audio caches in running generation
+            if self.running_generation:
+                try:
+                    # Clear audio chunk queues
+                    while not self.running_generation.audio_chunks.empty():
+                        try:
+                            self.running_generation.audio_chunks.get_nowait()
+                        except:
+                            break
+                    
+                    # Clear final answer chunks
+                    while not self.running_generation.final_answer_chunks.empty():
+                        try:
+                            self.running_generation.final_answer_chunks.get_nowait()
+                        except:
+                            break
+                    
+                    logger.info(f"🎤🧹 [Pipeline] [Gen {self.running_generation.id}] Audio caches cleared")
+                except Exception as e:
+                    logger.error(f"❌ [Pipeline] Error clearing audio caches: {e}")
+            
+            # Trigger immediate abort
+            self.abort_generation(wait_for_completion=False, reason="VAD_interruption")
+            
+            # Clear TTS service audio caches
+            if self.tts_service and hasattr(self.tts_service, 'clear_audio_caches'):
+                try:
+                    success = self.tts_service.clear_audio_caches()
+                    if success:
+                        logger.info("🔊🧹 [Pipeline] TTS service audio caches cleared")
+                    else:
+                        logger.warning("🔊⚠️ [Pipeline] TTS service cache clearing failed")
+                except Exception as e:
+                    logger.error(f"❌ [Pipeline] Error clearing TTS caches: {e}")
+            
+            # Send frontend clear signal through message router
+            if self.message_router:
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self.message_router.send_websocket_message({
+                            'type': 'clear_audio_buffers',
+                            'reason': 'vad_interruption',
+                            'timestamp': time.time()
+                        }),
+                        self.message_router.event_loop
+                    )
+                except Exception as e:
+                    logger.error(f"❌ [Pipeline] Error sending clear audio signal: {e}")
+
     async def handle_message(self, message_data):
         """Handle messages routed from message router"""
         message_type = message_data.get("type")
@@ -195,6 +253,18 @@ class SpeechPipeline:
             if command == "stop":
                 logger.info("🗣️🛑 [Pipeline] Received 'stop' command, initiating abort.")
                 self.abort_generation(wait_for_completion=False, reason="stt-command stop")
+
+        elif message_type == "vad_detect_start":
+            # Handle basic VAD detection start through message router
+            logger.info("🎤🔍 [Pipeline] VAD detection start received through message router")
+            # Don't interrupt immediately - wait for intelligent analysis
+
+        elif message_type == "intelligent_interrupt":
+            # NEW: Handle intelligent TurnDetection-based interruption
+            reason = message_data.get("reason", "unknown")
+            confidence = message_data.get("confidence", 0.0)
+            logger.info(f"🎤🧠 [Pipeline] INTELLIGENT INTERRUPT: {reason} (confidence: {confidence:.2f}s)")
+            self._handle_vad_interruption(f"intelligent_interruption_{reason}")
 
         elif message_type == "stop-streaming":
             self.abort_generation(wait_for_completion=False, reason="stop-streaming message")
@@ -297,10 +367,10 @@ class SpeechPipeline:
                                 current_gen.quick_answer_provided = True
                                 self.llm_answer_ready_event.set() # Signal the quick TTS worker
 
-                                # If there was text after the sentence end, queue it for the final answer.
+                                # If there was text after the sentence end, store it as overhang for final TTS
                                 if overhang:
-                                    logger.info(f"🗣️🧠📬 [Pipeline] [Gen {gen_id}] Putting overhang '{overhang}' into final answer queue.")
-                                    current_gen.final_answer_chunks.put(overhang)
+                                    logger.info(f"🗣️🧠📬 [Pipeline] [Gen {gen_id}] Storing overhang '{overhang}' for final TTS.")
+                                    current_gen.quick_answer_overhang = overhang
                         else:
                             # Phase 2: Quick answer is now found, all subsequent chunks go to the final answer queue.
                             logger.info(f"🗣️🧠📬 [Pipeline] [Gen {gen_id}] Putting final chunk '{chunk}' into queue.")
@@ -462,17 +532,17 @@ class SpeechPipeline:
                 current_gen.audio_quick_finished = True
 
     def _tts_final_inference_worker(self):
-        """Worker thread that handles TTS synthesis for final answer - matches reference implementation"""
+        """Worker thread that handles TTS synthesis for final answer - STREAMING FIX"""
         logger.info("🗣️👄🚀 [Pipeline] Final TTS Worker: Starting...")
         while not self.shutdown_event.is_set():
             current_gen = self.running_generation
             time.sleep(0.01)  # Prevent tight spinning when idle
 
-            # --- Wait for prerequisites ---
+            # --- Wait for prerequisites - FIXED: Don't wait for quick TTS to finish! ---
             if not current_gen: continue  # No active generation
             if current_gen.tts_final_started: continue  # Final TTS already running for this gen
-            if not current_gen.tts_quick_started: continue  # Quick TTS hasn't even started
-            if not current_gen.audio_quick_finished: continue  # Quick TTS hasn't finished
+            if not current_gen.quick_answer_provided: continue  # Wait for quick answer to be found
+            # REMOVED: if not current_gen.audio_quick_finished: continue  # Don't wait for quick TTS to finish!
 
             gen_id = current_gen.id
 
@@ -486,49 +556,8 @@ class SpeechPipeline:
                 logger.debug(f"🗣️👄🙅 [Pipeline] [Gen {gen_id}] Generation is aborting, skipping final TTS")
                 continue
 
-            # --- Conditions met, start final TTS ---
-            logger.info(f"🗣️👄🔄 [Pipeline] [Gen {gen_id}] Final TTS Worker: Processing final TTS...")
-
-            def get_generator():
-                """Yields remaining text chunks for final TTS synthesis - reference pattern"""
-                # Yield overhang first
-                if current_gen.quick_answer_overhang:
-                    preprocessed_overhang = self.preprocess_chunk(current_gen.quick_answer_overhang)
-                    logger.debug(f"🗣️👄< [Pipeline] [Gen {gen_id}] Final TTS Gen: Yielding overhang: '{preprocessed_overhang[:50]}...'")
-                    current_gen.final_answer += preprocessed_overhang
-                    if self.on_partial_assistant_text:
-                        try:
-                            self.on_partial_assistant_text(current_gen.quick_answer + current_gen.final_answer)
-                        except Exception as cb_e:
-                            logger.warning(f"🗣️💥 [Pipeline] Callback error in on_partial_assistant_text (overhang): {cb_e}")
-                    yield preprocessed_overhang
-
-                # Yield remaining chunks from the queue (populated by LLM worker)
-                logger.debug(f"🗣️👄< [Pipeline] [Gen {gen_id}] Final TTS Gen: Yielding remaining LLM chunks...")
-                try:
-                    while not current_gen.final_answer_llm_finished.is_set() or not current_gen.final_answer_chunks.empty():
-                        # Check for stop *before* processing chunk
-                        if self.stop_tts_final_request_event.is_set():
-                            logger.info(f"🗣️👄❌ [Pipeline] [Gen {gen_id}] Final TTS Gen: Stop request detected during iteration.")
-                            current_gen.audio_final_aborted = True
-                            break
-
-                        try:
-                            chunk = current_gen.final_answer_chunks.get(timeout=0.1)
-                            preprocessed_chunk = self.preprocess_chunk(chunk)
-                            current_gen.final_answer += preprocessed_chunk
-                            if self.on_partial_assistant_text:
-                                try:
-                                    self.on_partial_assistant_text(current_gen.quick_answer + current_gen.final_answer)
-                                except Exception as cb_e:
-                                    logger.warning(f"🗣️💥 [Pipeline] Callback error in on_partial_assistant_text (final chunk): {cb_e}")
-                            yield preprocessed_chunk
-                        except Empty:
-                            continue
-                    logger.debug(f"🗣️👄< [Pipeline] [Gen {gen_id}] Final TTS Gen: Finished iterating final answer chunks.")
-                except Exception as gen_e:
-                    logger.exception(f"🗣️👄💥 [Pipeline] [Gen {gen_id}] Final TTS Gen: Error iterating final answer chunks: {gen_e}")
-                    current_gen.audio_final_aborted = True
+            # --- Conditions met, start final TTS - STREAMING MODE ---
+            logger.info(f"🗣️👄🔄 [Pipeline] [Gen {gen_id}] Final TTS Worker: Starting STREAMING final TTS...")
 
             # Set state for active generation
             self.tts_final_generation_active = True
@@ -537,28 +566,76 @@ class SpeechPipeline:
             current_gen.tts_final_finished_event.clear()
 
             try:
-                # Collect all text from the generator for the final answer
-                final_text_parts = list(get_generator())
-                remaining_text = "".join(final_text_parts)
-
-                logger.info(f"🗣️👄🔍 [Pipeline] [Gen {gen_id}] Final TTS worker collected text of length {len(remaining_text)}: '{remaining_text[:100]}...'")
-
-                if remaining_text.strip():
-                    logger.info(f"🗣️👄🎶 [Pipeline] [Gen {gen_id}] Synthesizing final answer: '{remaining_text[:50]}...'")
+                # STREAMING APPROACH: Synthesize chunks as they come in, don't wait for all text
+                logger.info(f"🗣️👄🎶 [Pipeline] [Gen {gen_id}] Starting STREAMING final TTS synthesis...")
+                
+                # Create async synthesis function that processes chunks in real-time
+                async def stream_final_synthesis():
+                    """Stream TTS synthesis as chunks become available"""
                     
-                    # Use Hominio Voice TTS service for synthesis
-                    import asyncio
-                    try:
-                        loop = asyncio.get_event_loop()
-                    except RuntimeError:
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
+                    # First, handle overhang if any
+                    if current_gen.quick_answer_overhang:
+                        preprocessed_overhang = self.preprocess_chunk(current_gen.quick_answer_overhang)
+                        logger.info(f"🗣️👄🎶 [Pipeline] [Gen {gen_id}] Synthesizing overhang: '{preprocessed_overhang[:30]}...'")
+                        current_gen.final_answer += preprocessed_overhang
+                        
+                        # Synthesize overhang immediately
+                        await self.tts_service.synthesize_text_streaming(preprocessed_overhang, None)
                     
-                    loop.run_until_complete(
-                        self.tts_service.synthesize_text_streaming(remaining_text, None)
-                    )
-                else:
-                    logger.info(f"🗣️👄🤷 [Pipeline] [Gen {gen_id}] No remaining text for final TTS")
+                    # Then, process chunks as they arrive from LLM
+                    accumulated_chunk = ""
+                    chunk_count = 0
+                    
+                    while not current_gen.final_answer_llm_finished.is_set() or not current_gen.final_answer_chunks.empty():
+                        # Check for stop request
+                        if self.stop_tts_final_request_event.is_set():
+                            logger.info(f"🗣️👄❌ [Pipeline] [Gen {gen_id}] Final TTS streaming stopped by request.")
+                            current_gen.audio_final_aborted = True
+                            break
+                        
+                        try:
+                            # Get next chunk with short timeout
+                            chunk = current_gen.final_answer_chunks.get(timeout=0.1)
+                            preprocessed_chunk = self.preprocess_chunk(chunk)
+                            accumulated_chunk += preprocessed_chunk
+                            current_gen.final_answer += preprocessed_chunk
+                            chunk_count += 1
+                            
+                            # Stream synthesis every few chunks or on sentence boundaries
+                            should_synthesize = (
+                                len(accumulated_chunk) > 50 or  # Every ~50 characters
+                                any(punct in preprocessed_chunk for punct in ['.', '!', '?', ',']) or  # Sentence boundaries
+                                current_gen.final_answer_llm_finished.is_set()  # LLM finished
+                            )
+                            
+                            if should_synthesize and accumulated_chunk.strip():
+                                logger.info(f"🗣️👄🎶 [Pipeline] [Gen {gen_id}] Streaming chunk {chunk_count}: '{accumulated_chunk[:30]}...'")
+                                await self.tts_service.synthesize_text_streaming(accumulated_chunk, None)
+                                accumulated_chunk = ""  # Reset for next batch
+                                
+                        except Empty:
+                            # No chunk available, continue waiting
+                            continue
+                        except Exception as e:
+                            logger.error(f"🗣️👄💥 [Pipeline] [Gen {gen_id}] Error in streaming synthesis: {e}")
+                            break
+                    
+                    # Synthesize any remaining accumulated text
+                    if accumulated_chunk.strip():
+                        logger.info(f"🗣️👄🎶 [Pipeline] [Gen {gen_id}] Final streaming chunk: '{accumulated_chunk[:30]}...'")
+                        await self.tts_service.synthesize_text_streaming(accumulated_chunk, None)
+                    
+                    logger.info(f"🗣️👄✅ [Pipeline] [Gen {gen_id}] Streaming final TTS completed - processed {chunk_count} chunks")
+
+                # Run streaming synthesis
+                import asyncio
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                
+                loop.run_until_complete(stream_final_synthesis())
                 
                 logger.info(f"🗣️👄✅ [Pipeline] [Gen {gen_id}] Final TTS completed")
             except Exception as e:
@@ -660,6 +737,9 @@ class SpeechPipeline:
                 # Stop LLM streaming if available
                 if self.llm_service:
                     self.llm_service.stop_streaming()
+                    # Also cancel any active generation requests
+                    if hasattr(self.llm_service, 'cancel_generation'):
+                        self.llm_service.cancel_generation()
                 
                 self.llm_generation_active = False
                 aborted_something = True

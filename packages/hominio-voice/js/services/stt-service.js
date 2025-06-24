@@ -1,6 +1,7 @@
 import { domElements } from "../core/dom-elements.js";
 import { uiState } from "../core/ui-state.js";
 import { wsManager } from "./websocket-manager.js";
+import { audioService } from "./audio-service.js";
 
 /**
  * STT (Speech-to-Text) Service
@@ -186,6 +187,21 @@ export class STTService {
       case "vad_detect_start":
         console.log("🎤 [STT] VAD: Voice activity detected");
         uiState.showVADDetected();
+
+        // NEW: IMMEDIATE audio interruption on VAD detection
+        console.log("🎤🛑 [STT] TRIGGERING IMMEDIATE AUDIO INTERRUPTION");
+        try {
+          const success = audioService.handleInterruption("vad_detection");
+          if (success) {
+            console.log("✅ [STT] Audio interruption completed successfully");
+            // Show UI feedback for interruption
+            uiState.showInterrupted("Voice detected");
+          } else {
+            console.error("❌ [STT] Audio interruption failed");
+          }
+        } catch (error) {
+          console.error("❌ [STT] Error during audio interruption:", error);
+        }
         break;
 
       case "vad_detect_stop":
@@ -229,6 +245,57 @@ export class STTService {
       case "error":
         console.error("❌ [STT] Server error:", data.message);
         this.handleError(data.message);
+        break;
+
+      case "intelligent_interrupt":
+        // NEW: Intelligent TurnDetection-based interruption
+        console.log(
+          `🎤🧠 [STT] INTELLIGENT INTERRUPT: ${data.reason} (confidence: ${data.confidence})`
+        );
+        try {
+          const success = audioService.handleInterruption(
+            `intelligent_${data.reason}`
+          );
+          if (success) {
+            console.log(
+              "✅ [STT] Intelligent interruption completed successfully"
+            );
+            // Show specific UI feedback for intelligent interruption
+            uiState.showInterrupted(`Smart: ${data.reason}`);
+          } else {
+            console.error("❌ [STT] Intelligent interruption failed");
+          }
+        } catch (error) {
+          console.error(
+            "❌ [STT] Error during intelligent interruption:",
+            error
+          );
+        }
+        break;
+
+      case "clear_audio_buffers":
+        // NEW: Backend requesting immediate audio buffer clear
+        console.log(
+          "🎤🧹 [STT] Backend requesting audio buffer clear:",
+          data.reason
+        );
+        try {
+          const success = audioService.handleInterruption(
+            data.reason || "backend_request"
+          );
+          if (success) {
+            console.log("✅ [STT] Backend-requested audio clear completed");
+            // Show UI feedback for buffer clear
+            uiState.handleAudioBufferCleared(data.reason || "backend_request");
+          } else {
+            console.error("❌ [STT] Backend-requested audio clear failed");
+          }
+        } catch (error) {
+          console.error(
+            "❌ [STT] Error during backend-requested audio clear:",
+            error
+          );
+        }
         break;
 
       default:

@@ -292,6 +292,45 @@ registerProcessor('tts-playback-processor', TTSPlaybackProcessor);
   }
 
   /**
+   * Handle interruption - CRITICAL: Clear ALL audio caches immediately
+   */
+  handleInterruption(reason = "unknown") {
+    console.log(
+      `🎵🛑 [Audio] INTERRUPTION: Clearing all audio caches (reason: ${reason})`
+    );
+
+    try {
+      // 1. Clear AudioWorklet buffers immediately
+      if (this.ttsWorkletNode) {
+        this.ttsWorkletNode.port.postMessage({ type: "clear" });
+        console.log("🎵🧹 [Audio] AudioWorklet buffers cleared");
+      }
+
+      // 2. Force stop any ongoing audio context processing
+      if (this.audioContext && this.audioContext.state === "running") {
+        // Note: We don't suspend the context as it would break future audio
+        console.log(
+          "🎵⏸️ [Audio] AudioContext still running (keeping active for future use)"
+        );
+      }
+
+      // 3. Reset internal playing state
+      this.isPlayingTTS = false;
+      console.log("🎵🔄 [Audio] Internal playing state reset");
+
+      // 4. Send completion notification
+      console.log(
+        "✅ [Audio] Interruption handling complete - all audio caches cleared"
+      );
+
+      return true;
+    } catch (error) {
+      console.error("❌ [Audio] Error during interruption handling:", error);
+      return false;
+    }
+  }
+
+  /**
    * Check if audio is currently playing
    */
   isPlaying() {

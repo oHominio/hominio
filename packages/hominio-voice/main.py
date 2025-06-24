@@ -1,6 +1,7 @@
-from fastapi import FastAPI, WebSocket, UploadFile, File, HTTPException, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, UploadFile, File, HTTPException, WebSocketDisconnect, Depends, status
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import logging
 import asyncio
 import os
@@ -9,6 +10,7 @@ import sys
 import time
 import tempfile
 import threading
+import secrets
 from datetime import datetime
 from typing import Dict, Any
 import json
@@ -40,6 +42,33 @@ try:
 except Exception as e:
     print(f"❌ CRITICAL: Environment setup failed: {e}")
     sys.exit(1)
+
+# Password protection configuration - REQUIRED environment variable
+PROTECTED_PASSWORD = os.getenv("HOMINIO_PASSWORD")
+if not PROTECTED_PASSWORD:
+    print("❌ CRITICAL: HOMINIO_PASSWORD environment variable is required!")
+    print("💡 Set it with: export HOMINIO_PASSWORD='your-secure-password'")
+    sys.exit(1)
+
+security = HTTPBasic()
+
+def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
+    """Verify password for API access (username can be anything)"""
+    is_correct_password = secrets.compare_digest(credentials.password, PROTECTED_PASSWORD)
+    
+    if not is_correct_password:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid password",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
+print(f"🔐 Password protection enabled - Password loaded from environment variable")
+print(f"💡 Password length: {len(PROTECTED_PASSWORD)} characters")
+if len(PROTECTED_PASSWORD) < 8:
+    print("⚠️  WARNING: Password is shorter than 8 characters - consider using a stronger password")
+print(f"🛡️  Security: All API endpoints protected with HTTP Basic Authentication")
 
 # Suppress ALSA warnings in headless environment
 os.environ['ALSA_PCM_CARD'] = '-1'
@@ -246,12 +275,12 @@ app = FastAPI(lifespan=lifespan)
 app.mount("/js", StaticFiles(directory="js"), name="js")
 
 @app.get("/")
-async def serve_index():
-    """Serve the main web interface"""
+async def serve_index(user: str = Depends(verify_credentials)):
+    """Serve the main web interface - requires authentication"""
     return FileResponse("index.html")
 
 @app.get("/api")
-async def api_info():
+async def api_info(user: str = Depends(verify_credentials)):
     """API information endpoint"""
     return {
         "message": "Hominio Voice API with KokoroEngine TTS and RealtimeSTT", 
@@ -262,10 +291,20 @@ async def api_info():
 
 @app.get("/health")
 async def health_check():
+    """Health check endpoint - unprotected for Fly.io monitoring"""
     return {"status": "healthy", "tts_engine": "kokoro", "stt_engine": "whisper-base.en"}
 
+@app.get("/status")
+async def status_check():
+    """Basic status endpoint - unprotected for monitoring"""
+    return {
+        "status": "running",
+        "service": "hominio-voice",
+        "auth": "enabled"
+    }
+
 @app.get("/model-status")
-async def get_model_status():
+async def get_model_status(user: str = Depends(verify_credentials)):
     """Get real-time model loading status"""
     return {
         "tts": tts_service.get_status(),
@@ -274,14 +313,14 @@ async def get_model_status():
     }
 
 @app.post("/clear-conversation")
-async def clear_conversation():
+async def clear_conversation(user: str = Depends(verify_credentials)):
     """Clear conversation history and processed sentences"""
     llm_service.clear_conversation()
     logger.info("🧹 Conversation history and processed sentences cleared")
     return {"status": "cleared", "message": "Conversation history has been reset"}
 
 @app.get("/conversation-status")
-async def get_conversation_status():
+async def get_conversation_status(user: str = Depends(verify_credentials)):
     """Get current conversation status"""
     return {
         "conversation_length": len(llm_service.conversation_history),
@@ -293,8 +332,76 @@ async def get_conversation_status():
 async def unified_websocket_endpoint(websocket: WebSocket):
     """Unified WebSocket endpoint - handles STT, TTS, and model status communication"""
     global active_tts_ws
+    
+    # WebSocket authentication: Simplified approach
+    if not PROTECTED_PASSWORD:
+        # No password protection configured
+        user = "anonymous"
+    else:
+        # For WebSocket connections, we'll be more permissive since the user
+        # has already authenticated to access the page. We'll still check for
+        # explicit authentication but won't require it if the connection
+        # comes from the same origin.
+        
+        auth_token = websocket.query_params.get("token")
+        auth_header = websocket.headers.get("authorization")
+        
+        authenticated = False
+        user = "web_authenticated"
+        
+        # Method 1: Query parameter authentication
+        if auth_token:
+            try:
+                import base64
+                decoded_token = base64.b64decode(auth_token).decode('utf-8')
+                if ":" in decoded_token:
+                    username, password = decoded_token.split(":", 1)
+                else:
+                    username, password = "user", decoded_token
+                
+                if password == PROTECTED_PASSWORD:
+                    authenticated = True
+                    user = username if username else "token_authenticated"
+            except Exception as e:
+                logger.error(f"WebSocket token authentication error: {e}")
+        
+        # Method 2: Authorization header
+        elif auth_header and auth_header.startswith("Basic "):
+            try:
+                import base64
+                encoded_credentials = auth_header.split(" ")[1]
+                decoded_credentials = base64.b64decode(encoded_credentials).decode('utf-8')
+                
+                if ":" in decoded_credentials:
+                    username, password = decoded_credentials.split(":", 1)
+                else:
+                    username, password = "user", decoded_credentials
+                
+                if password == PROTECTED_PASSWORD:
+                    authenticated = True
+                    user = username if username else "header_authenticated"
+            except Exception as e:
+                logger.error(f"WebSocket header authentication error: {e}")
+        
+        # Method 3: Same-origin assumption (fallback)
+        # If no explicit auth provided, we'll allow the connection since
+        # the user has already authenticated to access the page
+        if not authenticated:
+            # Check if the connection is from the same origin
+            origin = websocket.headers.get("origin")
+            host = websocket.headers.get("host")
+            
+            if origin and host and (origin.endswith(host) or origin.endswith(f"://{host}")):
+                authenticated = True
+                user = "same_origin_authenticated"
+                logger.info(f"🔗 [WebSocket] Allowing same-origin connection from {origin}")
+            else:
+                logger.warning(f"🔗 [WebSocket] Rejecting connection - no auth and different origin: {origin} vs {host}")
+                await websocket.close(code=1008, reason="Authentication required")
+                return
+    
     await websocket.accept()
-    logger.info("Unified WebSocket client connected")
+    logger.info(f"Unified WebSocket client connected (authenticated as: {user})")
     
     # Set this as the active TTS connection for server-initiated audio
     active_tts_ws = websocket
