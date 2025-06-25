@@ -1,32 +1,44 @@
-app = "hominio-voice"
-primary_region = "ord"
-vm.size = "a100-40gb"
+# fly.toml app configuration file for realtime-voice-test
+app = 'hominio-voice'
+primary_region = 'ord'
+vm.size = 'a100-40gb'
 
 [build]
-dockerfile = "Dockerfile"
+dockerfile = 'Dockerfile'
 
 [env]
-CUDA_VISIBLE_DEVICES = "0"
-NVIDIA_VISIBLE_DEVICES = "all"
-NVIDIA_DRIVER_CAPABILITIES = "compute,utility"
-FORCE_CUDA = "1"
-PYTHONUNBUFFERED = "1"
-PYTHONDONTWRITEBYTECODE = "1"
-OMP_NUM_THREADS = "1"
-MKL_NUM_THREADS = "1"
-TOKENIZERS_PARALLELISM = "false"
-PYTORCH_NUM_THREADS = "1"
+CUDA_VISIBLE_DEVICES = '0'
+FORCE_CUDA = '1'
+LLM_BASE_URL = 'https://api.redpill.ai/v1'
+LLM_MODEL = 'phala/llama-3.2-3b-instruct'
+LLM_PROVIDER = 'openai'
+LOG_LEVEL = 'INFO'
+MAX_AUDIO_QUEUE_SIZE = '50'
+MKL_NUM_THREADS = '1'
+NVIDIA_DRIVER_CAPABILITIES = 'compute,utility'
+NVIDIA_VISIBLE_DEVICES = 'all'
+OLLAMA_BASE_URL = ''
+OMP_NUM_THREADS = '1'
+PYTHONDONTWRITEBYTECODE = '1'
+PYTHONUNBUFFERED = '1'
+PYTORCH_NUM_THREADS = '1'
+TOKENIZERS_PARALLELISM = 'false'
+TTS_ENGINE = 'kokoro'
 
 [http_service]
-internal_port = 8080
+internal_port = 8000
 force_https = true
-auto_stop_machines = "stop"
+auto_stop_machines = 'stop'
 auto_start_machines = false
-processes = ["app"]
 
 [[http_service.checks]]
-grace_period = "10s"
-interval = "30s"
-method = "GET"
-timeout = "5s"
-path = "/health"
+interval = '30s'
+timeout = '30s'
+grace_period = '60s'
+method = 'GET'
+path = '/health'
+
+[http_service.concurrency]
+type = 'connections'
+hard_limit = 50
+soft_limit = 20
