@@ -30,6 +30,10 @@ from starlette.responses import HTMLResponse, Response, FileResponse
 # GPU Monitoring imports
 from system_monitor import SystemMonitor, SystemStatsStreamer
 
+# Session management imports
+from session_manager import SessionManager
+from session_state import SessionStatus
+
 USE_SSL = False
 TTS_START_ENGINE = "kokoro"
 TTS_ORPHEUS_MODEL = "Orpheus_3B-1BaseGGUF/mOrpheus_3B-1Base_Q4_K_M.gguf"
@@ -116,6 +120,10 @@ async def lifespan(app: FastAPI):
     """
     logger.info("🖥️▶️ Server starting up")
     
+    # Initialize session management
+    app.state.SessionManager = SessionManager()
+    await app.state.SessionManager.start_cleanup_task()
+    
     # Initialize system monitoring
     app.state.SystemMonitor = SystemMonitor()
     system_initialized = await app.state.SystemMonitor.initialize()
@@ -127,7 +135,7 @@ async def lifespan(app: FastAPI):
         app.state.SystemStatsStreamer = None
         logger.warning("🖥️⚠️ System monitoring not available")
     
-    # Initialize global components, not connection-specific state
+    # Initialize global components - these will be shared by sessions but accessed safely
     app.state.SpeechPipelineManager = SpeechPipelineManager(
         tts_engine=TTS_START_ENGINE,
         llm_provider=LLM_START_PROVIDER,
@@ -147,6 +155,11 @@ async def lifespan(app: FastAPI):
     yield
 
     logger.info("🖥️⏹️ Server shutting down")
+    
+    # Shutdown session management
+    if hasattr(app.state, 'SessionManager'):
+        await app.state.SessionManager.shutdown()
+        logger.info("🖥️🏢 Session manager shutdown")
     
     # Shutdown system monitoring
     if hasattr(app.state, 'SystemStatsStreamer') and app.state.SystemStatsStreamer:
@@ -189,6 +202,24 @@ async def health_check():
     except Exception as e:
         return {"status": "error", "error": str(e), "message": "Health check failed"}
 
+@app.get("/sessions")
+async def session_stats():
+    """
+    Returns session statistics for monitoring multi-user usage.
+
+    Returns:
+        dict: Session statistics including active users, total sessions, etc.
+    """
+    try:
+        stats = app.state.SessionManager.get_session_stats()
+        return {
+            "status": "OK",
+            "timestamp": time.time(),
+            "sessions": stats
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e), "message": "Failed to get session stats"}
+
 @app.get("/favicon.ico")
 async def favicon():
     """
@@ -212,6 +243,21 @@ async def get_index() -> HTMLResponse:
     with open("static/index.html", "r", encoding="utf-8") as f:
         html_content = f.read()
     return HTMLResponse(content=html_content)
+
+@app.get("/load-test")
+async def get_load_test() -> HTMLResponse:
+    """
+    Serves the load testing interface for simulating multiple users.
+
+    Returns:
+        An HTMLResponse containing the load testing interface.
+    """
+    try:
+        with open("load_test.html", "r", encoding="utf-8") as f:
+            html_content = f.read()
+        return HTMLResponse(content=html_content)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="load_test.html not found")
 
 # --------------------------------------------------------------------
 # Utility functions
@@ -264,7 +310,7 @@ def format_timestamp_ns(timestamp_ns: int) -> str:
 # WebSocket data processing
 # --------------------------------------------------------------------
 
-async def process_incoming_data(ws: WebSocket, app: FastAPI, incoming_chunks: asyncio.Queue, callbacks: 'TranscriptionCallbacks') -> None:
+async def process_incoming_data(ws: WebSocket, app: FastAPI, incoming_chunks: asyncio.Queue, callbacks: 'TranscriptionCallbacks', session_id: str) -> None:
     """
     Receives messages via WebSocket, processes audio and text messages.
 
@@ -283,6 +329,9 @@ async def process_incoming_data(ws: WebSocket, app: FastAPI, incoming_chunks: as
     try:
         while True:
             msg = await ws.receive()
+            # Update session activity on any message
+            app.state.SessionManager.update_activity(session_id)
+            
             if "bytes" in msg and msg["bytes"]:
                 raw = msg["bytes"]
 
@@ -316,6 +365,11 @@ async def process_incoming_data(ws: WebSocket, app: FastAPI, incoming_chunks: as
                 if current_qsize < MAX_AUDIO_QUEUE_SIZE:
                     # Now put only the metadata dict (containing PCM audio) into the processing queue.
                     await incoming_chunks.put(metadata)
+                    
+                    # Update session state - audio chunk received
+                    session_state = app.state.SessionManager.get_session_state(session_id)
+                    if session_state:
+                        session_state.increment_audio_chunk()
                 else:
                     # Queue is full, drop the chunk and log a warning
                     logger.warning(
@@ -535,6 +589,13 @@ async def send_tts_chunks(app: FastAPI, message_queue: asyncio.Queue, callbacks:
                 asyncio.create_task(_reset_interrupt_flag_async(app, callbacks))
 
             callbacks.tts_chunk_sent = True # Set via callbacks
+            
+            # Update session state - TTS chunk sent
+            session_state = app.state.SessionManager.get_session_state(callbacks.session_id)
+            if session_state:
+                session_state.increment_tts_chunk()
+                session_state.set_speaking(True)
+                app.state.SessionManager.update_session_status(callbacks.session_id, SessionStatus.SPEAKING)
 
     except asyncio.CancelledError:
         pass # Task cancellation is expected on disconnect
@@ -559,16 +620,18 @@ class TranscriptionCallbacks:
     `message_queue` and manages interaction logic like interruptions and final answer delivery.
     It also includes a threaded worker to handle abort checks based on partial transcription.
     """
-    def __init__(self, app: FastAPI, message_queue: asyncio.Queue):
+    def __init__(self, app: FastAPI, message_queue: asyncio.Queue, session_id: str):
         """
         Initializes the TranscriptionCallbacks instance for a WebSocket connection.
 
         Args:
             app: The FastAPI application instance (to access global components).
             message_queue: An asyncio queue for sending messages back to the client.
+            session_id: Unique identifier for this session.
         """
         self.app = app
         self.message_queue = message_queue
+        self.session_id = session_id
         self.final_transcription = ""
         self.abort_text = ""
         self.last_abort_text = ""
@@ -654,6 +717,12 @@ class TranscriptionCallbacks:
         self.message_queue.put_nowait({"type": "partial_user_request", "content": txt})
         self.abort_text = txt # Update text used for abort check
         self.abort_request_event.set() # Signal the abort worker
+        
+        # Update session state
+        session_state = self.app.state.SessionManager.get_session_state(self.session_id)
+        if session_state:
+            session_state.set_recording(True)
+            session_state.increment_message_received()
 
     def safe_abort_running_syntheses(self, reason: str):
         """Placeholder for safely aborting syntheses (currently does nothing)."""
@@ -759,6 +828,12 @@ class TranscriptionCallbacks:
         logger.info(f"\n{Colors.apply('🖥️✅ FINAL USER REQUEST (STT Callback): ').green}{txt}")
         if not self.final_transcription: # Store it if not already set by on_before_final logic
              self.final_transcription = txt
+        
+        # Update session state - user finished speaking
+        session_state = self.app.state.SessionManager.get_session_state(self.session_id)
+        if session_state:
+            session_state.set_recording(False)
+            self.app.state.SessionManager.update_session_status(self.session_id, SessionStatus.PROCESSING)
 
     def abort_generations(self, reason: str):
         """
@@ -815,6 +890,13 @@ class TranscriptionCallbacks:
         generation, sends any final assistant answer generated so far, and resets relevant state.
         """
         logger.info(f"{Colors.ORANGE}🖥️🎙️ Recording started.{Colors.RESET} TTS Client Playing: {self.tts_client_playing}")
+        
+        # Update session state - user started speaking/recording
+        session_state = self.app.state.SessionManager.get_session_state(self.session_id)
+        if session_state:
+            session_state.set_recording(True)
+            self.app.state.SessionManager.update_session_status(self.session_id, SessionStatus.LISTENING)
+        
         # Use connection-specific tts_client_playing flag
         if self.tts_client_playing:
             self.tts_to_client = False # Stop server sending TTS
@@ -921,66 +1003,90 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     logger.info("🖥️✅ Client connected via WebSocket.")
 
-    message_queue = asyncio.Queue()
-    audio_chunks = asyncio.Queue()
-
-    # Set up callback manager - THIS NOW HOLDS THE CONNECTION-SPECIFIC STATE
-    callbacks = TranscriptionCallbacks(app, message_queue)
-
-    # Register for system stats updates if available
-    if hasattr(app.state, 'SystemStatsStreamer') and app.state.SystemStatsStreamer:
-        app.state.SystemStatsStreamer.add_client(ws)
-        logger.info("🖥️📊 Client registered for system stats updates")
-
-    # Assign callbacks to the AudioInputProcessor (global component)
-    # These methods within callbacks will now operate on its *instance* state
-    app.state.AudioInputProcessor.realtime_callback = callbacks.on_partial
-    app.state.AudioInputProcessor.transcriber.potential_sentence_end = callbacks.on_potential_sentence
-    app.state.AudioInputProcessor.transcriber.on_tts_allowed_to_synthesize = callbacks.on_tts_allowed_to_synthesize
-    app.state.AudioInputProcessor.transcriber.potential_full_transcription_callback = callbacks.on_potential_final
-    app.state.AudioInputProcessor.transcriber.potential_full_transcription_abort_callback = callbacks.on_potential_abort
-    app.state.AudioInputProcessor.transcriber.full_transcription_callback = callbacks.on_final
-    app.state.AudioInputProcessor.transcriber.before_final_sentence = callbacks.on_before_final
-    app.state.AudioInputProcessor.recording_start_callback = callbacks.on_recording_start
-    app.state.AudioInputProcessor.silence_active_callback = callbacks.on_silence_active
-
-    # Assign callback to the SpeechPipelineManager (global component)
-    app.state.SpeechPipelineManager.on_partial_assistant_text = callbacks.on_partial_assistant_text
-
-    # Create tasks for handling different responsibilities
-    # Pass the 'callbacks' instance to tasks that need connection-specific state
-    tasks = [
-        asyncio.create_task(process_incoming_data(ws, app, audio_chunks, callbacks)), # Pass callbacks
-        asyncio.create_task(app.state.AudioInputProcessor.process_chunk_queue(audio_chunks)),
-        asyncio.create_task(send_text_messages(ws, message_queue)),
-        asyncio.create_task(send_tts_chunks(app, message_queue, callbacks)), # Pass callbacks
-    ]
-
+    # Create session
+    session_id = app.state.SessionManager.create_session(ws)
+    
     try:
-        # Wait for any task to complete (e.g., client disconnect)
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            if not task.done():
-                task.cancel()
-        # Await cancelled tasks to let them clean up if needed
-        await asyncio.gather(*pending, return_exceptions=True)
-    except Exception as e:
-        logger.error(f"🖥️💥 {Colors.apply('ERROR').red} in WebSocket session: {repr(e)}")
-    finally:
-        logger.info("🖥️🧹 Cleaning up WebSocket tasks...")
-        
-        # Unregister from system stats updates
+        message_queue = asyncio.Queue()
+        audio_chunks = asyncio.Queue()
+
+        # Set up callback manager - THIS NOW HOLDS THE CONNECTION-SPECIFIC STATE
+        callbacks = TranscriptionCallbacks(app, message_queue, session_id)
+
+        # Store session-specific components
+        app.state.SessionManager.set_session_component(session_id, "callbacks", callbacks)
+        app.state.SessionManager.set_session_component(session_id, "message_queue", message_queue)
+        app.state.SessionManager.set_session_component(session_id, "audio_chunks", audio_chunks)
+        app.state.SessionManager.set_session_component(session_id, "websocket", ws)
+
+        # Send session info to client
+        session_info_msg = {
+            "type": "session_info",
+            "content": {
+                "session_id": session_id,
+                "status": "connected"
+            }
+        }
+        await message_queue.put(session_info_msg)
+
+        # Register for system stats updates if available
         if hasattr(app.state, 'SystemStatsStreamer') and app.state.SystemStatsStreamer:
-            app.state.SystemStatsStreamer.remove_client(ws)
-            logger.info("🖥️📊 Client unregistered from system stats updates")
-        
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        # Ensure all tasks are awaited after cancellation
-        # Use return_exceptions=True to prevent gather from stopping on first error during cleanup
-        await asyncio.gather(*tasks, return_exceptions=True)
-        logger.info("🖥️❌ WebSocket session ended.")
+            app.state.SystemStatsStreamer.add_client(ws)
+            logger.info("🖥️📊 Client registered for system stats updates")
+
+        # Assign callbacks to the AudioInputProcessor (global component)
+        # These methods within callbacks will now operate on its *instance* state
+        app.state.AudioInputProcessor.realtime_callback = callbacks.on_partial
+        app.state.AudioInputProcessor.transcriber.potential_sentence_end = callbacks.on_potential_sentence
+        app.state.AudioInputProcessor.transcriber.on_tts_allowed_to_synthesize = callbacks.on_tts_allowed_to_synthesize
+        app.state.AudioInputProcessor.transcriber.potential_full_transcription_callback = callbacks.on_potential_final
+        app.state.AudioInputProcessor.transcriber.potential_full_transcription_abort_callback = callbacks.on_potential_abort
+        app.state.AudioInputProcessor.transcriber.full_transcription_callback = callbacks.on_final
+        app.state.AudioInputProcessor.transcriber.before_final_sentence = callbacks.on_before_final
+        app.state.AudioInputProcessor.recording_start_callback = callbacks.on_recording_start
+        app.state.AudioInputProcessor.silence_active_callback = callbacks.on_silence_active
+
+        # Assign callback to the SpeechPipelineManager (global component)
+        app.state.SpeechPipelineManager.on_partial_assistant_text = callbacks.on_partial_assistant_text
+
+        # Create tasks for handling different responsibilities
+        # Pass the 'callbacks' instance to tasks that need connection-specific state
+        tasks = [
+            asyncio.create_task(process_incoming_data(ws, app, audio_chunks, callbacks, session_id)), # Pass session_id
+            asyncio.create_task(app.state.AudioInputProcessor.process_chunk_queue(audio_chunks)),
+            asyncio.create_task(send_text_messages(ws, message_queue)),
+            asyncio.create_task(send_tts_chunks(app, message_queue, callbacks)), # Pass callbacks
+        ]
+
+        try:
+            # Wait for any task to complete (e.g., client disconnect)
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            # Await cancelled tasks to let them clean up if needed
+            await asyncio.gather(*pending, return_exceptions=True)
+        except Exception as e:
+            logger.error(f"🖥️💥 {Colors.apply('ERROR').red} in WebSocket session {session_id[:8]}: {repr(e)}")
+        finally:
+            logger.info(f"🖥️🧹 Cleaning up WebSocket tasks for session {session_id[:8]}...")
+            
+            # Unregister from system stats updates
+            if hasattr(app.state, 'SystemStatsStreamer') and app.state.SystemStatsStreamer:
+                app.state.SystemStatsStreamer.remove_client(ws)
+                logger.info("🖥️📊 Client unregistered from system stats updates")
+            
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            # Ensure all tasks are awaited after cancellation
+            # Use return_exceptions=True to prevent gather from stopping on first error during cleanup
+            await asyncio.gather(*tasks, return_exceptions=True)
+            logger.info(f"🖥️❌ WebSocket session {session_id[:8]} ended.")
+    
+    finally:
+        # Always clean up session, even if errors occurred
+        app.state.SessionManager.remove_session(session_id)
 
 # --------------------------------------------------------------------
 # Entry point

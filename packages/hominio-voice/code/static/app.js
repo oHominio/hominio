@@ -44,6 +44,12 @@ const systemInfo = document.getElementById("systemInfo");
 const statusDot = document.getElementById("statusDot");
 const connectionText = document.getElementById("connectionText");
 
+// Session Elements
+const sessionsPanel = document.getElementById("sessionsPanel");
+const sessionsList = document.getElementById("sessionsList");
+const totalSessionsCount = document.getElementById("totalSessionsCount");
+const activeSessionsCount = document.getElementById("activeSessionsCount");
+
 // Toggle buttons for both views
 const toggleBtn = document.getElementById("toggleBtn");
 const toggleBtn2 = document.getElementById("toggleBtn2");
@@ -66,6 +72,10 @@ let isConnected = false; // Track connection state
 
 // System Stats State
 let systemStatsConnected = false;
+
+// Session Management State
+let sessionId = null;
+let sessionsData = { sessions: { total_sessions: 0, active_sessions: 0 } };
 
 // --- batching + fixed 8‑byte header setup ---
 const BATCH_SAMPLES = 2048;
@@ -291,6 +301,25 @@ function renderMessages() {
 }
 
 function handleJSONMessage({ type, content }) {
+  if (type === "session_info") {
+    // Received session info from server
+    if (content.session_id) {
+      sessionId = content.session_id;
+      updateSessionsDisplay();
+    }
+    return;
+  }
+
+  if (type === "session_stats") {
+    // Received real-time session statistics
+    sessionsData = { sessions: content };
+    updateSessionsDisplay();
+    return;
+  }
+
+  // Update session display when we receive messages (for real-time status)
+  updateSessionsDisplay();
+
   if (type === "partial_user_request") {
     typingUser = content?.trim() ? escapeHtml(content) : "";
     setVoiceAvatarState("listening");
@@ -516,6 +545,155 @@ function updateSystemConnectionStatus(connected) {
   }
 }
 
+// Session Management Functions (Real-time via WebSocket)
+
+function updateSessionsDisplay() {
+  const stats = sessionsData.sessions || {};
+
+  // Update summary stats
+  if (totalSessionsCount) {
+    totalSessionsCount.textContent = stats.total_sessions || 0;
+  }
+  if (activeSessionsCount) {
+    activeSessionsCount.textContent = stats.active_sessions || 0;
+  }
+
+  // Display all sessions
+  if (sessionsList) {
+    const sessions = stats.sessions || [];
+
+    if (sessions.length > 0) {
+      const sessionsHtml = sessions
+        .map((session) => {
+          const isCurrentSession = session.session_id === sessionId;
+          const statusClass = getSessionStatusClassFromState(session.status);
+          const durationText = formatSessionDuration(session.duration_seconds);
+          const statusText = formatSessionStatus(session.status);
+          const lastActivity =
+            session.idle_time_seconds > 0
+              ? `${Math.round(session.idle_time_seconds)}s ago`
+              : "Now";
+
+          return `
+          <div class="session-item ${isCurrentSession ? "current" : ""}">
+            <div class="session-id">
+              ${session.session_id.substring(0, 8)}...
+              ${isCurrentSession ? " (You)" : ""}
+            </div>
+            <div class="session-status">
+              <div class="session-status-dot ${statusClass}"></div>
+              <span>${statusText}</span>
+            </div>
+            <div class="session-details">
+              <div class="session-detail-row">
+                <span>Duration:</span>
+                <span>${durationText}</span>
+              </div>
+              <div class="session-detail-row">
+                <span>Activity:</span>
+                <span>${lastActivity}</span>
+              </div>
+              <div class="session-detail-row">
+                <span>Messages:</span>
+                <span>${session.messages_received || 0}</span>
+              </div>
+                             <div class="session-detail-row">
+                 <span>Audio chunks:</span>
+                 <span>${session.audio_chunks_received || 0}</span>
+               </div>
+            </div>
+          </div>
+        `;
+        })
+        .join("");
+
+      sessionsList.innerHTML = sessionsHtml;
+    } else {
+      sessionsList.innerHTML =
+        '<div style="text-align: center; color: #7f8c8d; font-size: 0.8rem; padding: 1rem;">No active sessions</div>';
+    }
+  }
+}
+
+function getSessionStatusClass() {
+  if (!isConnected) return "inactive";
+  if (isTTSPlaying) return "speaking";
+  if (mediaStream) return "listening";
+  return "active";
+}
+
+function getSessionStatusText() {
+  if (!isConnected) return "Disconnected";
+  if (isTTSPlaying) return "Speaking";
+  if (mediaStream) return "Listening";
+  return "Connected";
+}
+
+function getSessionDuration() {
+  // This is a placeholder - in a real implementation, you'd track session start time
+  return "Active";
+}
+
+function getSessionStatusClassFromState(status) {
+  switch (status) {
+    case "speaking":
+      return "speaking";
+    case "listening":
+      return "listening";
+    case "processing":
+      return "processing";
+    case "connected":
+      return "active";
+    case "idle":
+      return "active";
+    case "disconnected":
+      return "inactive";
+    case "inactive":
+      return "inactive";
+    default:
+      return "active";
+  }
+}
+
+function formatSessionStatus(status) {
+  switch (status) {
+    case "speaking":
+      return "Speaking";
+    case "listening":
+      return "Listening";
+    case "processing":
+      return "Processing";
+    case "connected":
+      return "Connected";
+    case "idle":
+      return "Idle";
+    case "disconnected":
+      return "Disconnected";
+    case "inactive":
+      return "Inactive";
+    default:
+      return "Active";
+  }
+}
+
+function formatSessionDuration(seconds) {
+  if (!seconds || seconds < 1) return "0s";
+
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = Math.floor(seconds % 60);
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m ${secs}s`;
+  } else if (minutes > 0) {
+    return `${minutes}m ${secs}s`;
+  } else {
+    return `${secs}s`;
+  }
+}
+
+// Polling functions removed - now using real-time WebSocket updates
+
 function escapeHtml(str) {
   return (str ?? "")
     .replace(/&/g, "&amp;")
@@ -559,6 +737,9 @@ async function startConnection() {
     await setupTTSPlayback();
     isConnected = true;
 
+    // Session ID will be provided by the server via session_info message
+    // No need for polling anymore - we get real-time updates via WebSocket
+
     // Re-enable buttons
     buttons.forEach((btn) => {
       if (btn) btn.disabled = false;
@@ -583,6 +764,10 @@ async function startConnection() {
     flushRemainder();
     cleanupAudio();
     isConnected = false;
+    sessionId = null;
+
+    // Clear session display
+    updateSessionsDisplay();
 
     // Re-enable buttons
     const buttons = [toggleBtn, toggleBtn2];
@@ -598,6 +783,10 @@ async function startConnection() {
     cleanupAudio();
     console.error(err);
     isConnected = false;
+    sessionId = null;
+
+    // Clear session display
+    updateSessionsDisplay();
 
     // Re-enable buttons
     const buttons = [toggleBtn, toggleBtn2];
