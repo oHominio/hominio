@@ -27,6 +27,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import HTMLResponse, Response, FileResponse
 
+# GPU Monitoring imports
+from system_monitor import SystemMonitor, SystemStatsStreamer
+
 USE_SSL = False
 TTS_START_ENGINE = "kokoro"
 TTS_ORPHEUS_MODEL = "Orpheus_3B-1BaseGGUF/mOrpheus_3B-1Base_Q4_K_M.gguf"
@@ -112,6 +115,18 @@ async def lifespan(app: FastAPI):
         app: The FastAPI application instance.
     """
     logger.info("🖥️▶️ Server starting up")
+    
+    # Initialize system monitoring
+    app.state.SystemMonitor = SystemMonitor()
+    system_initialized = await app.state.SystemMonitor.initialize()
+    if system_initialized:
+        app.state.SystemStatsStreamer = SystemStatsStreamer(app.state.SystemMonitor, update_interval=1.0)
+        await app.state.SystemStatsStreamer.start_streaming()
+        logger.info("🖥️📊 System monitoring initialized and streaming started")
+    else:
+        app.state.SystemStatsStreamer = None
+        logger.warning("🖥️⚠️ System monitoring not available")
+    
     # Initialize global components, not connection-specific state
     app.state.SpeechPipelineManager = SpeechPipelineManager(
         tts_engine=TTS_START_ENGINE,
@@ -132,6 +147,16 @@ async def lifespan(app: FastAPI):
     yield
 
     logger.info("🖥️⏹️ Server shutting down")
+    
+    # Shutdown system monitoring
+    if hasattr(app.state, 'SystemStatsStreamer') and app.state.SystemStatsStreamer:
+        await app.state.SystemStatsStreamer.stop_streaming()
+        logger.info("🖥️📊 System stats streaming stopped")
+        
+    if hasattr(app.state, 'SystemMonitor'):
+        await app.state.SystemMonitor.shutdown()
+        logger.info("🖥️📊 System monitor shutdown")
+    
     app.state.AudioInputProcessor.shutdown()
 
 # --------------------------------------------------------------------
@@ -902,6 +927,11 @@ async def websocket_endpoint(ws: WebSocket):
     # Set up callback manager - THIS NOW HOLDS THE CONNECTION-SPECIFIC STATE
     callbacks = TranscriptionCallbacks(app, message_queue)
 
+    # Register for system stats updates if available
+    if hasattr(app.state, 'SystemStatsStreamer') and app.state.SystemStatsStreamer:
+        app.state.SystemStatsStreamer.add_client(ws)
+        logger.info("🖥️📊 Client registered for system stats updates")
+
     # Assign callbacks to the AudioInputProcessor (global component)
     # These methods within callbacks will now operate on its *instance* state
     app.state.AudioInputProcessor.realtime_callback = callbacks.on_partial
@@ -938,6 +968,12 @@ async def websocket_endpoint(ws: WebSocket):
         logger.error(f"🖥️💥 {Colors.apply('ERROR').red} in WebSocket session: {repr(e)}")
     finally:
         logger.info("🖥️🧹 Cleaning up WebSocket tasks...")
+        
+        # Unregister from system stats updates
+        if hasattr(app.state, 'SystemStatsStreamer') and app.state.SystemStatsStreamer:
+            app.state.SystemStatsStreamer.remove_client(ws)
+            logger.info("🖥️📊 Client unregistered from system stats updates")
+        
         for task in tasks:
             if not task.done():
                 task.cancel()

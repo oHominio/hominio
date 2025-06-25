@@ -52,6 +52,8 @@ RUN pip install --no-cache-dir --prefer-binary -r requirements.txt \
 # Pin ctranslate2 to a compatible version
 RUN pip install --no-cache-dir "ctranslate2<4.5.0"
 
+# NOTE: nvidia-ml-py is included in requirements.txt for GPU monitoring capabilities
+
 # Copy the application code
 COPY --chown=1001:1001 code/ ./code/
 

@@ -19,6 +19,31 @@ const statusText = document.getElementById("statusText");
 const chatStatus = document.getElementById("chatStatus");
 const viewToggle = document.getElementById("viewToggle");
 
+// System Stats Elements
+const cpuUsageValue = document.getElementById("cpuUsageValue");
+const cpuUsageBar = document.getElementById("cpuUsageBar");
+const cpuCoresInfo = document.getElementById("cpuCoresInfo");
+const cpuFreqValue = document.getElementById("cpuFreqValue");
+const cpuTempValue = document.getElementById("cpuTempValue");
+const cpuTempBar = document.getElementById("cpuTempBar");
+const cpuTempItem = document.getElementById("cpuTempItem");
+
+const memoryUsageValue = document.getElementById("memoryUsageValue");
+const memoryUsageBar = document.getElementById("memoryUsageBar");
+const memoryAvailableValue = document.getElementById("memoryAvailableValue");
+
+const gpuUtilValue = document.getElementById("gpuUtilValue");
+const gpuUtilBar = document.getElementById("gpuUtilBar");
+const gpuMemoryValue = document.getElementById("gpuMemoryValue");
+const gpuMemoryBar = document.getElementById("gpuMemoryBar");
+const gpuTempValue = document.getElementById("gpuTempValue");
+const gpuTempBar = document.getElementById("gpuTempBar");
+const gpuSection = document.getElementById("gpuSection");
+
+const systemInfo = document.getElementById("systemInfo");
+const statusDot = document.getElementById("statusDot");
+const connectionText = document.getElementById("connectionText");
+
 // Toggle buttons for both views
 const toggleBtn = document.getElementById("toggleBtn");
 const toggleBtn2 = document.getElementById("toggleBtn2");
@@ -38,6 +63,9 @@ let typingUser = "";
 let typingAssistant = "";
 let isVoiceView = true; // Default to voice bubble view
 let isConnected = false; // Track connection state
+
+// System Stats State
+let systemStatsConnected = false;
 
 // --- batching + fixed 8‑byte header setup ---
 const BATCH_SAMPLES = 2048;
@@ -320,6 +348,171 @@ function handleJSONMessage({ type, content }) {
     console.log("TTS playback stopped. Reason: tts_interruption.");
     socket.send(JSON.stringify({ type: "tts_stop" }));
     return;
+  }
+  if (type === "system_stats") {
+    // Handle system stats updates (includes CPU, memory, and GPU)
+    updateSystemStats(content);
+    return;
+  }
+  if (type === "gpu_stats") {
+    // Legacy support - convert to system stats format
+    const systemData = {
+      cpu_percent: 0,
+      cpu_count: 0,
+      cpu_freq_current: null,
+      cpu_temp: null,
+      memory_total: 0,
+      memory_used: 0,
+      memory_percent: 0,
+      memory_available: 0,
+      gpu_available: content.available,
+      gpu_utilization: content.utilization,
+      gpu_memory_used: content.memory_used,
+      gpu_memory_total: content.memory_total,
+      gpu_memory_percent: content.memory_percent,
+      gpu_temperature: content.temperature,
+      gpu_name: content.name,
+      gpu_power_usage: content.power_usage,
+      uptime: 0,
+    };
+    updateSystemStats(systemData);
+    return;
+  }
+}
+
+// System Stats Functions
+function updateSystemStats(data) {
+  // Update CPU stats
+  if (cpuUsageValue) {
+    cpuUsageValue.textContent = `${data.cpu_percent}%`;
+  }
+  if (cpuUsageBar) {
+    cpuUsageBar.style.width = `${Math.max(0, Math.min(100, data.cpu_percent))}%`;
+  }
+  if (cpuCoresInfo) {
+    cpuCoresInfo.textContent = `${data.cpu_count} cores`;
+  }
+  if (cpuFreqValue) {
+    if (data.cpu_freq_current) {
+      cpuFreqValue.textContent = `${Math.round(data.cpu_freq_current)} MHz`;
+    } else {
+      cpuFreqValue.textContent = "N/A";
+    }
+  }
+
+  // Update CPU temperature if available
+  if (data.cpu_temp !== null && data.cpu_temp !== undefined) {
+    if (cpuTempItem) cpuTempItem.style.display = "block";
+    if (cpuTempValue) {
+      cpuTempValue.textContent = `${Math.round(data.cpu_temp)}°C`;
+    }
+    if (cpuTempBar) {
+      const tempPercent = Math.max(
+        0,
+        Math.min(100, (data.cpu_temp / 100) * 100)
+      );
+      cpuTempBar.style.width = `${tempPercent}%`;
+
+      // Update temperature bar color
+      cpuTempBar.className = "stat-bar-fill temp";
+      if (data.cpu_temp >= 80) {
+        cpuTempBar.classList.add("critical");
+      } else if (data.cpu_temp >= 70) {
+        cpuTempBar.classList.add("hot");
+      }
+    }
+  } else {
+    if (cpuTempItem) cpuTempItem.style.display = "none";
+  }
+
+  // Update memory stats
+  if (memoryUsageValue) {
+    memoryUsageValue.textContent = `${data.memory_used} MB / ${data.memory_total} MB`;
+  }
+  if (memoryUsageBar) {
+    memoryUsageBar.style.width = `${Math.max(0, Math.min(100, data.memory_percent))}%`;
+  }
+  if (memoryAvailableValue) {
+    memoryAvailableValue.textContent = `${data.memory_available} MB`;
+  }
+
+  // Update GPU stats
+  if (data.gpu_available) {
+    if (gpuSection) gpuSection.style.display = "block";
+
+    if (gpuUtilValue) {
+      gpuUtilValue.textContent = `${data.gpu_utilization}%`;
+    }
+    if (gpuUtilBar) {
+      gpuUtilBar.style.width = `${Math.max(0, Math.min(100, data.gpu_utilization))}%`;
+    }
+
+    if (gpuMemoryValue) {
+      gpuMemoryValue.textContent = `${data.gpu_memory_used} MB / ${data.gpu_memory_total} MB`;
+    }
+    if (gpuMemoryBar) {
+      gpuMemoryBar.style.width = `${Math.max(0, Math.min(100, data.gpu_memory_percent))}%`;
+    }
+
+    if (gpuTempValue) {
+      gpuTempValue.textContent = `${data.gpu_temperature}°C`;
+    }
+    if (gpuTempBar) {
+      const tempPercent = Math.max(
+        0,
+        Math.min(100, (data.gpu_temperature / 100) * 100)
+      );
+      gpuTempBar.style.width = `${tempPercent}%`;
+
+      // Update temperature bar color
+      gpuTempBar.className = "stat-bar-fill temp";
+      if (data.gpu_temperature >= 80) {
+        gpuTempBar.classList.add("critical");
+      } else if (data.gpu_temperature >= 70) {
+        gpuTempBar.classList.add("hot");
+      }
+    }
+  } else {
+    // Hide GPU section if not available
+    if (gpuSection) gpuSection.style.display = "none";
+  }
+
+  // Update system info
+  if (systemInfo) {
+    let infoLines = [];
+
+    if (data.gpu_available) {
+      infoLines.push(data.gpu_name);
+      if (data.gpu_power_usage !== null) {
+        infoLines.push(`Power: ${data.gpu_power_usage}W`);
+      }
+    }
+
+    if (data.uptime > 0) {
+      const hours = Math.floor(data.uptime / 3600);
+      const minutes = Math.floor((data.uptime % 3600) / 60);
+      infoLines.push(`Uptime: ${hours}h ${minutes}m`);
+    }
+
+    systemInfo.textContent = infoLines.join(" • ");
+  }
+
+  updateSystemConnectionStatus(true);
+}
+
+function updateSystemConnectionStatus(connected) {
+  systemStatsConnected = connected;
+
+  if (statusDot) {
+    if (connected) {
+      statusDot.classList.add("connected");
+    } else {
+      statusDot.classList.remove("connected");
+    }
+  }
+
+  if (connectionText) {
+    connectionText.textContent = connected ? "Connected" : "Disconnected";
   }
 }
 

@@ -17,5 +17,9 @@ python-multipart
 # llm providers - only OpenAI for remote API
 openai
 
+# System monitoring
+nvidia-ml-py
+psutil
+
 # compatibility fix
 ctranslate2<4.5.0
