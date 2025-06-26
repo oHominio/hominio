@@ -14,6 +14,9 @@ from huggingface_hub import hf_hub_download
 from RealtimeTTS import (CoquiEngine, KokoroEngine, OrpheusEngine,
                          OrpheusVoice, TextToAudioStream)
 
+# Import memory management
+from memory_manager import BufferManager, get_resource_tracker
+
 logger = logging.getLogger(__name__)
 
 # Default configuration constants
@@ -97,6 +100,11 @@ class AudioProcessor:
         self.finished_event = threading.Event()
         self.audio_chunks = asyncio.Queue() # Queue for synthesized audio output
         self.orpheus_model = orpheus_model
+
+        # Initialize memory management for audio buffers
+        self.audio_buffer_manager = BufferManager(max_size=200, max_age_seconds=5.0)
+        self.resource_tracker = get_resource_tracker()
+        self.resource_tracker.track_resource("global", "AudioProcessor", f"audio_processor_{id(self)}")
 
         self.silence = ENGINE_SILENCES.get(engine, ENGINE_SILENCES[self.engine_name])
         self.current_stream_chunk_size = QUICK_ANSWER_STREAM_CHUNK_SIZE # Initial chunk size
@@ -319,9 +327,14 @@ class AudioProcessor:
 
             put_occurred_this_call = False # Track if put happened in this specific call
 
-            # --- Buffering Logic ---
-            buffer.append(chunk) # Always append the received chunk first
-            buf_dur += play_duration # Update buffer duration
+            # --- Buffering Logic with Memory Management ---
+            # Use BufferManager to prevent memory leaks
+            if self.audio_buffer_manager.add(chunk):
+                buffer.append(chunk) # Only add if buffer manager accepts it
+                buf_dur += play_duration # Update buffer duration
+            else:
+                logger.warning(f"👄⚠️ {generation_string} Quick audio buffer manager rejected chunk (buffer full)")
+                return  # Skip this chunk to prevent memory overflow
 
             if buffering:
                 # Check conditions to flush buffer and stop buffering
@@ -333,6 +346,7 @@ class AudioProcessor:
                             put_occurred_this_call = True
                         except asyncio.QueueFull:
                             logger.warning(f"👄⚠️ {generation_string} Quick audio queue full, dropping chunk.")
+                            break  # Stop trying to put more chunks if queue is full
                     buffer.clear()
                     buf_dur = 0.0 # Reset buffer duration
                     buffering = False # Stop buffering mode
@@ -496,9 +510,15 @@ class AudioProcessor:
 
             put_occurred_this_call = False
 
-            # --- Buffering Logic ---
-            buffer.append(chunk)
-            buf_dur += play_duration
+            # --- Buffering Logic with Memory Management ---
+            # Use BufferManager to prevent memory leaks
+            if self.audio_buffer_manager.add(chunk):
+                buffer.append(chunk)
+                buf_dur += play_duration
+            else:
+                logger.warning(f"👄⚠️ {generation_string} Final audio buffer manager rejected chunk (buffer full)")
+                return  # Skip this chunk to prevent memory overflow
+                
             if buffering:
                 if good_streak >= 2 or buf_dur >= 0.5: # Same flush logic as synthesize
                     logger.info(f"👄➡️ {generation_string} Final Flushing buffer (streak={good_streak}, dur={buf_dur:.2f}s).")
@@ -508,6 +528,7 @@ class AudioProcessor:
                            put_occurred_this_call = True
                         except asyncio.QueueFull:
                             logger.warning(f"👄⚠️ {generation_string} Final audio queue full, dropping chunk.")
+                            break  # Stop trying to put more chunks if queue is full
                     buffer.clear()
                     buf_dur = 0.0
                     buffering = False
@@ -575,3 +596,20 @@ class AudioProcessor:
 
         logger.info(f"👄✅ {generation_string} Final answer synthesis complete.")
         return True # Indicate successful completion
+
+    def shutdown(self) -> None:
+        """
+        Shuts down the AudioProcessor and cleans up resources.
+        
+        Untracking resources and cleaning up buffers.
+        """
+        logger.info("👄🔌 Shutting down AudioProcessor...")
+        
+        # Untrack resource
+        self.resource_tracker.untrack_resource("global", "AudioProcessor", f"audio_processor_{id(self)}")
+        
+        # Clean up buffer manager
+        if hasattr(self, 'audio_buffer_manager'):
+            self.audio_buffer_manager.clear()
+            
+        logger.info("👄🔌 AudioProcessor shutdown complete.")

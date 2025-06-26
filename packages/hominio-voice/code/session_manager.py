@@ -287,7 +287,7 @@ class SessionManager:
             if session_id in self.session_states:
                 self.session_states[session_id].update_status(status)
         
-        # Broadcast update (async)
+        # Broadcast update (async) - keeping original logic
         import asyncio
         try:
             asyncio.create_task(self.broadcast_session_update())

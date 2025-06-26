@@ -1,5 +1,69 @@
 # ACTION PLAN: Multi-User Voice Chat Scaling
 
+## 🚨 CRITICAL: PRE-SCALING FIXES REQUIRED
+
+**These issues MUST be resolved before implementing multi-user support, as they will be amplified with concurrent users:**
+
+### MEMORY LEAK FIXES (Priority 1)
+
+- [ ] **Fix Thread Join Deadlocks**
+  - Location: `speech_pipeline_manager.py:1102`
+  - Issue: Threads not joining cleanly become zombie processes
+  - Fix: Add force termination after timeout, ensure all threads are daemon threads
+  - Risk: Each user connection could leave zombie threads consuming memory
+
+- [ ] **Audio Buffer Memory Leaks**
+  - Location: `audio_module.py:265-396`
+  - Issue: Audio buffers grow indefinitely when synthesis fails/interrupts
+  - Fix: Add buffer size limits, guaranteed cleanup in finally blocks
+  - Risk: With 20+ users, audio buffers could consume gigabytes of RAM
+
+- [ ] **Queue Overflow Cleanup**
+  - Location: `server.py:364-375`, `audio_module.py` TTS queues
+  - Issue: Full queues don't drain old data, causing memory bloat
+  - Fix: Implement LRU eviction when queues approach limits
+  - Risk: Each user's audio queue could grow to hundreds of MBs
+
+- [ ] **LLM Generator Resource Leaks**
+  - Location: `llm_module.py` active requests tracking
+  - Issue: Generators not properly closed on cancellation
+  - Fix: Ensure proper close() calls in all code paths
+  - Risk: GPU memory leaks scale linearly with concurrent users
+
+- [ ] **TTS Engine GPU Memory**
+  - Location: TTS engine initialization/cleanup
+  - Issue: Models loaded but not unloaded properly
+  - Fix: Implement proper model lifecycle management
+  - Risk: GPU VRAM exhaustion with multiple users
+
+### THREADING SAFETY FIXES (Priority 2)
+
+- [ ] **Race Conditions in Callback Assignment**
+  - Location: `server.py:930-944` (websocket handler)
+  - Issue: Callbacks overwritten between users
+  - Fix: Use session-specific callback routing
+  - Risk: Users interfering with each other's audio/text processing
+
+- [ ] **Shared State Mutations**
+  - Location: `speech_pipeline_manager.py` global state
+  - Issue: Multiple threads accessing shared variables without proper locking
+  - Fix: Add proper synchronization primitives
+  - Risk: Data corruption and unpredictable behavior under load
+
+### PERFORMANCE BOTTLENECKS (Priority 3)
+
+- [ ] **Queue Processing Efficiency**
+  - Location: Various queue.get() operations with timeouts
+  - Issue: Polling-based queue processing wastes CPU
+  - Fix: Use event-driven processing where possible
+  - Risk: High CPU usage with many concurrent users
+
+- [ ] **Audio Processing Optimization**
+  - Location: PCM data processing in multiple locations
+  - Issue: Inefficient buffer management and copying
+  - Fix: Implement zero-copy buffer sharing where possible
+  - Risk: CPU bottleneck during high concurrent audio load
+
 ## 1. DECONSTRUCT PROBLEM
 
 ### Current Status Quo Analysis - Problematic Weak Points:

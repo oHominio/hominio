@@ -5,6 +5,8 @@ from turndetect import strip_ending_punctuation
 from difflib import SequenceMatcher
 from colors import Colors
 from text_similarity import TextSimilarity
+from memory_manager import BufferManager, get_resource_tracker
+from thread_manager import create_managed_thread
 from scipy import signal
 import numpy as np
 import threading
@@ -157,6 +159,11 @@ class TranscriptionProcessor:
         self.on_tts_allowed_to_synthesize: Optional[Callable] = None # Note: Seems unused
 
         self.text_similarity = TextSimilarity(focus='end', n_words=5)
+        
+        # Initialize memory management for this session
+        self.audio_buffer_manager = BufferManager(max_size=50, max_age_seconds=10.0)
+        self.resource_tracker = get_resource_tracker()
+        self.resource_tracker.track_resource("global", "TranscriptionProcessor", f"transcription_processor_{id(self)}")
 
         # Use provided config or default
         self.recorder_config = copy.deepcopy(recorder_config if recorder_config else DEFAULT_RECORDER_CONFIG)
@@ -279,7 +286,7 @@ class TranscriptionProcessor:
                     if time_since_silence > potential_sentence_end_time:
                         # Check if realtime_text exists before logging/detecting
                         current_text = self.realtime_text if self.realtime_text else ""
-                        logger.info(f"👂🔚 {Colors.YELLOW}Potential sentence end detected (timed out){Colors.RESET}: {current_text}")
+                        # Commented out excessive logging: logger.info(f"👂🔚 {Colors.YELLOW}Potential sentence end detected (timed out){Colors.RESET}: {current_text}")
                         # Use force_yield=True because this is triggered by timeout, not punctuation detection
                         self.detect_potential_sentence_end(current_text, force_yield=True, force_ellipses=True) # Force ellipses if timeout occurs
 
@@ -314,8 +321,8 @@ class TranscriptionProcessor:
 
                 time.sleep(0.001) # Short sleep to prevent busy-waiting dominating CPU
 
-        monitor_thread = threading.Thread(target=monitor, daemon=True)
-        monitor_thread.start()
+        monitor_thread = create_managed_thread(target=monitor, name="TranscriptionSilenceMonitor", daemon=True)
+        # Note: Thread starts automatically when created (auto_start=True by default)
 
     def on_new_waiting_time(
             self,
@@ -600,15 +607,14 @@ class TranscriptionProcessor:
 
     def get_audio_copy(self) -> Optional[np.ndarray]:
         """
-        Copies the current audio buffer from the recorder's frames.
+        Copies the current audio buffer from the recorder's frames using managed buffers.
 
-        Retrieves the raw audio frames, concatenates them, converts to a float32
-        NumPy array normalized to [-1.0, 1.0], and returns a deep copy. Updates
-        `self.last_audio_copy` if successful. If the recorder is unavailable,
-        frames are empty, or an error occurs, it returns the `last_audio_copy`.
+        Retrieves the raw audio frames safely using BufferManager, concatenates them, 
+        converts to a float32 NumPy array normalized to [-1.0, 1.0], and returns a copy. 
+        Updates `self.last_audio_copy` if successful. Thread-safe for concurrent access.
 
         Returns:
-            A deep copy of the current audio buffer as a float32 NumPy array,
+            A copy of the current audio buffer as a float32 NumPy array,
             or the last known good copy if the current fetch fails, or None
             if no audio has ever been successfully captured.
         """
@@ -620,30 +626,38 @@ class TranscriptionProcessor:
              return self.last_audio_copy
 
         try:
-             # Access frames safely
-             # Ensure frames is thread-safe if accessed concurrently
-             with self.recorder.frames_lock if hasattr(self.recorder, 'frames_lock') else threading.Lock(): # Use recorder's lock if available
-                 frames_data = list(self.recorder.frames) # Create a copy of the deque items
+             # Use BufferManager for thread-safe access to frames
+             frames_data = []
+             
+             # Access frames safely with proper locking
+             with self.recorder.frames_lock if hasattr(self.recorder, 'frames_lock') else threading.Lock():
+                 # Copy frames to managed buffer for safe processing
+                 for frame in list(self.recorder.frames):
+                     if self.audio_buffer_manager.add(frame):
+                         frames_data.append(frame)
+                     else:
+                         logger.warning("👂⚠️ Audio buffer manager rejected frame (buffer full)")
 
              if not frames_data:
-                 logger.debug("👂💾 Recorder frames buffer is currently empty.")
+                 logger.debug("👂💾 No audio frames available for processing.")
                  return self.last_audio_copy # Return last known if current is empty
 
-             # Process audio buffer
+             # Process audio buffer safely
              full_audio_array = np.frombuffer(b''.join(frames_data), dtype=np.int16)
              if full_audio_array.size == 0:
-                 logger.debug("👂💾 Recorder frames buffer resulted in empty array after join.")
+                 logger.debug("👂💾 Audio frames resulted in empty array after join.")
                  return self.last_audio_copy # Return last known if buffer is empty after join
 
              full_audio = full_audio_array.astype(np.float32) / INT16_MAX_ABS_VALUE
-             # No need for deepcopy here as full_audio is a new array derived from the buffer
-             audio_copy = full_audio
+             audio_copy = full_audio.copy()  # Explicit copy for safety
 
              # Update last_audio_copy only if the new copy is valid and has data
              if audio_copy is not None and len(audio_copy) > 0:
                  self.last_audio_copy = audio_copy
                  logger.debug(f"👂💾 Successfully got audio copy (length: {len(audio_copy)} samples).")
-
+                 
+                 # Track memory usage
+                 self.resource_tracker.update_memory_usage(f"audio_copy_{id(self)}", len(audio_copy) * 4)  # 4 bytes per float32
 
              return audio_copy
         except Exception as e:
@@ -814,6 +828,15 @@ class TranscriptionProcessor:
         if not self.shutdown_performed:
             logger.info("👂🔌 Shutting down TranscriptionProcessor...")
             self.shutdown_performed = True # Set flag early to stop loops/threads
+
+            # Clean up memory management resources first
+            if hasattr(self, 'audio_buffer_manager'):
+                logger.info("👂🔌 Cleaning up audio buffer manager...")
+                self.audio_buffer_manager.clear()
+                
+            if hasattr(self, 'resource_tracker'):
+                logger.info("👂🔌 Cleaning up resource tracker...")
+                self.resource_tracker.untrack_resource("global", "TranscriptionProcessor", f"transcription_processor_{id(self)}")
 
             if self.recorder:
                 logger.info("👂🔌 Calling recorder shutdown()...")

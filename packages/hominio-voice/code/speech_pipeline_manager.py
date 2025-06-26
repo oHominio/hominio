@@ -12,6 +12,8 @@ from text_similarity import TextSimilarity
 from text_context import TextContext
 from llm_module import LLM
 from colors import Colors
+from thread_manager import create_managed_thread, get_thread_manager
+from memory_manager import get_memory_monitor, get_resource_tracker
 
 # (Logging setup)
 logger = logging.getLogger(__name__)
@@ -148,8 +150,7 @@ class SpeechPipelineManager:
         self.orpheus_model = orpheus_model
 
         self.system_prompt = system_prompt
-        if tts_engine == "orpheus":
-            self.system_prompt += f"\n{orpheus_prompt_addon}"
+        # Removed orpheus-specific system prompt modification - only using Kokoro now
 
         # --- Instance Dependencies ---
         self.audio = AudioProcessor(
@@ -202,16 +203,45 @@ class SpeechPipelineManager:
         self.tts_final_generation_active = False
         self.previous_request = None
 
-        # --- Worker Threads ---
-        self.request_processing_thread = threading.Thread(target=self._request_processing_worker, name="RequestProcessingThread", daemon=True)
-        self.llm_inference_thread = threading.Thread(target=self._llm_inference_worker, name="LLMProcessingThread", daemon=True)
-        self.tts_quick_inference_thread = threading.Thread(target=self._tts_quick_inference_worker, name="TTSQuickProcessingThread", daemon=True)
-        self.tts_final_inference_thread = threading.Thread(target=self._tts_final_inference_worker, name="TTSFinalProcessingThread", daemon=True)
-
-        self.request_processing_thread.start()
-        self.llm_inference_thread.start()
-        self.tts_quick_inference_thread.start()
-        self.tts_final_inference_thread.start()
+        # --- Worker Threads (using ManagedThread for proper cleanup) ---
+        self.thread_manager = get_thread_manager()
+        self.memory_monitor = get_memory_monitor()
+        self.resource_tracker = get_resource_tracker()
+        
+        # Create managed threads with proper lifecycle management
+        self.request_processing_thread = create_managed_thread(
+            target=self._request_processing_worker, 
+            name="RequestProcessingThread",
+            shutdown_event=self.shutdown_event,
+            cleanup_callback=lambda: logger.info("🗣️🧹 Request processor thread cleaned up")
+        )
+        
+        self.llm_inference_thread = create_managed_thread(
+            target=self._llm_inference_worker, 
+            name="LLMProcessingThread",
+            shutdown_event=self.shutdown_event,
+            cleanup_callback=lambda: logger.info("🗣️🧹 LLM worker thread cleaned up")
+        )
+        
+        self.tts_quick_inference_thread = create_managed_thread(
+            target=self._tts_quick_inference_worker, 
+            name="TTSQuickProcessingThread",
+            shutdown_event=self.shutdown_event,
+            cleanup_callback=lambda: logger.info("🗣️🧹 TTS Quick worker thread cleaned up")
+        )
+        
+        self.tts_final_inference_thread = create_managed_thread(
+            target=self._tts_final_inference_worker, 
+            name="TTSFinalProcessingThread",
+            shutdown_event=self.shutdown_event,
+            cleanup_callback=lambda: logger.info("🗣️🧹 TTS Final worker thread cleaned up")
+        )
+        
+        # Start memory monitoring
+        self.memory_monitor.start_monitoring()
+        
+        # Add cleanup callback for memory pressure
+        self.memory_monitor.add_cleanup_callback(self._memory_cleanup_callback)
 
         self.on_partial_assistant_text: Optional[Callable[[str], None]] = None
 
@@ -221,6 +251,32 @@ class SpeechPipelineManager:
         logger.info(f"🗣️⏱️ Full output pipeline latency: {self.full_output_pipeline_latency:.2f}ms (LLM: {self.llm_inference_time:.2f}ms, TTS: {tts_time:.2f}ms)")
 
         logger.info("🗣️🚀 SpeechPipelineManager initialized and workers started.")
+
+    def _memory_cleanup_callback(self, level: str):
+        """
+        Called when memory usage is high to trigger cleanup actions.
+        
+        Args:
+            level: 'warning' or 'critical' indicating severity
+        """
+        logger.warning(f"🗣️🧹 Memory cleanup triggered (level: {level})")
+        
+        if level == "critical":
+            # Aggressive cleanup for critical memory pressure
+            if self.running_generation:
+                logger.warning("🗣️🧹 Critical memory - aborting current generation")
+                self.abort_generation(wait_for_completion=False, reason="critical_memory")
+            
+            # Clear history if too large
+            if len(self.history) > 5:
+                logger.warning(f"🗣️🧹 Critical memory - trimming history from {len(self.history)} to 5")
+                self.history = self.history[-5:]
+                
+        elif level == "warning":
+            # Gentle cleanup for warning level
+            if len(self.history) > 20:
+                logger.info(f"🗣️🧹 Warning memory - trimming history from {len(self.history)} to 15")
+                self.history = self.history[-15:]
 
     def is_valid_gen(self) -> bool:
         """
@@ -1069,10 +1125,14 @@ class SpeechPipelineManager:
         1. Sets the `shutdown_event`.
         2. Attempts a final abort of any running generation.
         3. Signals all relevant events to unblock any waiting worker threads.
-        4. Joins each worker thread with a timeout, logging warnings if they fail to exit.
+        4. Uses ManagedThread system for proper cleanup with zombie prevention.
         """
         logger.info("🗣️🔌 Initiating shutdown...")
         self.shutdown_event.set()
+
+        # Stop memory monitoring first
+        logger.info("🗣️🔌🧹 Stopping memory monitoring...")
+        self.memory_monitor.stop_monitoring()
 
         # Try a final synchronous abort to ensure clean state before join
         logger.info("🗣️🔌🛑 Attempting final abort before joining threads...")
@@ -1089,22 +1149,47 @@ class SpeechPipelineManager:
         self.abort_completed_event.set()
         self.abort_block_event.set() # Ensure request processor isn't blocked
 
-        # Join threads
-        threads_to_join = [
+        # Use ManagedThread system for proper cleanup
+        logger.info("🗣️🔌🧹 Stopping managed threads...")
+        managed_threads = [
             (self.request_processing_thread, "Request Processor"),
             (self.llm_inference_thread, "LLM Worker"),
             (self.tts_quick_inference_thread, "Quick TTS Worker"),
             (self.tts_final_inference_thread, "Final TTS Worker"),
         ]
 
-        for thread, name in threads_to_join:
-             if thread.is_alive():
-                 logger.info(f"🗣️🔌⏳ Joining {name}...")
-                 thread.join(timeout=5.0)
-                 if thread.is_alive():
-                     logger.warning(f"🗣️🔌⏱️ {name} thread did not join cleanly.")
-             else:
-                  logger.info(f"🗣️🔌👍 {name} thread already finished.")
+        # Stop all managed threads gracefully
+        failed_threads = []
+        for managed_thread, name in managed_threads:
+            if managed_thread and managed_thread.is_alive:
+                logger.info(f"🗣️🔌⏳ Stopping {name}...")
+                success = managed_thread.stop(timeout=5.0)
+                if not success:
+                    logger.warning(f"🗣️🔌⚠️ {name} thread did not stop gracefully - will be marked as zombie")
+                    failed_threads.append(name)
+                else:
+                    logger.info(f"🗣️🔌✅ {name} thread stopped successfully")
+            else:
+                logger.info(f"🗣️🔌👍 {name} thread already finished.")
 
+        # Log any failed threads
+        if failed_threads:
+            logger.warning(f"🗣️🔌⚠️ Threads that failed to stop gracefully: {failed_threads}")
+            logger.info("🗣️🔌🧹 Thread manager will handle zombie cleanup automatically")
+
+        # Shutdown audio processor
+        logger.info("🗣️🔌👄 Shutting down AudioProcessor...")
+        if hasattr(self.audio, 'shutdown'):
+            try:
+                self.audio.shutdown()
+                logger.info("🗣️🔌👄✅ AudioProcessor shutdown complete")
+            except Exception as e:
+                logger.error(f"🗣️🔌👄💥 Error during AudioProcessor shutdown: {e}")
+        else:
+            logger.warning("🗣️🔌👄⚠️ AudioProcessor has no shutdown method")
+
+        # Get final thread statistics
+        thread_stats = self.thread_manager.get_thread_stats()
+        logger.info(f"🗣️🔌📊 Final thread stats: {thread_stats}")
 
         logger.info("🗣️🔌✅ Shutdown complete.")

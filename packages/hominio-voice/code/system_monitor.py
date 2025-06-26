@@ -189,6 +189,12 @@ class SystemMonitor:
                 
         return self.stats
     
+    async def trigger_immediate_update(self, reason: str = "AI operation"):
+        """Trigger an immediate stats update and broadcast to clients"""
+        if hasattr(self, '_streamer') and self._streamer:
+            logger.debug(f"🖥️⚡ Triggering immediate GPU stats update: {reason}")
+            await self._streamer.send_immediate_update()
+    
     def to_dict(self) -> Dict:
         """Convert current stats to dictionary for JSON serialization"""
         return {
@@ -238,6 +244,8 @@ class SystemStatsStreamer:
         self.clients = set()
         self.running = False
         self.task = None
+        # Link back to monitor for immediate updates
+        self.monitor._streamer = self
         
     def add_client(self, websocket):
         """Add a WebSocket client for system stats updates"""
@@ -268,6 +276,35 @@ class SystemStatsStreamer:
             except asyncio.CancelledError:
                 pass
         logger.info("🖥️📊 System stats streaming stopped")
+        
+    async def send_immediate_update(self):
+        """Send an immediate stats update to all clients"""
+        if self.clients:
+            try:
+                # Get current system stats
+                await self.monitor.get_stats()
+                stats_dict = self.monitor.to_dict()
+                
+                # Create message
+                message = json.dumps({
+                    "type": "system_stats",
+                    "content": stats_dict
+                })
+                
+                # Send to all connected clients
+                disconnected_clients = set()
+                for client in self.clients.copy():
+                    try:
+                        await client.send_text(message)
+                    except Exception as e:
+                        logger.warning(f"Failed to send immediate system stats to client: {e}")
+                        disconnected_clients.add(client)
+                
+                # Remove disconnected clients
+                for client in disconnected_clients:
+                    self.remove_client(client)
+            except Exception as e:
+                logger.error(f"Error in immediate system stats update: {e}")
         
     async def _stream_loop(self):
         """Main streaming loop"""

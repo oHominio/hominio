@@ -34,6 +34,10 @@ from system_monitor import SystemMonitor, SystemStatsStreamer
 from session_manager import SessionManager
 from session_state import SessionStatus
 
+# Memory & Thread management imports
+from memory_manager import get_memory_monitor, get_resource_tracker, QueueManager
+from thread_manager import get_thread_manager, create_managed_thread
+
 USE_SSL = False
 TTS_START_ENGINE = "kokoro"
 TTS_ORPHEUS_MODEL = "Orpheus_3B-1BaseGGUF/mOrpheus_3B-1Base_Q4_K_M.gguf"
@@ -120,6 +124,17 @@ async def lifespan(app: FastAPI):
     """
     logger.info("🖥️▶️ Server starting up")
     
+    # Initialize memory and thread management
+    logger.info("🖥️🧠 Initializing memory and thread management...")
+    app.state.MemoryMonitor = get_memory_monitor()
+    app.state.ResourceTracker = get_resource_tracker()
+    app.state.ThreadManager = get_thread_manager()
+    
+    # Start background monitoring
+    app.state.MemoryMonitor.start_monitoring()
+    app.state.ThreadManager.start_monitoring()
+    logger.info("🖥️🧠 Memory and thread monitoring started")
+    
     # Initialize session management
     app.state.SessionManager = SessionManager()
     await app.state.SessionManager.start_cleanup_task()
@@ -128,7 +143,7 @@ async def lifespan(app: FastAPI):
     app.state.SystemMonitor = SystemMonitor()
     system_initialized = await app.state.SystemMonitor.initialize()
     if system_initialized:
-        app.state.SystemStatsStreamer = SystemStatsStreamer(app.state.SystemMonitor, update_interval=1.0)
+        app.state.SystemStatsStreamer = SystemStatsStreamer(app.state.SystemMonitor, update_interval=0.5)
         await app.state.SystemStatsStreamer.start_streaming()
         logger.info("🖥️📊 System monitoring initialized and streaming started")
     else:
@@ -155,6 +170,15 @@ async def lifespan(app: FastAPI):
     yield
 
     logger.info("🖥️⏹️ Server shutting down")
+    
+    # Shutdown memory and thread management first
+    if hasattr(app.state, 'MemoryMonitor'):
+        app.state.MemoryMonitor.stop_monitoring()
+        logger.info("🖥️🧠 Memory monitoring stopped")
+        
+    if hasattr(app.state, 'ThreadManager'):
+        app.state.ThreadManager.stop_monitoring()
+        logger.info("🖥️🧠 Thread monitoring stopped")
     
     # Shutdown session management
     if hasattr(app.state, 'SessionManager'):
@@ -244,20 +268,24 @@ async def get_index() -> HTMLResponse:
         html_content = f.read()
     return HTMLResponse(content=html_content)
 
-@app.get("/load-test")
-async def get_load_test() -> HTMLResponse:
+@app.get("/dashboard")
+async def get_dashboard() -> HTMLResponse:
     """
-    Serves the load testing interface for simulating multiple users.
+    Serves the dashboard interface for load testing and system monitoring.
 
     Returns:
-        An HTMLResponse containing the load testing interface.
+        An HTMLResponse containing the dashboard interface.
     """
     try:
-        with open("load_test.html", "r", encoding="utf-8") as f:
+        with open("static/dashboard.html", "r", encoding="utf-8") as f:
             html_content = f.read()
         return HTMLResponse(content=html_content)
     except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="load_test.html not found")
+        return HTMLResponse("""
+        <!DOCTYPE html>
+        <html><head><title>Dashboard</title></head>
+        <body><h1>Dashboard Page Not Found</h1></body></html>
+        """, status_code=404)
 
 # --------------------------------------------------------------------
 # Utility functions
@@ -314,9 +342,9 @@ async def process_incoming_data(ws: WebSocket, app: FastAPI, incoming_chunks: as
     """
     Receives messages via WebSocket, processes audio and text messages.
 
-    Handles binary audio chunks, extracting metadata (timestamp, flags) and
-    putting the audio PCM data with metadata into the `incoming_chunks` queue.
-    Applies back-pressure if the queue is full.
+    Handles binary audio chunks with queue overflow protection, extracting metadata 
+    (timestamp, flags) and putting the audio PCM data with metadata into the 
+    `incoming_chunks` queue. Applies back-pressure if the queue is full.
     Parses text messages (assumed JSON) and triggers actions based on message type
     (e.g., updates client TTS state via `callbacks`, clears history, sets speed).
 
@@ -325,6 +353,7 @@ async def process_incoming_data(ws: WebSocket, app: FastAPI, incoming_chunks: as
         app: The FastAPI application instance (for accessing global state if needed).
         incoming_chunks: An asyncio queue to put processed audio metadata dictionaries into.
         callbacks: The TranscriptionCallbacks instance for this connection to manage state.
+        session_id: The unique session identifier for this WebSocket connection.
     """
     try:
         while True:
@@ -360,27 +389,51 @@ async def process_incoming_data(ws: WebSocket, app: FastAPI, incoming_chunks: as
                 # The rest of the payload is raw PCM bytes
                 metadata["pcm"] = raw[8:]
 
-                # Check queue size before putting data
+                # Check queue size with overflow protection
                 current_qsize = incoming_chunks.qsize()
                 if current_qsize < MAX_AUDIO_QUEUE_SIZE:
-                    # Now put only the metadata dict (containing PCM audio) into the processing queue.
+                    # Put data into the queue
                     await incoming_chunks.put(metadata)
                     
                     # Update session state - audio chunk received
                     session_state = app.state.SessionManager.get_session_state(session_id)
                     if session_state:
                         session_state.increment_audio_chunk()
+                elif current_qsize >= MAX_AUDIO_QUEUE_SIZE * 0.9:  # At 90% capacity, start dropping old items
+                    # Emergency eviction - remove old items to make space
+                    evicted_count = 0
+                    while incoming_chunks.qsize() > MAX_AUDIO_QUEUE_SIZE * 0.7 and evicted_count < 10:
+                        try:
+                            incoming_chunks.get_nowait()
+                            evicted_count += 1
+                        except asyncio.QueueEmpty:
+                            break
+                    
+                    if evicted_count > 0:
+                        logger.warning(f"🖥️🧹 Evicted {evicted_count} old audio chunks to prevent overflow")
+                    
+                    # Try to put the new item
+                    try:
+                        await asyncio.wait_for(incoming_chunks.put(metadata), timeout=0.01)
+                        # Update session state - audio chunk received
+                        session_state = app.state.SessionManager.get_session_state(session_id)
+                        if session_state:
+                            session_state.increment_audio_chunk()
+                    except asyncio.TimeoutError:
+                        logger.warning(f"🖥️⚠️ Audio queue timeout, dropping chunk for session {session_id}")
                 else:
-                    # Queue is full, drop the chunk and log a warning
+                    # Queue is completely full, drop the chunk
                     logger.warning(
-                        f"🖥️⚠️ Audio queue full ({current_qsize}/{MAX_AUDIO_QUEUE_SIZE}); dropping chunk. Possible lag."
+                        f"🖥️⚠️ Audio queue full ({current_qsize}/{MAX_AUDIO_QUEUE_SIZE}); dropping chunk for session {session_id}"
                     )
 
             elif "text" in msg and msg["text"]:
                 # Text-based message: parse JSON
                 data = parse_json_message(msg["text"])
                 msg_type = data.get("type")
-                logger.info(Colors.apply(f"🖥️📥 ←←Client: {data}").orange)
+                # Only log important incoming messages, skip partial requests to reduce noise
+                if msg_type not in ("partial_user_request", "get_system_stats"):
+                    logger.info(Colors.apply(f"🖥️📥 ←←Client: {data}").orange)
 
 
                 if msg_type == "tts_start":
@@ -415,10 +468,10 @@ async def process_incoming_data(ws: WebSocket, app: FastAPI, incoming_chunks: as
 
 async def send_text_messages(ws: WebSocket, message_queue: asyncio.Queue) -> None:
     """
-    Continuously sends text messages from a queue to the client via WebSocket.
+    Continuously sends outgoing text messages (excluding TTS chunks) to the WebSocket client.
 
-    Waits for messages on the `message_queue`, formats them as JSON, and sends
-    them to the connected WebSocket client. Logs non-TTS messages.
+    Retrieves messages from the provided asyncio queue and sends them as JSON through the
+    WebSocket connection. Handles connection errors and task cancellation gracefully.
 
     Args:
         ws: The WebSocket connection instance.
@@ -429,7 +482,8 @@ async def send_text_messages(ws: WebSocket, message_queue: asyncio.Queue) -> Non
             await asyncio.sleep(0.001) # Yield control
             data = await message_queue.get()
             msg_type = data.get("type")
-            if msg_type != "tts_chunk":
+            # Only log important messages, skip noisy partial messages and stats to reduce noise
+            if msg_type not in ("tts_chunk", "session_stats", "partial_assistant_answer", "partial_user_request"):
                 logger.info(Colors.apply(f"🖥️📤 →→Client: {data}").orange)
             await ws.send_json(data)
     except asyncio.CancelledError:
@@ -481,6 +535,7 @@ async def send_tts_chunks(app: FastAPI, message_queue: asyncio.Queue, callbacks:
         last_quick_answer_chunk = 0
         last_chunk_sent = 0
         prev_status = None
+        last_status_log_time = 0  # Add throttling for status logs
 
         while True:
             await asyncio.sleep(0.001) # Yield control
@@ -494,7 +549,8 @@ async def send_tts_chunks(app: FastAPI, message_queue: asyncio.Queue, callbacks:
             is_tts_finished = app.state.SpeechPipelineManager.is_valid_gen() and app.state.SpeechPipelineManager.running_generation.audio_quick_finished
 
             def log_status():
-                nonlocal prev_status
+                nonlocal prev_status, last_status_log_time
+                current_time = time.time()
                 last_quick_answer_chunk_decayed = (
                     last_quick_answer_chunk
                     and time.time() - last_quick_answer_chunk > TTS_FINAL_TIMEOUT
@@ -515,19 +571,20 @@ async def send_tts_chunks(app: FastAPI, message_queue: asyncio.Queue, callbacks:
                     int(app.state.AudioInputProcessor.interrupted) # Input processor state
                 )
 
-                if curr_status != prev_status:
-                    status = Colors.apply("🖥️🚦 State ").red
-                    logger.info(
-                        f"{status} ToClient {curr_status[0]}, "
-                        f"ttsClientON {curr_status[1]}, " # Renamed slightly for clarity
-                        f"ChunkSent {curr_status[2]}, "
-                        f"hot {curr_status[4]}, synth {curr_status[5]}"
-                        f" gen {curr_status[6]}"
-                        f" valid {curr_status[7]}"
-                        f" tts_q_fin {curr_status[8]}"
-                        f" mic_inter {curr_status[9]}"
-                    )
-                    prev_status = curr_status
+                # Commented out excessive state logging to reduce noise
+                # if curr_status != prev_status:
+                #     status = Colors.apply("🖥️🚦 State ").red
+                #     logger.info(
+                #         f"{status} ToClient {curr_status[0]}, "
+                #         f"ttsClientON {curr_status[1]}, " 
+                #         f"ChunkSent {curr_status[2]}, "
+                #         f"hot {curr_status[4]}, synth {curr_status[5]}"
+                #         f" gen {curr_status[6]}"
+                #         f" valid {curr_status[7]}"
+                #         f" tts_q_fin {curr_status[8]}"
+                #         f" mic_inter {curr_status[9]}"
+                #     )
+                prev_status = curr_status
 
             # Use connection-specific state via callbacks
             if not callbacks.tts_to_client:
@@ -659,8 +716,8 @@ class TranscriptionCallbacks:
         self.reset_state() # Call reset to ensure consistency
 
         self.abort_request_event = threading.Event()
-        self.abort_worker_thread = threading.Thread(target=self._abort_worker, name="AbortWorker", daemon=True)
-        self.abort_worker_thread.start()
+        self.abort_worker_thread = create_managed_thread(target=self._abort_worker, name="AbortWorker", daemon=True)
+        # Note: Thread starts automatically when created (auto_start=True by default)
 
 
     def reset_state(self):
@@ -829,6 +886,9 @@ class TranscriptionCallbacks:
         if not self.final_transcription: # Store it if not already set by on_before_final logic
              self.final_transcription = txt
         
+        # Trigger immediate GPU stats update after STT processing
+        asyncio.create_task(self.app.state.SystemMonitor.trigger_immediate_update("STT completed"))
+        
         # Update session state - user finished speaking
         session_state = self.app.state.SessionManager.get_session_state(self.session_id)
         if session_state:
@@ -870,7 +930,7 @@ class TranscriptionCallbacks:
         Args:
             txt: The partial assistant text.
         """
-        logger.info(f"{Colors.apply('🖥️💬 PARTIAL ASSISTANT ANSWER: ').green}{txt}")
+        # logger.info(f"{Colors.apply('🖥️💬 PARTIAL ASSISTANT ANSWER: ').green}{txt}")
         # Use connection-specific user_interrupted flag
         if not self.user_interrupted:
             self.assistant_answer = txt
@@ -975,13 +1035,16 @@ class TranscriptionCallbacks:
                 app.state.SpeechPipelineManager.history.append({"role": "assistant", "content": cleaned_answer})
                 self.final_assistant_answer_sent = True
                 self.final_assistant_answer = cleaned_answer # Store the sent answer
+                
+                # Trigger immediate GPU stats update after LLM+TTS processing
+                asyncio.create_task(self.app.state.SystemMonitor.trigger_immediate_update("LLM+TTS completed"))
             else:
                 logger.warning(f"🖥️⚠️ {Colors.YELLOW}Final assistant answer was empty after cleaning.{Colors.RESET}")
                 self.final_assistant_answer_sent = False # Don't mark as sent
                 self.final_assistant_answer = "" # Clear the stored answer
         elif forced and not final_answer: # Should not happen due to earlier check, but safety
-             logger.warning(f"🖥️⚠️ {Colors.YELLOW}Forced send of final assistant answer, but it was empty.{Colors.RESET}")
-             self.final_assistant_answer = "" # Clear the stored answer
+            logger.warning(f"🖥️⚠️ {Colors.YELLOW}Forced send of final assistant answer, but it was empty.{Colors.RESET}")
+            self.final_assistant_answer = "" # Clear the stored answer
 
 
 # --------------------------------------------------------------------

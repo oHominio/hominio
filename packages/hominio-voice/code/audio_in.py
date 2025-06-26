@@ -1,9 +1,13 @@
 import asyncio
 import logging
-from typing import Optional, Callable
+import threading
+from typing import Optional, Callable, Dict, Any
 import numpy as np
 from scipy.signal import resample_poly
 from transcribe import TranscriptionProcessor
+
+# Import memory management for async queues
+from memory_manager import get_resource_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +58,12 @@ class AudioInputProcessor:
         self.recording_start_callback: Optional[Callable[[None], None]] = None # Type adjusted
         self.silence_active_callback: Optional[Callable[[bool], None]] = silence_active_callback
         self.interrupted = False # TODO: Consider renaming or clarifying usage (interrupted by user speech?)
+        
+        # Initialize resource tracking and queue management
+        self.resource_tracker = get_resource_tracker()
+        self.resource_tracker.track_resource("global", "AudioInputProcessor", f"audio_input_{id(self)}")
+        self.max_queue_size = 500  # Prevent memory overflow
+        self.dropped_chunks = 0
 
         self._setup_callbacks()
         logger.info("👂🚀 AudioInputProcessor initialized.")
@@ -185,6 +195,24 @@ class AudioInputProcessor:
                         logger.warning("👂⏹️ Transcription task is no longer running (completed or cancelled). Stopping audio processing.")
                         break # Stop processing
 
+                # Check queue size for overflow protection
+                queue_size = audio_queue.qsize() if hasattr(audio_queue, 'qsize') else 0
+                if queue_size > self.max_queue_size:
+                    logger.warning(f"👂⚠️ Audio queue overflow detected ({queue_size}/{self.max_queue_size}), draining old chunks")
+                    # Drain old chunks to prevent memory buildup
+                    drained_count = 0
+                    target_size = self.max_queue_size // 2  # Drain to 50% capacity
+                    while queue_size > target_size and drained_count < 100:  # Safety limit
+                        try:
+                            await asyncio.wait_for(audio_queue.get(), timeout=0.001)
+                            drained_count += 1
+                            queue_size -= 1
+                            self.dropped_chunks += 1
+                        except (asyncio.TimeoutError, asyncio.QueueEmpty):
+                            break
+                    if drained_count > 0:
+                        logger.warning(f"👂🗑️ Drained {drained_count} old audio chunks, total dropped: {self.dropped_chunks}")
+                
                 audio_data = await audio_queue.get()
                 if audio_data is None:
                     logger.info("👂🔌 Received termination signal for audio processing.")
@@ -224,6 +252,10 @@ class AudioInputProcessor:
         transcription task.
         """
         logger.info("👂🛑 Shutting down AudioInputProcessor...")
+        
+        # Untrack resource
+        self.resource_tracker.untrack_resource("global", "AudioInputProcessor", f"audio_input_{id(self)}")
+        
         # Ensure transcriber shutdown is called first to signal the loop
         if hasattr(self.transcriber, 'shutdown'):
              logger.info("👂🛑 Signaling TranscriptionProcessor to shut down.")

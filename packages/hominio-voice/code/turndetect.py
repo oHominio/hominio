@@ -1,12 +1,18 @@
 import logging
+import queue
+import threading
+import time
+from typing import Callable, Optional
+from collections import deque
+
+# Import thread management
+from thread_manager import create_managed_thread, get_thread_manager
+
 logger = logging.getLogger(__name__)
 
 import transformers
 import collections
-import threading
-import queue
 import torch
-import time
 import re
 
 # Configuration constants
@@ -207,11 +213,12 @@ class TurnDetection:
         self.texts_without_punctuation: collections.deque[tuple[str, str]] = collections.deque(maxlen=20)
 
         self.text_queue: queue.Queue[str] = queue.Queue() # Queue for incoming text
-        self.text_worker = threading.Thread(
+        self.text_worker = create_managed_thread(
             target=self._text_worker,
+            name="TurnDetection_TextWorker",
             daemon=True # Allows program to exit even if this thread is running
         )
-        self.text_worker.start()
+        # Note: Thread starts automatically when created (auto_start=True by default)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info(f"🎤🔌 Using device: {self.device}")

@@ -95,8 +95,8 @@ class VoiceChatLoadTester {
     this.testStartTime = Date.now();
 
     // Update UI
-    document.getElementById("startTest").disabled = true;
-    document.getElementById("stopTest").disabled = false;
+    document.getElementById("startTest").style.display = "none";
+    document.getElementById("stopTest").style.display = "inline-block";
 
     // Create test users
     for (let i = 0; i < userCount; i++) {
@@ -160,12 +160,8 @@ class VoiceChatLoadTester {
         // Send audio prompt and wait for complete response
         await user.sendRandomAudioPromptAndWaitForResponse();
 
-        // Add realistic pause between conversations (1-2x the audio length, max 15-20s)
-        const lastAudioDuration = user.lastAudioDuration || 5000; // fallback 5s
-        const pauseMultiplier = 1 + Math.random(); // 1-2x multiplier
-        const calculatedPause = lastAudioDuration * pauseMultiplier;
-        const maxPause = 15000 + Math.random() * 5000; // 15-20 seconds max
-        const pauseDuration = Math.min(calculatedPause, maxPause);
+        // Random pause between conversations (5-25 seconds)
+        const pauseDuration = 5000 + Math.random() * 20000; // 5-25 seconds
 
         this.log(
           "info",
@@ -197,6 +193,10 @@ class VoiceChatLoadTester {
     this.stats.activeUsers = 0;
     this.updateStats();
     this.updateUserList();
+
+    // Update UI
+    document.getElementById("startTest").style.display = "inline-block";
+    document.getElementById("stopTest").style.display = "none";
 
     // Update UI
     document.getElementById("startTest").disabled = false;
@@ -258,6 +258,12 @@ class VoiceChatLoadTester {
 
   log(level, message) {
     const logPanel = document.getElementById("logPanel");
+    if (!logPanel) {
+      // Fallback to console if logPanel doesn't exist
+      console.log(`[${level.toUpperCase()}] ${message}`);
+      return;
+    }
+
     const timestamp = new Date().toLocaleTimeString();
     const entry = document.createElement("div");
     entry.className = "log-entry";
@@ -287,13 +293,13 @@ class VoiceChatLoadTester {
         // Decode MP3 to PCM audio data
         const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
 
-        // Convert to 24kHz mono PCM (Int16Array) as required by the voice chat system
-        const targetSampleRate = 24000;
+        // Convert to 48kHz mono PCM (Int16Array) to match server expectations (48kHz -> 16kHz resample ratio 3:1)
+        const targetSampleRate = 48000;
         const duration = audioBuffer.duration;
         prompt.duration = duration * 1000; // Store duration in milliseconds
 
         // Resample and convert to mono if needed
-        const pcmData = this.convertToPCM24kMono(audioBuffer, targetSampleRate);
+        const pcmData = this.convertToPCM48kMono(audioBuffer, targetSampleRate);
 
         this.loadedAudioBuffers.set(prompt.file, {
           pcmData: pcmData,
@@ -313,7 +319,7 @@ class VoiceChatLoadTester {
     audioContext.close();
   }
 
-  convertToPCM24kMono(audioBuffer, targetSampleRate) {
+  convertToPCM48kMono(audioBuffer, targetSampleRate) {
     // Get source data
     const sourceRate = audioBuffer.sampleRate;
     const sourceData = audioBuffer.getChannelData(0); // Use first channel (mono)
@@ -366,6 +372,22 @@ class TestUser {
     this.waitingForResponse = false;
     this.responsePromise = null;
     this.responseResolve = null;
+
+    // Each user will choose completely random audio files during the session
+  }
+
+  getRandomAudioPrompt() {
+    // Choose a completely random audio file each time
+    const randomIndex = Math.floor(
+      Math.random() * this.tester.audioPrompts.length
+    );
+    const prompt = this.tester.audioPrompts[randomIndex];
+
+    this.tester.log(
+      "info",
+      `User ${this.userId} randomly selected: "${prompt.text}"`
+    );
+    return prompt;
   }
 
   async connect() {
@@ -459,10 +481,7 @@ class TestUser {
       throw new Error("Socket not connected");
     }
 
-    const prompt =
-      this.tester.audioPrompts[
-        Math.floor(Math.random() * this.tester.audioPrompts.length)
-      ];
+    const prompt = this.getRandomAudioPrompt();
 
     this.status = "sending audio";
     this.statusClass = "processing";
@@ -520,7 +539,7 @@ class TestUser {
 
     const pcmData = audioBuffer.pcmData;
     const chunkSize = 2048; // samples per chunk
-    const sampleRate = 24000;
+    const sampleRate = 48000;
     const bytesPerSample = 2;
     const chunkDuration = (chunkSize / sampleRate) * 1000; // ms per chunk
 
