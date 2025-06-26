@@ -71,8 +71,48 @@ if sys.platform == "win32":
 #from handlerequests import LanguageProcessor
 #from audio_out import AudioOutProcessor
 from audio_in import AudioInputProcessor
+from audio_input_pool import AudioInputProcessorPool
 from speech_pipeline_manager import SpeechPipelineManager
 from colors import Colors
+
+# Connection rate limiting to prevent cascade failures during load testing
+_CONNECTION_LIMITER = {
+    'connections': {},  # Track recent connections by IP
+    'max_connections_per_ip': 10,  # Max concurrent connections per IP
+    'connection_window': 60.0,  # Time window in seconds
+}
+
+def check_connection_rate_limit(client_host: str) -> bool:
+    """
+    Check if the client IP has exceeded connection rate limits.
+    
+    Args:
+        client_host: Client IP address
+        
+    Returns:
+        True if connection is allowed, False if rate limited
+    """
+    current_time = time.time()
+    
+    if client_host not in _CONNECTION_LIMITER['connections']:
+        _CONNECTION_LIMITER['connections'][client_host] = []
+    
+    # Clean old connections outside the window
+    connections = _CONNECTION_LIMITER['connections'][client_host]
+    cutoff_time = current_time - _CONNECTION_LIMITER['connection_window']
+    _CONNECTION_LIMITER['connections'][client_host] = [
+        conn_time for conn_time in connections if conn_time > cutoff_time
+    ]
+    
+    # Check if under limit
+    current_connections = len(_CONNECTION_LIMITER['connections'][client_host])
+    if current_connections >= _CONNECTION_LIMITER['max_connections_per_ip']:
+        logger.warning(f"🖥️⚠️ Rate limit exceeded for IP {client_host}: {current_connections} connections")
+        return False
+    
+    # Add current connection
+    _CONNECTION_LIMITER['connections'][client_host].append(current_time)
+    return True
 
 LANGUAGE = "en"
 # TTS_FINAL_TIMEOUT = 0.5 # unsure if 1.0 is needed for stability
@@ -160,11 +200,34 @@ async def lifespan(app: FastAPI):
     )
 
     app.state.Upsampler = UpsampleOverlap()
-    app.state.AudioInputProcessor = AudioInputProcessor(
-        LANGUAGE,
+    
+    # Initialize AudioInputProcessor pool for multi-user concurrency
+    # Auto-adjust pool size based on available GPU memory
+    try:
+        import torch
+        if torch.cuda.is_available():
+            gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            # Conservative sizing: ~1GB per concurrent user (STT + TurnDetection models)
+            max_concurrent_users = max(3, min(int(gpu_memory_gb * 0.6), 50))
+            initial_pool_size = min(3, max_concurrent_users)
+            logger.info(f"🖥️🎯 Auto-sizing pool: {initial_pool_size} initial, {max_concurrent_users} max (GPU: {gpu_memory_gb:.1f}GB)")
+        else:
+            max_concurrent_users = 10  # CPU fallback
+            initial_pool_size = 3
+            logger.info(f"🖥️🎯 CPU mode: {initial_pool_size} initial, {max_concurrent_users} max")
+    except Exception as e:
+        logger.warning(f"🖥️⚠️ Failed to detect GPU memory, using defaults: {e}")
+        max_concurrent_users = 10
+        initial_pool_size = 3
+    
+    app.state.AudioInputProcessorPool = AudioInputProcessorPool(
+        initial_size=initial_pool_size,
+        max_size=max_concurrent_users,
+        language=LANGUAGE,
         is_orpheus=TTS_START_ENGINE=="orpheus",
         pipeline_latency=app.state.SpeechPipelineManager.full_output_pipeline_latency / 1000, # seconds
     )
+    
     app.state.Aborting = False # Keep this? Its usage isn't clear in the provided snippet. Minimizing changes.
 
     yield
@@ -194,7 +257,10 @@ async def lifespan(app: FastAPI):
         await app.state.SystemMonitor.shutdown()
         logger.info("🖥️📊 System monitor shutdown")
     
-    app.state.AudioInputProcessor.shutdown()
+    # Shutdown AudioInputProcessor pool
+    if hasattr(app.state, 'AudioInputProcessorPool'):
+        app.state.AudioInputProcessorPool.shutdown()
+        logger.info("🖥️🏊‍♂️ AudioInputProcessor pool shutdown")
 
 # --------------------------------------------------------------------
 # FastAPI app instance
@@ -243,6 +309,27 @@ async def session_stats():
         }
     except Exception as e:
         return {"status": "error", "error": str(e), "message": "Failed to get session stats"}
+
+@app.get("/pool")
+async def pool_stats():
+    """
+    Returns AudioInputProcessor pool statistics for monitoring resource usage.
+
+    Returns:
+        dict: Pool statistics including allocation counts, utilization, etc.
+    """
+    try:
+        if hasattr(app.state, 'AudioInputProcessorPool'):
+            pool_status = app.state.AudioInputProcessorPool.get_pool_status()
+            return {
+                "status": "OK",
+                "timestamp": time.time(),
+                "pool": pool_status
+            }
+        else:
+            return {"status": "error", "message": "AudioInputProcessor pool not available"}
+    except Exception as e:
+        return {"status": "error", "error": str(e), "message": "Failed to get pool stats"}
 
 @app.get("/favicon.ico")
 async def favicon():
@@ -447,13 +534,19 @@ async def process_incoming_data(ws: WebSocket, app: FastAPI, incoming_chunks: as
                 # Add to the handleJSONMessage function in server.py
                 elif msg_type == "clear_history":
                     logger.info("🖥️ℹ️ Received clear_history from client.")
-                    app.state.SpeechPipelineManager.reset()
+                    # Use per-user speech pipeline manager instead of global
+                    if callbacks.audio_processor and hasattr(callbacks.audio_processor, 'speech_pipeline_manager'):
+                        callbacks.audio_processor.speech_pipeline_manager.reset()
+                    else:
+                        # Fallback to global manager if per-user not available yet
+                        app.state.SpeechPipelineManager.reset()
                 elif msg_type == "set_speed":
                     speed_value = data.get("speed", 0)
                     speed_factor = speed_value / 100.0  # Convert 0-100 to 0.0-1.0
-                    turn_detection = app.state.AudioInputProcessor.transcriber.turn_detection
-                    if turn_detection:
-                        turn_detection.update_settings(speed_factor)
+                    # Get session-specific audio processor
+                    audio_processor = app.state.SessionManager.get_session_component(session_id, "audio_processor")
+                    if audio_processor and audio_processor.transcriber.turn_detection:
+                        audio_processor.transcriber.turn_detection.update_settings(speed_factor)
                         logger.info(f"🖥️⚙️ Updated turn detection settings to factor: {speed_factor:.2f}")
 
 
@@ -499,19 +592,19 @@ async def _reset_interrupt_flag_async(app: FastAPI, callbacks: 'TranscriptionCal
     """
     Resets the microphone interruption flag after a delay (async version).
 
-    Waits for 1 second, then checks if the AudioInputProcessor is still marked
+    Waits for 1 second, then checks if the session-specific AudioInputProcessor is still marked
     as interrupted. If so, resets the flag on both the processor and the
     connection-specific callbacks instance.
 
     Args:
-        app: The FastAPI application instance (to access AudioInputProcessor).
+        app: The FastAPI application instance.
         callbacks: The TranscriptionCallbacks instance for the connection.
     """
     await asyncio.sleep(1)
-    # Check the AudioInputProcessor's own interrupted state
-    if app.state.AudioInputProcessor.interrupted:
+    # Check the session-specific AudioInputProcessor's interrupted state
+    if callbacks.audio_processor and callbacks.audio_processor.interrupted:
         logger.info(f"{Colors.apply('🖥️🎙️ ▶️ Microphone continued (async reset)').cyan}")
-        app.state.AudioInputProcessor.interrupted = False
+        callbacks.audio_processor.interrupted = False
         # Reset connection-specific interruption time via callbacks
         callbacks.interruption_time = 0
         logger.info(Colors.apply("🖥️🎙️ interruption flag reset after TTS chunk (async)").cyan)
@@ -541,12 +634,20 @@ async def send_tts_chunks(app: FastAPI, message_queue: asyncio.Queue, callbacks:
             await asyncio.sleep(0.001) # Yield control
 
             # Use connection-specific interruption_time via callbacks
-            if app.state.AudioInputProcessor.interrupted and callbacks.interruption_time and time.time() - callbacks.interruption_time > 2.0:
-                app.state.AudioInputProcessor.interrupted = False
+            if callbacks.audio_processor and callbacks.audio_processor.interrupted and callbacks.interruption_time and time.time() - callbacks.interruption_time > 2.0:
+                callbacks.audio_processor.interrupted = False
                 callbacks.interruption_time = 0 # Reset via callbacks
                 logger.info(Colors.apply("🖥️🎙️ interruption flag reset after 2 seconds").cyan)
 
-            is_tts_finished = app.state.SpeechPipelineManager.is_valid_gen() and app.state.SpeechPipelineManager.running_generation.audio_quick_finished
+            # Use per-user speech pipeline manager instead of global
+            speech_manager = None
+            if callbacks.audio_processor and hasattr(callbacks.audio_processor, 'speech_pipeline_manager'):
+                speech_manager = callbacks.audio_processor.speech_pipeline_manager
+            else:
+                # Fallback to global manager if per-user not available yet
+                speech_manager = app.state.SpeechPipelineManager
+                
+            is_tts_finished = speech_manager.is_valid_gen() and speech_manager.running_generation.audio_quick_finished
 
             def log_status():
                 nonlocal prev_status, last_status_log_time
@@ -565,25 +666,13 @@ async def send_tts_chunks(app: FastAPI, message_queue: asyncio.Queue, callbacks:
                     1, # Placeholder?
                     int(callbacks.is_hot), # from callbacks
                     int(callbacks.synthesis_started), # from callbacks
-                    int(app.state.SpeechPipelineManager.running_generation is not None), # Global manager state
-                    int(app.state.SpeechPipelineManager.is_valid_gen()), # Global manager state
+                    int(speech_manager.running_generation is not None), # Per-user manager state
+                    int(speech_manager.is_valid_gen()), # Per-user manager state
                     int(is_tts_finished), # Calculated local variable
-                    int(app.state.AudioInputProcessor.interrupted) # Input processor state
+                    int(callbacks.audio_processor.interrupted if callbacks.audio_processor else False) # Input processor state
                 )
 
-                # Commented out excessive state logging to reduce noise
-                # if curr_status != prev_status:
-                #     status = Colors.apply("🖥️🚦 State ").red
-                #     logger.info(
-                #         f"{status} ToClient {curr_status[0]}, "
-                #         f"ttsClientON {curr_status[1]}, " 
-                #         f"ChunkSent {curr_status[2]}, "
-                #         f"hot {curr_status[4]}, synth {curr_status[5]}"
-                #         f" gen {curr_status[6]}"
-                #         f" valid {curr_status[7]}"
-                #         f" tts_q_fin {curr_status[8]}"
-                #         f" mic_inter {curr_status[9]}"
-                #     )
+                # State logging removed to reduce noise
                 prev_status = curr_status
 
             # Use connection-specific state via callbacks
@@ -592,39 +681,39 @@ async def send_tts_chunks(app: FastAPI, message_queue: asyncio.Queue, callbacks:
                 log_status()
                 continue
 
-            if not app.state.SpeechPipelineManager.running_generation:
+            if not speech_manager.running_generation:
                 await asyncio.sleep(0.001)
                 log_status()
                 continue
 
-            if app.state.SpeechPipelineManager.running_generation.abortion_started:
+            if speech_manager.running_generation.abortion_started:
                 await asyncio.sleep(0.001)
                 log_status()
                 continue
 
-            if not app.state.SpeechPipelineManager.running_generation.audio_quick_finished:
-                app.state.SpeechPipelineManager.running_generation.tts_quick_allowed_event.set()
+            if not speech_manager.running_generation.audio_quick_finished:
+                speech_manager.running_generation.tts_quick_allowed_event.set()
 
-            if not app.state.SpeechPipelineManager.running_generation.quick_answer_first_chunk_ready:
+            if not speech_manager.running_generation.quick_answer_first_chunk_ready:
                 await asyncio.sleep(0.001)
                 log_status()
                 continue
 
             chunk = None
             try:
-                chunk = app.state.SpeechPipelineManager.running_generation.audio_chunks.get_nowait()
+                chunk = speech_manager.running_generation.audio_chunks.get_nowait()
                 if chunk:
                     last_quick_answer_chunk = time.time()
             except Empty:
-                final_expected = app.state.SpeechPipelineManager.running_generation.quick_answer_provided
-                audio_final_finished = app.state.SpeechPipelineManager.running_generation.audio_final_finished
+                final_expected = speech_manager.running_generation.quick_answer_provided
+                audio_final_finished = speech_manager.running_generation.audio_final_finished
 
                 if not final_expected or audio_final_finished:
                     logger.info("🖥️🏁 Sending of TTS chunks and 'user request/assistant answer' cycle finished.")
                     callbacks.send_final_assistant_answer() # Callbacks method
 
-                    assistant_answer = app.state.SpeechPipelineManager.running_generation.quick_answer + app.state.SpeechPipelineManager.running_generation.final_answer                    
-                    app.state.SpeechPipelineManager.running_generation = None
+                    assistant_answer = speech_manager.running_generation.quick_answer + speech_manager.running_generation.final_answer                    
+                    speech_manager.running_generation = None
 
                     callbacks.tts_chunk_sent = False # Reset via callbacks
                     callbacks.reset_state() # Reset connection state via callbacks
@@ -689,6 +778,7 @@ class TranscriptionCallbacks:
         self.app = app
         self.message_queue = message_queue
         self.session_id = session_id
+        self.audio_processor: Optional[AudioInputProcessor] = None  # Session-specific processor
         self.final_transcription = ""
         self.abort_text = ""
         self.last_abort_text = ""
@@ -743,7 +833,8 @@ class TranscriptionCallbacks:
         self.partial_transcription = ""
 
         # Keep the abort call related to the audio processor/pipeline manager
-        self.app.state.AudioInputProcessor.abort_generation()
+        if self.audio_processor:
+            self.audio_processor.abort_generation()
 
 
     def _abort_worker(self):
@@ -756,7 +847,12 @@ class TranscriptionCallbacks:
                 if self.last_abort_text != self.abort_text:
                     self.last_abort_text = self.abort_text
                     logger.debug(f"🖥️🧠 Abort check triggered by partial: '{self.abort_text}'")
-                    self.app.state.SpeechPipelineManager.check_abort(self.abort_text, False, "on_partial")
+                    # Use per-user speech pipeline manager instead of global
+                    if self.audio_processor and hasattr(self.audio_processor, 'speech_pipeline_manager'):
+                        self.audio_processor.speech_pipeline_manager.check_abort(self.abort_text, False, "on_partial")
+                    else:
+                        # Fallback to global manager if per-user not available yet
+                        self.app.state.SpeechPipelineManager.check_abort(self.abort_text, False, "on_partial")
 
     def on_partial(self, txt: str):
         """
@@ -788,10 +884,17 @@ class TranscriptionCallbacks:
 
     def on_tts_allowed_to_synthesize(self):
         """Callback invoked when the system determines TTS synthesis can proceed."""
-        # Access global manager state
-        if self.app.state.SpeechPipelineManager.running_generation and not self.app.state.SpeechPipelineManager.running_generation.abortion_started:
-            logger.info(f"{Colors.apply('🖥️🔊 TTS ALLOWED').blue}")
-            self.app.state.SpeechPipelineManager.running_generation.tts_quick_allowed_event.set()
+        # Use per-user speech pipeline manager instead of global
+        speech_manager = None
+        if self.audio_processor and hasattr(self.audio_processor, 'speech_pipeline_manager'):
+            speech_manager = self.audio_processor.speech_pipeline_manager
+        else:
+            # Fallback to global manager if per-user not available yet
+            speech_manager = self.app.state.SpeechPipelineManager
+            
+        if speech_manager.running_generation and not speech_manager.running_generation.abortion_started:
+            logger.debug(f"🖥️🔊 TTS ALLOWED (Session: {self.session_id})")
+            speech_manager.running_generation.tts_quick_allowed_event.set()
 
     def on_potential_sentence(self, txt: str):
         """
@@ -803,8 +906,12 @@ class TranscriptionCallbacks:
             txt: The potential sentence text.
         """
         logger.debug(f"🖥️🧠 Potential sentence: '{txt}'")
-        # Access global manager state
-        self.app.state.SpeechPipelineManager.prepare_generation(txt)
+        # Use per-user speech pipeline manager instead of global
+        if self.audio_processor and hasattr(self.audio_processor, 'speech_pipeline_manager'):
+            self.audio_processor.speech_pipeline_manager.prepare_generation(txt)
+        else:
+            # Fallback to global manager if per-user not available yet
+            self.app.state.SpeechPipelineManager.prepare_generation(txt)
 
     def on_potential_final(self, txt: str):
         """
@@ -837,15 +944,23 @@ class TranscriptionCallbacks:
         logger.info(Colors.apply('🖥️🏁 =================== USER TURN END ===================').light_gray)
         self.user_finished_turn = True
         self.user_interrupted = False # Reset connection-specific flag (user finished, not interrupted)
-        # Access global manager state
-        if self.app.state.SpeechPipelineManager.is_valid_gen():
-            logger.info(f"{Colors.apply('🖥️🔊 TTS ALLOWED (before final)').blue}")
-            self.app.state.SpeechPipelineManager.running_generation.tts_quick_allowed_event.set()
+        
+        # Use per-user speech pipeline manager instead of global
+        speech_manager = None
+        if self.audio_processor and hasattr(self.audio_processor, 'speech_pipeline_manager'):
+            speech_manager = self.audio_processor.speech_pipeline_manager
+        else:
+            # Fallback to global manager if per-user not available yet
+            speech_manager = self.app.state.SpeechPipelineManager
+            
+        if speech_manager.is_valid_gen():
+            logger.debug(f"🖥️🔊 TTS ALLOWED (before final, Session: {self.session_id})")
+            speech_manager.running_generation.tts_quick_allowed_event.set()
 
         # first block further incoming audio (Audio processor's state)
-        if not self.app.state.AudioInputProcessor.interrupted:
+        if self.audio_processor and not self.audio_processor.interrupted:
             logger.info(f"{Colors.apply('🖥️🎙️ ⏸️ Microphone interrupted (end of turn)').cyan}")
-            self.app.state.AudioInputProcessor.interrupted = True
+            self.audio_processor.interrupted = True
             self.interruption_time = time.time() # Set connection-specific flag
 
         logger.info(f"{Colors.apply('🖥️🔊 TTS STREAM RELEASED').blue}")
@@ -858,20 +973,19 @@ class TranscriptionCallbacks:
             "content": user_request_content
         })
 
-        # Access global manager state
-        if self.app.state.SpeechPipelineManager.is_valid_gen():
+        if speech_manager.is_valid_gen():
             # Send partial assistant answer (if available) to the client
             # Use connection-specific user_interrupted flag
-            if self.app.state.SpeechPipelineManager.running_generation.quick_answer and not self.user_interrupted:
-                self.assistant_answer = self.app.state.SpeechPipelineManager.running_generation.quick_answer
+            if speech_manager.running_generation.quick_answer and not self.user_interrupted:
+                self.assistant_answer = speech_manager.running_generation.quick_answer
                 self.message_queue.put_nowait({
                     "type": "partial_assistant_answer",
                     "content": self.assistant_answer
                 })
 
         logger.info(f"🖥️🧠 Adding user request to history: '{user_request_content}'")
-        # Access global manager state
-        self.app.state.SpeechPipelineManager.history.append({"role": "user", "content": user_request_content})
+        # Use per-user speech pipeline manager's history instead of global
+        speech_manager.history.append({"role": "user", "content": user_request_content})
 
     def on_final(self, txt: str):
         """
@@ -905,8 +1019,12 @@ class TranscriptionCallbacks:
             reason: A string describing why the abortion is triggered.
         """
         logger.info(f"{Colors.apply('🖥️🛑 Aborting generation:').blue} {reason}")
-        # Access global manager state
-        self.app.state.SpeechPipelineManager.abort_generation(reason=f"server.py abort_generations: {reason}")
+        # Use per-user speech pipeline manager instead of global
+        if self.audio_processor and hasattr(self.audio_processor, 'speech_pipeline_manager'):
+            self.audio_processor.speech_pipeline_manager.abort_generation(reason=f"server.py abort_generations: {reason}")
+        else:
+            # Fallback to global manager if per-user not available yet
+            self.app.state.SpeechPipelineManager.abort_generation(reason=f"server.py abort_generations: {reason}")
 
     def on_silence_active(self, silence_active: bool):
         """
@@ -1003,9 +1121,17 @@ class TranscriptionCallbacks:
                     final answer is available. Defaults to False.
         """
         final_answer = ""
-        # Access global manager state
-        if self.app.state.SpeechPipelineManager.is_valid_gen():
-            final_answer = self.app.state.SpeechPipelineManager.running_generation.quick_answer + self.app.state.SpeechPipelineManager.running_generation.final_answer
+        
+        # Use per-user speech pipeline manager instead of global
+        speech_manager = None
+        if self.audio_processor and hasattr(self.audio_processor, 'speech_pipeline_manager'):
+            speech_manager = self.audio_processor.speech_pipeline_manager
+        else:
+            # Fallback to global manager if per-user not available yet
+            speech_manager = self.app.state.SpeechPipelineManager
+            
+        if speech_manager.is_valid_gen():
+            final_answer = speech_manager.running_generation.quick_answer + speech_manager.running_generation.final_answer
 
         if not final_answer: # Check if constructed answer is empty
             # If forced, try using the last known partial answer from this connection
@@ -1032,7 +1158,8 @@ class TranscriptionCallbacks:
                     "type": "final_assistant_answer",
                     "content": cleaned_answer
                 })
-                app.state.SpeechPipelineManager.history.append({"role": "assistant", "content": cleaned_answer})
+                # Use per-user speech pipeline manager's history instead of global
+                speech_manager.history.append({"role": "assistant", "content": cleaned_answer})
                 self.final_assistant_answer_sent = True
                 self.final_assistant_answer = cleaned_answer # Store the sent answer
                 
@@ -1063,8 +1190,15 @@ async def websocket_endpoint(ws: WebSocket):
     Args:
         ws: The WebSocket connection instance provided by FastAPI.
     """
+    # Rate limiting check before accepting connection
+    client_host = ws.client.host if ws.client else "unknown"
+    if not check_connection_rate_limit(client_host):
+        logger.warning(f"🖥️🚫 Connection from {client_host} rate limited")
+        await ws.close(code=1008, reason="Rate limit exceeded")
+        return
+    
     await ws.accept()
-    logger.info("🖥️✅ Client connected via WebSocket.")
+    logger.info(f"🖥️✅ Client connected via WebSocket from {client_host}")
 
     # Create session
     session_id = app.state.SessionManager.create_session(ws)
@@ -1097,26 +1231,40 @@ async def websocket_endpoint(ws: WebSocket):
             app.state.SystemStatsStreamer.add_client(ws)
             logger.info("🖥️📊 Client registered for system stats updates")
 
-        # Assign callbacks to the AudioInputProcessor (global component)
-        # These methods within callbacks will now operate on its *instance* state
-        app.state.AudioInputProcessor.realtime_callback = callbacks.on_partial
-        app.state.AudioInputProcessor.transcriber.potential_sentence_end = callbacks.on_potential_sentence
-        app.state.AudioInputProcessor.transcriber.on_tts_allowed_to_synthesize = callbacks.on_tts_allowed_to_synthesize
-        app.state.AudioInputProcessor.transcriber.potential_full_transcription_callback = callbacks.on_potential_final
-        app.state.AudioInputProcessor.transcriber.potential_full_transcription_abort_callback = callbacks.on_potential_abort
-        app.state.AudioInputProcessor.transcriber.full_transcription_callback = callbacks.on_final
-        app.state.AudioInputProcessor.transcriber.before_final_sentence = callbacks.on_before_final
-        app.state.AudioInputProcessor.recording_start_callback = callbacks.on_recording_start
-        app.state.AudioInputProcessor.silence_active_callback = callbacks.on_silence_active
+        # Allocate dedicated AudioInputProcessor instance for this session
+        audio_processor = app.state.AudioInputProcessorPool.allocate_instance(session_id)
+        if not audio_processor:
+            logger.error(f"🖥️💥 Failed to allocate AudioInputProcessor for session {session_id[:8]}")
+            await ws.close(code=1013, reason="Server overloaded - no available processors")
+            return
+        
+        # Store the allocated instance in session components and callbacks
+        app.state.SessionManager.set_session_component(session_id, "audio_processor", audio_processor)
+        callbacks.audio_processor = audio_processor  # Store reference in callbacks
+        
+        # Assign callbacks to the session-specific AudioInputProcessor
+        audio_processor.realtime_callback = callbacks.on_partial
+        audio_processor.transcriber.potential_sentence_end = callbacks.on_potential_sentence
+        audio_processor.transcriber.on_tts_allowed_to_synthesize = callbacks.on_tts_allowed_to_synthesize
+        audio_processor.transcriber.potential_full_transcription_callback = callbacks.on_potential_final
+        audio_processor.transcriber.potential_full_transcription_abort_callback = callbacks.on_potential_abort
+        audio_processor.transcriber.full_transcription_callback = callbacks.on_final
+        audio_processor.transcriber.before_final_sentence = callbacks.on_before_final
+        audio_processor.recording_start_callback = callbacks.on_recording_start
+        audio_processor.silence_active_callback = callbacks.on_silence_active
 
-        # Assign callback to the SpeechPipelineManager (global component)
-        app.state.SpeechPipelineManager.on_partial_assistant_text = callbacks.on_partial_assistant_text
+        # Assign callback to the per-user SpeechPipelineManager instead of global
+        if callbacks.audio_processor and hasattr(callbacks.audio_processor, 'speech_pipeline_manager'):
+            callbacks.audio_processor.speech_pipeline_manager.on_partial_assistant_text = callbacks.on_partial_assistant_text
+        else:
+            # Fallback to global manager if per-user not available yet
+            app.state.SpeechPipelineManager.on_partial_assistant_text = callbacks.on_partial_assistant_text
 
         # Create tasks for handling different responsibilities
         # Pass the 'callbacks' instance to tasks that need connection-specific state
         tasks = [
             asyncio.create_task(process_incoming_data(ws, app, audio_chunks, callbacks, session_id)), # Pass session_id
-            asyncio.create_task(app.state.AudioInputProcessor.process_chunk_queue(audio_chunks)),
+            asyncio.create_task(audio_processor.process_chunk_queue(audio_chunks)),  # Use session-specific processor
             asyncio.create_task(send_text_messages(ws, message_queue)),
             asyncio.create_task(send_tts_chunks(app, message_queue, callbacks)), # Pass callbacks
         ]
@@ -1148,6 +1296,9 @@ async def websocket_endpoint(ws: WebSocket):
             logger.info(f"🖥️❌ WebSocket session {session_id[:8]} ended.")
     
     finally:
+        # Return AudioInputProcessor instance to pool before session cleanup
+        app.state.AudioInputProcessorPool.return_instance(session_id)
+        
         # Always clean up session, even if errors occurred
         app.state.SessionManager.remove_session(session_id)
 

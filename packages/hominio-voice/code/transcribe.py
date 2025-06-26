@@ -170,7 +170,7 @@ class TranscriptionProcessor:
         self.recorder_config['language'] = self.source_language # Ensure language is set
 
         if USE_TURN_DETECTION:
-            logger.info(f"👂🔄 {Colors.YELLOW}Turn detection enabled{Colors.RESET}")
+            logger.debug(f"👂🔄 {Colors.YELLOW}Turn detection enabled{Colors.RESET}")
             self.turn_detection = TurnDetection(
                 on_new_waiting_time=self.on_new_waiting_time,
                 local=local,
@@ -286,15 +286,21 @@ class TranscriptionProcessor:
                     if time_since_silence > potential_sentence_end_time:
                         # Check if realtime_text exists before logging/detecting
                         current_text = self.realtime_text if self.realtime_text else ""
-                        # Commented out excessive logging: logger.info(f"👂🔚 {Colors.YELLOW}Potential sentence end detected (timed out){Colors.RESET}: {current_text}")
+                        # Logging removed to reduce noise
                         # Use force_yield=True because this is triggered by timeout, not punctuation detection
                         self.detect_potential_sentence_end(current_text, force_yield=True, force_ellipses=True) # Force ellipses if timeout occurs
 
                     # 2. Allow TTS synthesis shortly before the final silence duration elapses
                     tts_allowance_time = silence_waiting_time - self._TTS_ALLOWANCE_OFFSET_S
                     if time_since_silence > tts_allowance_time:
-                        if self.on_tts_allowed_to_synthesize: # Check if callback exists
-                            self.on_tts_allowed_to_synthesize()
+                        # Rate limit TTS allowed callback to prevent spam
+                        if not hasattr(self, '_last_tts_allowed_time'):
+                            self._last_tts_allowed_time = 0
+                        current_time = time.time()
+                        if current_time - self._last_tts_allowed_time > 0.1:  # Only trigger every 100ms max
+                            if self.on_tts_allowed_to_synthesize: # Check if callback exists
+                                self.on_tts_allowed_to_synthesize()
+                                self._last_tts_allowed_time = current_time
 
                     # 3. Handle "Hot" state (potential full transcription)
                     hot_condition_met = time_since_silence > start_hot_condition_time
@@ -341,7 +347,7 @@ class TranscriptionProcessor:
             current_duration = self._get_recorder_param("post_speech_silence_duration")
             if current_duration != waiting_time:
                 log_text = text if text else "(No text provided)"
-                logger.info(f"👂⏳ {Colors.GRAY}New waiting time: {Colors.RESET}{Colors.YELLOW}{waiting_time:.2f}{Colors.RESET}{Colors.GRAY} for text: {log_text}{Colors.RESET}")
+                logger.debug(f"👂⏳ {Colors.GRAY}New waiting time: {Colors.RESET}{Colors.YELLOW}{waiting_time:.2f}{Colors.RESET}{Colors.GRAY} for text: {log_text}{Colors.RESET}")
                 self._set_recorder_param("post_speech_silence_duration", waiting_time)
         else:
             logger.warning("👂⚠️ Recorder not initialized, cannot set new waiting time.")
@@ -560,7 +566,7 @@ class TranscriptionProcessor:
                 # if len(self.potential_sentences_yielded) > MAX_YIELDED_SIZE:
                 #    self.potential_sentences_yielded.pop(0)
 
-                logger.info(f"👂➡️ Yielding potential sentence end: {stripped_text_raw}")
+                logger.debug(f"👂➡️ Yielding potential sentence end: {stripped_text_raw}")
                 if self.potential_sentence_end:
                     self.potential_sentence_end(stripped_text_raw) # Callback with original punctuation
             # else: # No need to log this every time, can be noisy
@@ -689,7 +695,7 @@ class TranscriptionProcessor:
 
         def start_recording():
             """Callback triggered when recorder starts a new recording segment."""
-            logger.info("👂▶️ Recording started.")
+            logger.debug("👂▶️ Recording started.")
             self.set_silence(False) # Ensure silence is marked inactive
             self.silence_time = 0.0   # Ensure silence timer is reset
             if self.on_recording_start_callback:
@@ -700,7 +706,7 @@ class TranscriptionProcessor:
             Callback triggered when recorder stops a recording segment, just
             before final transcription might be generated.
             """
-            logger.info("👂⏹️ Recording stopped.")
+            logger.debug("👂⏹️ Recording stopped.")
             # Get audio *before* recorder might clear it for final processing
             audio_copy = self.get_last_audio_copy() # Use get_last_audio_copy for robustness
             if self.before_final_sentence:
@@ -731,7 +737,7 @@ class TranscriptionProcessor:
             # Log only significant changes or all partials based on debug level maybe
             if stripped_partial_user_text_new != self.stripped_partial_user_text:
                 self.stripped_partial_user_text = stripped_partial_user_text_new
-                logger.info(f"👂📝 Partial transcription: {Colors.CYAN}{text}{Colors.RESET}")
+                logger.debug(f"👂📝 Partial transcription: {Colors.CYAN}{text}{Colors.RESET}")
                 if self.realtime_transcription_callback:
                     self.realtime_transcription_callback(text)
                 if USE_TURN_DETECTION and hasattr(self, 'turn_detection'):
@@ -767,7 +773,7 @@ class TranscriptionProcessor:
         padded_cfg = textwrap.indent(json.dumps(pretty_cfg, indent=2), "    ")
 
         recorder_type = "AudioToTextRecorderClient" if START_STT_SERVER else "AudioToTextRecorder"
-        logger.info(f"👂⚙️ Creating {recorder_type} with params:")
+        logger.debug(f"👂⚙️ Creating {recorder_type} with params:")
         print(Colors.apply(padded_cfg).blue) # Use print for formatted JSON as logger might mangle it
 
 
@@ -785,7 +791,7 @@ class TranscriptionProcessor:
                 # Ensure wake words are disabled if needed (double check via param setting)
                 self._set_recorder_param("use_wake_words", False) # Uses the helper method
 
-            logger.info(f"👂✅ {recorder_type} instance created successfully.")
+            logger.debug(f"👂✅ {recorder_type} instance created successfully.")
 
         except Exception as e:
             # Log the exception with traceback for detailed debugging

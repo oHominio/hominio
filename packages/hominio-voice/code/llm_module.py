@@ -70,10 +70,11 @@ LMSTUDIO_BASE_URL = os.getenv("LMSTUDIO_BASE_URL", "http://127.0.0.1:1234/v1")
 # --- Backend Client Creation/Check Functions ---
 def _create_openai_client(api_key: Optional[str], base_url: Optional[str] = None) -> OpenAI:
     """
-    Creates and configures an OpenAI API client instance.
+    Creates and configures an OpenAI API client instance with optimized connection pooling.
 
     Handles API key logic (using a placeholder if none provided for local models)
-    and optional base URL configuration. Sets default timeout and retries.
+    and optional base URL configuration. Sets default timeout, retries, and connection limits
+    optimized for concurrent multi-user scenarios.
 
     Args:
         api_key: The OpenAI API key, or None if not required (e.g., for LMStudio).
@@ -89,17 +90,31 @@ def _create_openai_client(api_key: Optional[str], base_url: Optional[str] = None
     if not OPENAI_AVAILABLE:
         raise ImportError("openai library is required for this backend but not installed.")
     try:
+        import httpx
+        
         effective_key = api_key if api_key else "no-key-needed"
+        
+        # Optimized HTTP client for concurrent requests
+        http_client = httpx.Client(
+            timeout=httpx.Timeout(30.0, connect=10.0),
+            limits=httpx.Limits(
+                max_connections=50,       # Allow more concurrent connections
+                max_keepalive_connections=20,  # Keep connections alive
+                keepalive_expiry=30.0     # Connection reuse timeout
+            )
+        )
+        
         client_args = {
             "api_key": effective_key,
             "timeout": 30.0,
-            "max_retries": 2
+            "max_retries": 2,
+            "http_client": http_client  # Use optimized HTTP client
         }
         if base_url:
             client_args["base_url"] = base_url
 
         client = OpenAI(**client_args)
-        logger.info(f"🤖🔌 Prepared OpenAI-compatible client (Base URL: {base_url or 'Default'}).")
+        logger.debug(f"🤖🔌 Prepared OpenAI client with optimized connection pooling (Base URL: {base_url or 'Default'}).")
         return client
     except Exception as e:
         logger.error(f"🤖💥 Failed to initialize OpenAI client: {e}")
@@ -221,7 +236,7 @@ class LLM:
             ValueError: If an unsupported backend is specified.
             ImportError: If required libraries for the selected backend are not installed.
         """
-        logger.info(f"🤖⚙️ Initializing LLM with backend: {backend}, model: {model}, system_prompt: {system_prompt}")
+        logger.debug(f"🤖⚙️ Initializing LLM with backend: {backend}, model: {model}")
         self.backend = backend.lower()
         if self.backend not in self.SUPPORTED_BACKENDS:
             raise ValueError(f"Unsupported backend '{backend}'. Supported: {self.SUPPORTED_BACKENDS}")
@@ -245,7 +260,7 @@ class LLM:
         self._requests_lock = Lock()
         self._ollama_connection_ok: bool = False # Added explicit init
 
-        logger.info(f"🤖⚙️ Configuring LLM instance: backend='{self.backend}', model='{self.model}'")
+        logger.debug(f"🤖⚙️ Configuring LLM instance: backend='{self.backend}', model='{self.model}'")
 
         # For "openai" provider, use RedPill API by default (Phala/Llama 3.2)
         self.effective_openai_key = self._api_key or REDPILL_API_KEY if self.backend == "openai" else (self._api_key or OPENAI_API_KEY)
@@ -262,8 +277,18 @@ class LLM:
              logger.debug(f"🤖⚙️ Normalized Ollama URL: {self.effective_ollama_url}")
 
         if self.backend == "ollama" and REQUESTS_AVAILABLE:
+            # Optimized session for concurrent requests
             self.ollama_session = requests.Session()
-            logger.info("🤖🔌 Initialized requests.Session for Ollama backend.")
+            # Configure connection pooling for better concurrency
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=10,     # Number of urllib3 connection pools
+                pool_maxsize=20,         # Max connections per pool  
+                max_retries=2,          # Retry failed requests
+                pool_block=False        # Don't block when pool is full
+            )
+            self.ollama_session.mount('http://', adapter)
+            self.ollama_session.mount('https://', adapter)
+            logger.debug("🤖🔌 Initialized optimized requests.Session for Ollama backend.")
 
         self.system_prompt_message = None
         if self.system_prompt:
@@ -374,13 +399,13 @@ class LLM:
                 if not self._active_requests:
                     logger.debug("🤖🗑️ Cancel all requested, but no active requests found.")
                     return False
-                logger.info(f"🤖🗑️ Attempting to cancel ALL active generation requests ({len(self._active_requests)}).")
+                logger.debug(f"🤖🗑️ Attempting to cancel ALL active generation requests ({len(self._active_requests)}).")
                 ids_to_cancel = list(self._active_requests.keys())
             else:
                 if request_id not in self._active_requests:
                     logger.warning(f"🤖🗑️ Cancel requested for ID '{request_id}', but it's not an active request.")
                     return False
-                logger.info(f"🤖🗑️ Attempting to cancel generation request: {request_id}")
+                logger.debug(f"🤖🗑️ Attempting to cancel generation request: {request_id}")
                 ids_to_cancel.append(request_id)
 
             # Perform the cancellation
@@ -421,17 +446,17 @@ class LLM:
                 if hasattr(stream_obj, 'close') and callable(stream_obj.close):
                     logger.debug(f"🤖🗑️ [{request_id}] Attempting to close stream/response object...")
                     stream_obj.close()
-                    logger.info(f"🤖🗑️ Closed stream/response for cancelled request {request_id}.")
+                    logger.debug(f"🤖🗑️ Closed stream/response for cancelled request {request_id}.")
                 else:
-                    logger.warning(f"🤖⚠️ [{request_id}] Stream object of type {type(stream_obj)} does not have a callable 'close' method. Cannot explicitly close.")
+                    logger.debug(f"🤖⚠️ [{request_id}] Stream object of type {type(stream_obj)} does not have a callable 'close' method. Cannot explicitly close.")
             except Exception as e:
                 # Log error during close but continue - the request is still removed from tracking
                 logger.error(f"🤖💥 Error closing stream/response for request {request_id}: {e}", exc_info=False)
         else:
-             logger.warning(f"🤖⚠️ [{request_id}] No stream object found in request data to close.")
+             logger.debug(f"🤖⚠️ [{request_id}] No stream object found in request data to close.")
 
         # Log the removal from tracking
-        logger.info(f"🤖🗑️ Removed generation request {request_id} from tracking (close attempted).")
+        logger.debug(f"🤖🗑️ Removed generation request {request_id} from tracking (close attempted).")
         return True # Indicate removal occurred
 
     def _register_request(self, request_id: str, request_type: str, stream_obj: Optional[Any]):
@@ -478,13 +503,13 @@ class LLM:
             ]
 
         if stale_ids:
-            logger.info(f"🤖🧹 Found {len(stale_ids)} potentially stale requests (>{timeout_seconds}s). Cleaning up...")
+            logger.debug(f"🤖🧹 Found {len(stale_ids)} potentially stale requests (>{timeout_seconds}s). Cleaning up...")
             cleaned_count = 0
             for req_id in stale_ids:
                 # cancel_generation handles locking internally and now attempts to close stream
                 if self.cancel_generation(req_id):
                     cleaned_count += 1
-            logger.info(f"🤖🧹 Cleaned up {cleaned_count}/{len(stale_ids)} stale requests (attempted stream close).")
+            logger.debug(f"🤖🧹 Cleaned up {cleaned_count}/{len(stale_ids)} stale requests (attempted stream close).")
             return cleaned_count
         return 0
 
@@ -639,7 +664,7 @@ class LLM:
             raise RuntimeError(f"LLM backend '{self.backend}' client failed to initialize.")
 
         req_id = request_id if request_id else f"{self.backend}-{uuid.uuid4()}"
-        logger.info(f"🤖💬 Starting generation (Request ID: {req_id})")
+        logger.debug(f"🤖💬 Starting generation (Request ID: {req_id})")
 
         messages = []
         if use_system_prompt and self.system_prompt_message:
@@ -652,7 +677,7 @@ class LLM:
             if self.no_think:
                  # This modification logic remains specific for now
                 added_text = f"{text}/nothink" # for qwen 3
-            logger.info(f"🧠💬 llm_module.py generate adding role user to messages, content: {added_text}")
+            logger.debug(f"🧠💬 llm_module.py generate adding role user to messages, content: {added_text}")
             messages.append({"role": "user", "content": added_text})
         logger.debug(f"🤖💬 [{req_id}] Prepared messages count: {len(messages)}")
 
@@ -664,8 +689,7 @@ class LLM:
                 if self.client is None:
                     raise RuntimeError("OpenAI client not initialized (should have been caught by lazy_init).")
                 payload = { "model": self.model, "messages": messages, "stream": True, **kwargs }
-                logger.info(f"🤖💬 [{req_id}] Sending OpenAI request with payload:")
-                logger.info(f"{json.dumps(payload, indent=2)}")
+                logger.debug(f"🤖💬 [{req_id}] Sending OpenAI request")
                 stream_iterator = self.client.chat.completions.create(
                     model=self.model, messages=messages, stream=True, **kwargs
                 )
@@ -679,8 +703,7 @@ class LLM:
                 if 'temperature' not in kwargs:
                     kwargs['temperature'] = 0.7
                 payload = { "model": self.model, "messages": messages, "stream": True, **kwargs }
-                logger.info(f"🤖💬 [{req_id}] Sending LM Studio request with payload:")
-                logger.info(f"{json.dumps(payload, indent=2)}")
+                logger.debug(f"🤖💬 [{req_id}] Sending LM Studio request")
                 stream_iterator = self.client.chat.completions.create(
                     model=self.model, messages=messages, stream=True, **kwargs
                 )
@@ -707,8 +730,7 @@ class LLM:
                     "stream": True,
                     "options": options
                 }
-                logger.info(f"🤖💬 [{req_id}] Sending Ollama request to {ollama_api_url} with payload:")
-                logger.info(f"{json.dumps(payload, indent=2)}")
+                logger.debug(f"🤖💬 [{req_id}] Sending Ollama request to {ollama_api_url}")
                 # Increase read timeout significantly for generation
                 response = self.ollama_session.post(
                     ollama_api_url, json=payload, stream=True, timeout=(10.0, 600.0) # (connect_timeout, read_timeout)
@@ -722,7 +744,7 @@ class LLM:
                 # This case should technically be caught by __init__
                 raise ValueError(f"Backend '{self.backend}' generation logic not implemented.")
 
-            logger.info(f"🤖✅ Finished generating stream successfully (request_id: {req_id})")
+            logger.debug(f"🤖✅ Finished generating stream successfully (request_id: {req_id})")
 
         # Catch specific exceptions first
         except (requests.exceptions.ConnectionError, ConnectionError, APITimeoutError, requests.exceptions.Timeout) as e:

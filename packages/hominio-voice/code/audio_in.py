@@ -5,6 +5,7 @@ from typing import Optional, Callable, Dict, Any
 import numpy as np
 from scipy.signal import resample_poly
 from transcribe import TranscriptionProcessor
+from speech_pipeline_manager import SpeechPipelineManager
 
 # Import memory management for async queues
 from memory_manager import get_resource_tracker
@@ -32,7 +33,7 @@ class AudioInputProcessor:
             pipeline_latency: float = 0.5,
         ) -> None:
         """
-        Initializes the AudioInputProcessor.
+        Initializes the AudioInputProcessor with its own SpeechPipelineManager.
 
         Args:
             language: Target language code for transcription (e.g., "en").
@@ -42,6 +43,16 @@ class AudioInputProcessor:
             pipeline_latency: Estimated latency of the processing pipeline in seconds.
         """
         self.last_partial_text: Optional[str] = None
+        
+        # Create per-user SpeechPipelineManager instance to prevent user interference
+        self.speech_pipeline_manager = SpeechPipelineManager(
+            tts_engine="kokoro",
+            llm_provider="openai", 
+            llm_model="phala/llama-3.3-70b-instruct",
+            no_think=False,
+            orpheus_model="orpheus-3b-0.1-ft-Q8_0-GGUF/orpheus-3b-0.1-ft-q8_0.gguf"
+        )
+        
         self.transcriber = TranscriptionProcessor(
             language,
             on_recording_start_callback=self._on_recording_start,
@@ -51,7 +62,8 @@ class AudioInputProcessor:
         )
         # Flag to indicate if the transcription loop has failed fatally
         self._transcription_failed = False
-        self.transcription_task = asyncio.create_task(self._run_transcription_loop())
+        self.transcription_task = None  # Will be created when needed
+        self._task_started = False
 
 
         self.realtime_callback: Optional[Callable[[str], None]] = None
@@ -66,7 +78,20 @@ class AudioInputProcessor:
         self.dropped_chunks = 0
 
         self._setup_callbacks()
-        logger.info("👂🚀 AudioInputProcessor initialized.")
+        logger.debug(f"👂🚀 AudioInputProcessor initialized with dedicated SpeechPipelineManager")
+
+    def start_transcription_task(self) -> None:
+        """Start the transcription task if not already started."""
+        if not self._task_started and self.transcription_task is None:
+            try:
+                self.transcription_task = asyncio.create_task(self._run_transcription_loop())
+                self._task_started = True
+                logger.debug("👂⚡ Transcription task started.")
+            except RuntimeError as e:
+                if "no running event loop" in str(e):
+                    logger.warning("👂⚠️ No event loop available, transcription task will start when process_chunk_queue is called")
+                else:
+                    raise
 
     def _silence_active_callback(self, is_active: bool) -> None:
         """Internal callback relay for silence detection status."""
@@ -80,7 +105,7 @@ class AudioInputProcessor:
 
     def abort_generation(self) -> None:
         """Signals the underlying transcriber to abort any ongoing generation process."""
-        logger.info("👂🛑 Aborting generation requested.")
+        logger.debug("👂🛑 Aborting generation requested.")
         self.transcriber.abort_generation()
 
     def _setup_callbacks(self) -> None:
@@ -103,8 +128,8 @@ class AudioInputProcessor:
         If `transcribe_loop` raises an Exception, it's treated as a fatal error,
         a flag is set, and this loop terminates. Handles CancelledError separately.
         """
-        task_name = self.transcription_task.get_name() if hasattr(self.transcription_task, 'get_name') else 'TranscriptionTask'
-        logger.info(f"👂▶️ Starting background transcription task ({task_name}).")
+        task_name = asyncio.current_task().get_name() if hasattr(asyncio.current_task(), 'get_name') else 'TranscriptionTask'
+        logger.debug(f"👂▶️ Starting background transcription task ({task_name}).")
         while True: # Loop restored to continuously call transcribe_loop
             try:
                 # Run one cycle of the underlying blocking loop
@@ -172,7 +197,17 @@ class AudioInputProcessor:
             audio_queue: An asyncio queue expected to yield dictionaries containing
                          'pcm' (raw audio bytes) or None to terminate.
         """
-        logger.info("👂▶️ Starting audio chunk processing loop.")
+        logger.debug("👂▶️ Starting audio chunk processing loop.")
+        
+        # Start transcription task if not already started
+        if not self._task_started and self.transcription_task is None:
+            try:
+                self.transcription_task = asyncio.create_task(self._run_transcription_loop())
+                self._task_started = True
+                logger.debug("👂⚡ Transcription task started in process_chunk_queue.")
+            except Exception as e:
+                logger.error(f"👂💥 Failed to start transcription task: {e}")
+                return
         while True:
             try:
                 # Check if the transcription task has permanently failed *before* getting item
@@ -255,6 +290,15 @@ class AudioInputProcessor:
         
         # Untrack resource
         self.resource_tracker.untrack_resource("global", "AudioInputProcessor", f"audio_input_{id(self)}")
+        
+        # Shutdown speech pipeline manager first to prevent user interference
+        if hasattr(self, 'speech_pipeline_manager'):
+            try:
+                logger.info("👂🛑 Shutting down dedicated SpeechPipelineManager...")
+                self.speech_pipeline_manager.shutdown()
+                logger.info("👂✅ SpeechPipelineManager shutdown complete.")
+            except Exception as e:
+                logger.error(f"👂💥 Error shutting down SpeechPipelineManager: {e}")
         
         # Ensure transcriber shutdown is called first to signal the loop
         if hasattr(self.transcriber, 'shutdown'):

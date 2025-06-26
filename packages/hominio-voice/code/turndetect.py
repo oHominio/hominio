@@ -182,6 +182,135 @@ class TurnDetection:
     thread for processing and provides a callback for new waiting time suggestions.
     It also maintains a history of recent texts and uses caching for model predictions.
     """
+    
+    # Class-level shared model and tokenizer to prevent CUDA conflicts
+    _shared_model = None
+    _shared_tokenizer = None
+    _model_loading_lock = threading.Lock()
+    _device = None
+
+    @classmethod
+    def _ensure_model_loaded(cls, local: bool = False):
+        """Ensures the shared model and tokenizer are loaded exactly once."""
+        with cls._model_loading_lock:
+            if cls._shared_model is not None:
+                return  # Already loaded
+            
+            logger.info("🎤🔄 Loading shared turn detection model...")
+            model_dir = model_dir_local if local else model_dir_cloud
+            cls._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            logger.info(f"🎤🔌 Using device: {cls._device}")
+            
+            # Load tokenizer
+            try:
+                cls._shared_tokenizer = transformers.DistilBertTokenizerFast.from_pretrained(
+                    model_dir,
+                    local_files_only=True
+                )
+                logger.info("🎤✅ Shared tokenizer loaded from local files")
+            except Exception as e:
+                logger.info(f"🎤🔄 Local tokenizer loading failed ({e}), trying remote...")
+                cls._shared_tokenizer = transformers.DistilBertTokenizerFast.from_pretrained(model_dir)
+            
+            # Load model with proper CUDA handling
+            def _safe_model_to_device(model, device):
+                """Safely move model to device with proper CUDA error handling."""
+                try:
+                    # Clear CUDA cache before attempting model transfer
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                    
+                    # Force CPU first to avoid CUDA corruption issues
+                    logger.info("🎤🔄 Moving model to CPU first for safe transfer...")
+                    model = model.cpu()
+                    
+                    # Clear cache again after CPU move
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                    
+                    # Now move to target device
+                    logger.info(f"🎤🔄 Moving model to {device}...")
+                    model = model.to(device, non_blocking=False)  # Use blocking transfer for safety
+                    
+                    # Final cache clear and sync
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                    
+                    return model
+                    
+                except Exception as e:
+                    logger.error(f"🎤💥 Device transfer failed: {e}")
+                    # Try to clear CUDA context on error
+                    if torch.cuda.is_available():
+                        try:
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                        except:
+                            pass
+                    raise e
+            
+            try:
+                # Try simple loading first with local_files_only to avoid rate limiting
+                cls._shared_model = transformers.DistilBertForSequenceClassification.from_pretrained(
+                    model_dir,
+                    torch_dtype=torch.float32,
+                    low_cpu_mem_usage=False,
+                    local_files_only=True,  # Try local files first to avoid HF rate limits
+                    trust_remote_code=False
+                )
+                cls._shared_model = _safe_model_to_device(cls._shared_model, cls._device)
+                logger.info("🎤✅ Shared classification model loaded successfully")
+            except Exception as e:
+                logger.error(f"🎤💥 Failed to load shared classification model: {e}")
+                # Try fallback method with different parameters
+                try:
+                    logger.info("🎤🔄 Trying fallback model loading...")
+                    cls._shared_model = transformers.DistilBertForSequenceClassification.from_pretrained(
+                        model_dir,
+                        torch_dtype=torch.float32,
+                        low_cpu_mem_usage=False,
+                        use_safetensors=False,  # Disable safetensors
+                        local_files_only=False,
+                        force_download=False,  # Don't force redownload
+                        resume_download=True   # Resume if partially downloaded
+                    )
+                    cls._shared_model = _safe_model_to_device(cls._shared_model, cls._device)
+                    logger.info("🎤✅ Fallback model loading successful")
+                except Exception as fallback_e:
+                    logger.error(f"🎤💥 Fallback loading also failed: {fallback_e}")
+                    # Final fallback: try without torch_dtype specification
+                    try:
+                        logger.info("🎤🔄 Trying final fallback without torch_dtype...")
+                        cls._shared_model = transformers.DistilBertForSequenceClassification.from_pretrained(
+                            model_dir,
+                            low_cpu_mem_usage=False,
+                            local_files_only=False
+                        )
+                        cls._shared_model = _safe_model_to_device(cls._shared_model, cls._device)
+                        logger.info("🎤✅ Final fallback model loading successful")
+                    except Exception as final_e:
+                        logger.error(f"🎤💥 All model loading attempts failed: {final_e}")
+                        raise final_e
+            
+            cls._shared_model.eval()  # Set model to evaluation mode
+            
+            # Warmup the shared model
+            logger.info("🎤🔥 Warming up the shared classification model...")
+            with torch.no_grad():
+                warmup_text = "This is a warmup sentence."
+                inputs = cls._shared_tokenizer(
+                    warmup_text,
+                    return_tensors="pt",
+                    truncation=True,
+                    padding="max_length",
+                    max_length=128
+                )
+                inputs = {key: value.to(cls._device) for key, value in inputs.items()}
+                _ = cls._shared_model(**inputs)  # Run one prediction
+            logger.info("🎤✅ Shared classification model warmed up.")
 
     def __init__(
         self,
@@ -203,8 +332,9 @@ class TurnDetection:
             pipeline_latency: Estimated base latency of the STT/processing pipeline in seconds.
             pipeline_latency_overhead: Additional buffer added to the pipeline latency.
         """
-        model_dir = model_dir_local if local else model_dir_cloud
-
+        # Ensure shared model is loaded
+        self._ensure_model_loaded(local)
+        
         self.on_new_waiting_time = on_new_waiting_time
 
         self.current_waiting_time: float = -1 # Tracks the last suggested time
@@ -220,12 +350,11 @@ class TurnDetection:
         )
         # Note: Thread starts automatically when created (auto_start=True by default)
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"🎤🔌 Using device: {self.device}")
-        self.tokenizer = transformers.DistilBertTokenizerFast.from_pretrained(model_dir)
-        self.classification_model = transformers.DistilBertForSequenceClassification.from_pretrained(model_dir)
-        self.classification_model.to(self.device)
-        self.classification_model.eval() # Set model to evaluation mode
+        # Use shared model and tokenizer
+        self.device = self._device
+        self.tokenizer = self._shared_tokenizer
+        self.classification_model = self._shared_model
+        
         self.max_length: int = 128 # Max sequence length for the model
         self.pipeline_latency: float = pipeline_latency
         self.pipeline_latency_overhead: float = pipeline_latency_overhead
@@ -233,21 +362,6 @@ class TurnDetection:
         # Initialize completion probability cache with OrderedDict for LRU behavior
         self._completion_probability_cache: collections.OrderedDict[str, float] = collections.OrderedDict()
         self._completion_probability_cache_max_size: int = 256 # Max size for the LRU cache
-
-        # Warmup the classification model for faster initial predictions
-        logger.info("🎤🔥 Warming up the classification model...")
-        with torch.no_grad():
-            warmup_text = "This is a warmup sentence."
-            inputs = self.tokenizer(
-                warmup_text,
-                return_tensors="pt",
-                truncation=True,
-                padding="max_length",
-                max_length=self.max_length
-            )
-            inputs = {key: value.to(self.device) for key, value in inputs.items()}
-            _ = self.classification_model(**inputs) # Run one prediction
-        logger.info("🎤✅ Classification model warmed up.")
 
         # Default dynamic pause settings (initialized for speed_factor=0.0)
         self.detection_speed: float = 0.5
@@ -437,7 +551,7 @@ class TurnDetection:
                 continue
 
             # --- Processing starts when text is received ---
-            logger.info(f"🎤⚙️ Starting pause calculation for: \"{text}\"")
+            logger.debug(f"🎤⚙️ Starting pause calculation for: \"{text}\"")
             
             processed_text = preprocess_text(text) # Apply initial cleaning
 
@@ -493,13 +607,13 @@ class TurnDetection:
             if contains_ellipses:
                 final_pause += 0.2
 
-            logger.info(f"🎤📊 Calculated pauses: Punct={whisper_suggested_pause:.2f}, Model={sentence_finished_model_pause:.2f}, Weighted={weighted_pause:.2f}, Final={final_pause:.2f} for \"{processed_text}\" (Prob={prob_complete:.2f})")
+            logger.debug(f"🎤📊 Calculated pauses: Punct={whisper_suggested_pause:.2f}, Model={sentence_finished_model_pause:.2f}, Weighted={weighted_pause:.2f}, Final={final_pause:.2f} for \"{processed_text}\" (Prob={prob_complete:.2f})")
 
 
             # Ensure final pause is not less than the pipeline latency overhead
             min_pause = self.pipeline_latency + self.pipeline_latency_overhead
             if final_pause < min_pause:
-                logger.info(f"🎤⚠️ Final pause ({final_pause:.2f}s) is less than minimum ({min_pause:.2f}s). Using minimum.")
+                logger.debug(f"🎤⚠️ Final pause ({final_pause:.2f}s) is less than minimum ({min_pause:.2f}s). Using minimum.")
                 final_pause = min_pause
             
             # Suggest the calculated time via callback
@@ -520,7 +634,7 @@ class TurnDetection:
         Args:
             text: The text segment (e.g., from STT) to be processed.
         """
-        logger.info(f"🎤📥 Queuing text for pause calculation: \"{text}\"")
+        logger.debug(f"🎤📥 Queuing text for pause calculation: \"{text}\"")
         self.text_queue.put(text)
 
     def reset(self) -> None:
