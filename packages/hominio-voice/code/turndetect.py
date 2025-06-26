@@ -645,7 +645,7 @@ class TurnDetection:
         current waiting time tracker. Useful for starting a new conversation or
         interaction context.
         """
-        logger.info("🎤🔄 Resetting TurnDetection state.")
+        logger.debug(f"🎤🔄 Resetting TurnDetection state.")
         # Clear the history deques
         self.text_time_deque.clear()
         self.texts_without_punctuation.clear()

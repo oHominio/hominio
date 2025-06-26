@@ -87,3 +87,18 @@ def setup_logging(level: int = logging.INFO) -> None:
 
         # 5. Add the configured handler to the root logger
         root_logger.addHandler(handler)
+
+        # Configure third-party library loggers to reduce noise
+        logging.getLogger("faster_whisper").setLevel(logging.WARNING)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("uvicorn").setLevel(logging.WARNING)
+        logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+        
+        # Reduce TTS library verbosity
+        logging.getLogger("RealtimeTTS").setLevel(logging.WARNING)
+        logging.getLogger("").setLevel(logging.WARNING)  # Root logger for libraries that use it
+        
+        # Reduce other common noisy libraries
+        logging.getLogger("PIL").setLevel(logging.WARNING)
+        logging.getLogger("matplotlib").setLevel(logging.WARNING)
+        logging.getLogger("numba").setLevel(logging.WARNING)

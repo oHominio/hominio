@@ -77,42 +77,61 @@ from colors import Colors
 
 # Connection rate limiting to prevent cascade failures during load testing
 _CONNECTION_LIMITER = {
-    'connections': {},  # Track recent connections by IP
-    'max_connections_per_ip': 10,  # Max concurrent connections per IP
-    'connection_window': 60.0,  # Time window in seconds
+    'active_connections': {},  # Track active connections by IP -> set of session_ids
+    'connection_times': {},   # Track connection start times by IP for fallback cleanup
+    'max_connections_per_ip': 50,  # Increased for load testing
+    'connection_window': 300.0,  # Extended window for cleanup
 }
 
-def check_connection_rate_limit(client_host: str) -> bool:
+def check_connection_rate_limit(client_host: str, session_id: str = None) -> bool:
     """
     Check if the client IP has exceeded connection rate limits.
     
     Args:
         client_host: Client IP address
+        session_id: Optional session ID to track this specific connection
         
     Returns:
         True if connection is allowed, False if rate limited
     """
     current_time = time.time()
     
-    if client_host not in _CONNECTION_LIMITER['connections']:
-        _CONNECTION_LIMITER['connections'][client_host] = []
+    # Initialize tracking for this IP if needed
+    if client_host not in _CONNECTION_LIMITER['active_connections']:
+        _CONNECTION_LIMITER['active_connections'][client_host] = set()
+        _CONNECTION_LIMITER['connection_times'][client_host] = []
     
-    # Clean old connections outside the window
-    connections = _CONNECTION_LIMITER['connections'][client_host]
+    # Clean old connection times outside the window (fallback cleanup)
+    connections = _CONNECTION_LIMITER['connection_times'][client_host]
     cutoff_time = current_time - _CONNECTION_LIMITER['connection_window']
-    _CONNECTION_LIMITER['connections'][client_host] = [
+    _CONNECTION_LIMITER['connection_times'][client_host] = [
         conn_time for conn_time in connections if conn_time > cutoff_time
     ]
     
-    # Check if under limit
-    current_connections = len(_CONNECTION_LIMITER['connections'][client_host])
-    if current_connections >= _CONNECTION_LIMITER['max_connections_per_ip']:
-        logger.warning(f"🖥️⚠️ Rate limit exceeded for IP {client_host}: {current_connections} connections")
+    # Check active connections count
+    active_count = len(_CONNECTION_LIMITER['active_connections'][client_host])
+    if active_count >= _CONNECTION_LIMITER['max_connections_per_ip']:
+        logger.warning(f"🖥️⚠️ Rate limit exceeded for IP {client_host}: {active_count} active connections")
         return False
     
     # Add current connection
-    _CONNECTION_LIMITER['connections'][client_host].append(current_time)
+    if session_id:
+        _CONNECTION_LIMITER['active_connections'][client_host].add(session_id)
+    _CONNECTION_LIMITER['connection_times'][client_host].append(current_time)
     return True
+
+def remove_connection_from_rate_limiter(client_host: str, session_id: str):
+    """
+    Remove a connection from the rate limiter when it ends.
+    
+    Args:
+        client_host: Client IP address
+        session_id: Session ID to remove
+    """
+    if (client_host in _CONNECTION_LIMITER['active_connections'] and 
+        session_id in _CONNECTION_LIMITER['active_connections'][client_host]):
+        _CONNECTION_LIMITER['active_connections'][client_host].discard(session_id)
+        logger.debug(f"🖥️🧹 Removed connection {session_id[:8]} from rate limiter for {client_host}")
 
 LANGUAGE = "en"
 # TTS_FINAL_TIMEOUT = 0.5 # unsure if 1.0 is needed for stability
@@ -520,20 +539,56 @@ async def process_incoming_data(ws: WebSocket, app: FastAPI, incoming_chunks: as
                 msg_type = data.get("type")
                 # Only log important incoming messages, skip partial requests to reduce noise
                 if msg_type not in ("partial_user_request", "get_system_stats"):
-                    logger.info(Colors.apply(f"🖥️📥 ←←Client: {data}").orange)
+                    logger.debug(Colors.apply(f"🖥️📥 ←←Client: {data}").orange)
 
 
                 if msg_type == "tts_start":
-                    logger.info("🖥️ℹ️ Received tts_start from client.")
+                    logger.debug("🖥️ℹ️ Received tts_start from client.")
                     # Update connection-specific state via callbacks
                     callbacks.tts_client_playing = True
                 elif msg_type == "tts_stop":
-                    logger.info("🖥️ℹ️ Received tts_stop from client.")
+                    logger.debug("🖥️ℹ️ Received tts_stop from client.")
                     # Update connection-specific state via callbacks
                     callbacks.tts_client_playing = False
-                # Add to the handleJSONMessage function in server.py
+                elif msg_type == "get_system_stats":
+                    # Send current system stats to client
+                    if hasattr(app.state, 'SystemMonitor') and app.state.SystemMonitor:
+                        try:
+                            await app.state.SystemMonitor.get_stats()
+                            stats_dict = app.state.SystemMonitor.to_dict()
+                            callbacks.message_queue.put_nowait({
+                                "type": "system_stats",
+                                "content": stats_dict
+                            })
+                        except Exception as e:
+                            logger.error(f"🖥️💥 Error getting system stats: {e}")
+                            callbacks.message_queue.put_nowait({
+                                "type": "system_stats",
+                                "content": {"error": str(e)}
+                            })
+                    else:
+                        logger.warning("🖥️⚠️ SystemMonitor not available")
+                        callbacks.message_queue.put_nowait({
+                            "type": "system_stats", 
+                            "content": {"error": "System monitor not available"}
+                        })
+                
+                elif msg_type == "get_queue_status":
+                    # Send queue status for this session
+                    queue_position = app.state.AudioInputProcessorPool.get_queue_position(session_id)
+                    pool_status = app.state.AudioInputProcessorPool.get_pool_status()
+                    
+                    callbacks.message_queue.put_nowait({
+                        "type": "queue_status",
+                        "content": {
+                            "queue_position": queue_position,
+                            "pool_status": pool_status,
+                            "has_processor": callbacks.audio_processor is not None
+                        }
+                    })
+                
                 elif msg_type == "clear_history":
-                    logger.info("🖥️ℹ️ Received clear_history from client.")
+                    logger.debug("🖥️ℹ️ Received clear_history from client.")
                     # Use per-user speech pipeline manager instead of global
                     if callbacks.audio_processor and hasattr(callbacks.audio_processor, 'speech_pipeline_manager'):
                         callbacks.audio_processor.speech_pipeline_manager.reset()
@@ -577,7 +632,7 @@ async def send_text_messages(ws: WebSocket, message_queue: asyncio.Queue) -> Non
             msg_type = data.get("type")
             # Only log important messages, skip noisy partial messages and stats to reduce noise
             if msg_type not in ("tts_chunk", "session_stats", "partial_assistant_answer", "partial_user_request"):
-                logger.info(Colors.apply(f"🖥️📤 →→Client: {data}").orange)
+                logger.debug(Colors.apply(f"🖥️📤 →→Client: {data}").orange)
             await ws.send_json(data)
     except asyncio.CancelledError:
         pass # Task cancellation is expected on disconnect
@@ -587,6 +642,41 @@ async def send_text_messages(ws: WebSocket, message_queue: asyncio.Queue) -> Non
         logger.error(f"🖥️💥 {Colors.apply('RUNTIME_ERROR').red} in send_text_messages: {repr(e)}")
     except Exception as e:
         logger.exception(f"🖥️💥 {Colors.apply('EXCEPTION').red} in send_text_messages: {repr(e)}")
+
+async def handle_audio_processing(audio_chunks: asyncio.Queue, callbacks: 'TranscriptionCallbacks') -> None:
+    """
+    Handles audio processing, waiting for processor allocation if needed.
+    
+    This function will wait until an AudioInputProcessor is allocated to the session
+    (either immediately or from the queue) and then start processing audio chunks.
+    """
+    logger.debug("🖥️🎧 Starting audio processing handler")
+    
+    # Wait for processor allocation
+    max_wait_time = 300  # 5 minutes maximum wait
+    check_interval = 0.1  # Check every 100ms
+    elapsed_time = 0
+    
+    while callbacks.audio_processor is None and elapsed_time < max_wait_time:
+        await asyncio.sleep(check_interval)
+        elapsed_time += check_interval
+    
+    if callbacks.audio_processor is None:
+        logger.error("🖥️💥 Timeout waiting for audio processor allocation")
+        return
+    
+    logger.info("🖥️🎧 Audio processor allocated, starting audio processing")
+    
+    try:
+        # Start audio processing with the allocated processor
+        await callbacks.audio_processor.process_chunk_queue(audio_chunks)
+    except asyncio.CancelledError:
+        logger.info("🖥️🎧 Audio processing cancelled")
+        pass
+    except Exception as e:
+        logger.error(f"🖥️💥 Error in audio processing: {e}", exc_info=True)
+    finally:
+        logger.info("🖥️🎧 Audio processing handler finished")
 
 async def _reset_interrupt_flag_async(app: FastAPI, callbacks: 'TranscriptionCallbacks'):
     """
@@ -603,11 +693,11 @@ async def _reset_interrupt_flag_async(app: FastAPI, callbacks: 'TranscriptionCal
     await asyncio.sleep(1)
     # Check the session-specific AudioInputProcessor's interrupted state
     if callbacks.audio_processor and callbacks.audio_processor.interrupted:
-        logger.info(f"{Colors.apply('🖥️🎙️ ▶️ Microphone continued (async reset)').cyan}")
+        logger.debug(f"{Colors.apply('🖥️🎙️ ▶️ Microphone continued (async reset)').cyan}")
         callbacks.audio_processor.interrupted = False
         # Reset connection-specific interruption time via callbacks
         callbacks.interruption_time = 0
-        logger.info(Colors.apply("🖥️🎙️ interruption flag reset after TTS chunk (async)").cyan)
+        logger.debug(Colors.apply("🖥️🎙️ interruption flag reset after TTS chunk (async)").cyan)
 
 async def send_tts_chunks(app: FastAPI, message_queue: asyncio.Queue, callbacks: 'TranscriptionCallbacks') -> None:
     """
@@ -757,58 +847,28 @@ async def send_tts_chunks(app: FastAPI, message_queue: asyncio.Queue, callbacks:
 # Callback class to handle transcription events
 # --------------------------------------------------------------------
 class TranscriptionCallbacks:
-    """
-    Manages state and callbacks for a single WebSocket connection's transcription lifecycle.
-
-    This class holds connection-specific state flags (like TTS status, user interruption)
-    and implements callback methods triggered by the `AudioInputProcessor` and
-    `SpeechPipelineManager`. It sends messages back to the client via the provided
-    `message_queue` and manages interaction logic like interruptions and final answer delivery.
-    It also includes a threaded worker to handle abort checks based on partial transcription.
-    """
     def __init__(self, app: FastAPI, message_queue: asyncio.Queue, session_id: str):
-        """
-        Initializes the TranscriptionCallbacks instance for a WebSocket connection.
-
-        Args:
-            app: The FastAPI application instance (to access global components).
-            message_queue: An asyncio queue for sending messages back to the client.
-            session_id: Unique identifier for this session.
-        """
         self.app = app
         self.message_queue = message_queue
         self.session_id = session_id
-        self.audio_processor: Optional[AudioInputProcessor] = None  # Session-specific processor
+        self.tts_client_playing = False
+        self.tts_to_client = False
+        self.tts_chunk_sent = False
+        self.is_hot = False
+        self.synthesis_started = False
+        self.audio_processor = None
+        
+        # Additional attributes that were missing
+        self.final_assistant_answer_sent = False
         self.final_transcription = ""
+        self.partial_transcription = ""
         self.abort_text = ""
-        self.last_abort_text = ""
-
-        # Initialize connection-specific state flags here
-        self.tts_to_client: bool = False
-        self.user_interrupted: bool = False
-        self.tts_chunk_sent: bool = False
-        self.tts_client_playing: bool = False
-        self.interruption_time: float = 0.0
-
-        # These were already effectively instance variables or reset logic existed
-        self.silence_active: bool = True
-        self.is_hot: bool = False
-        self.user_finished_turn: bool = False
-        self.synthesis_started: bool = False
-        self.assistant_answer: str = ""
-        self.final_assistant_answer: str = ""
-        self.is_processing_potential: bool = False
-        self.is_processing_final: bool = False
-        self.last_inferred_transcription: str = ""
-        self.final_assistant_answer_sent: bool = False
-        self.partial_transcription: str = "" # Added for clarity
-
-        self.reset_state() # Call reset to ensure consistency
-
         self.abort_request_event = threading.Event()
-        self.abort_worker_thread = create_managed_thread(target=self._abort_worker, name="AbortWorker", daemon=True)
-        # Note: Thread starts automatically when created (auto_start=True by default)
-
+        self.user_finished_turn = False
+        self.user_interrupted = False
+        self.interruption_time = 0
+        self.assistant_answer = ""
+        self.silence_active = False
 
     def reset_state(self):
         """Resets connection-specific state flags and variables to their initial values."""
@@ -825,34 +885,16 @@ class TranscriptionCallbacks:
         self.user_finished_turn = False
         self.synthesis_started = False
         self.assistant_answer = ""
-        self.final_assistant_answer = ""
-        self.is_processing_potential = False
-        self.is_processing_final = False
-        self.last_inferred_transcription = ""
         self.final_assistant_answer_sent = False
         self.partial_transcription = ""
+        self.final_transcription = ""
 
-        # Keep the abort call related to the audio processor/pipeline manager
-        if self.audio_processor:
-            self.audio_processor.abort_generation()
-
-
-    def _abort_worker(self):
-        """Background thread worker to check for abort conditions based on partial text."""
-        while True:
-            was_set = self.abort_request_event.wait(timeout=0.1) # Check every 100ms
-            if was_set:
-                self.abort_request_event.clear()
-                # Only trigger abort check if the text actually changed
-                if self.last_abort_text != self.abort_text:
-                    self.last_abort_text = self.abort_text
-                    logger.debug(f"🖥️🧠 Abort check triggered by partial: '{self.abort_text}'")
-                    # Use per-user speech pipeline manager instead of global
-                    if self.audio_processor and hasattr(self.audio_processor, 'speech_pipeline_manager'):
-                        self.audio_processor.speech_pipeline_manager.check_abort(self.abort_text, False, "on_partial")
-                    else:
-                        # Fallback to global manager if per-user not available yet
-                        self.app.state.SpeechPipelineManager.check_abort(self.abort_text, False, "on_partial")
+        # Abort generation using the session-specific speech pipeline manager
+        if self.audio_processor and hasattr(self.audio_processor, 'speech_pipeline_manager'):
+            self.audio_processor.speech_pipeline_manager.abort_generation(reason="reset_state")
+        else:
+            # Fallback to global manager if per-user not available yet
+            self.app.state.SpeechPipelineManager.abort_generation(reason="reset_state")
 
     def on_partial(self, txt: str):
         """
@@ -1001,7 +1043,12 @@ class TranscriptionCallbacks:
              self.final_transcription = txt
         
         # Trigger immediate GPU stats update after STT processing
-        asyncio.create_task(self.app.state.SystemMonitor.trigger_immediate_update("STT completed"))
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.app.state.SystemMonitor.trigger_immediate_update("STT completed"))
+        except RuntimeError:
+            # No running event loop, skip the update
+            logger.debug("No running event loop, skipping immediate stats update")
         
         # Update session state - user finished speaking
         session_state = self.app.state.SessionManager.get_session_state(self.session_id)
@@ -1048,7 +1095,8 @@ class TranscriptionCallbacks:
         Args:
             txt: The partial assistant text.
         """
-        # logger.info(f"{Colors.apply('🖥️💬 PARTIAL ASSISTANT ANSWER: ').green}{txt}")
+        # Remove partial assistant answer log noise - already handled by final answer
+        # logger.debug(f"{Colors.apply('🖥️💬 PARTIAL ASSISTANT ANSWER: ').green}{txt}")
         # Use connection-specific user_interrupted flag
         if not self.user_interrupted:
             self.assistant_answer = txt
@@ -1190,18 +1238,20 @@ async def websocket_endpoint(ws: WebSocket):
     Args:
         ws: The WebSocket connection instance provided by FastAPI.
     """
+    # Create session first to get session_id for rate limiting
+    session_id = app.state.SessionManager.create_session(ws)
+    
     # Rate limiting check before accepting connection
     client_host = ws.client.host if ws.client else "unknown"
-    if not check_connection_rate_limit(client_host):
+    if not check_connection_rate_limit(client_host, session_id):
         logger.warning(f"🖥️🚫 Connection from {client_host} rate limited")
         await ws.close(code=1008, reason="Rate limit exceeded")
+        # Clean up session since we're rejecting the connection
+        await app.state.SessionManager.remove_session(session_id)
         return
     
     await ws.accept()
     logger.info(f"🖥️✅ Client connected via WebSocket from {client_host}")
-
-    # Create session
-    session_id = app.state.SessionManager.create_session(ws)
     
     try:
         message_queue = asyncio.Queue()
@@ -1231,42 +1281,28 @@ async def websocket_endpoint(ws: WebSocket):
             app.state.SystemStatsStreamer.add_client(ws)
             logger.info("🖥️📊 Client registered for system stats updates")
 
-        # Allocate dedicated AudioInputProcessor instance for this session
-        audio_processor = app.state.AudioInputProcessorPool.allocate_instance(session_id)
-        if not audio_processor:
-            logger.error(f"🖥️💥 Failed to allocate AudioInputProcessor for session {session_id[:8]}")
-            await ws.close(code=1013, reason="Server overloaded - no available processors")
+        # Allocate AudioInputProcessor with queue support
+        allocation_result = await allocate_audio_processor(app, session_id, callbacks)
+        
+        if allocation_result is None:
+            logger.error(f"🖥️💥 WebSocket session {session_id[:8]} closing due to allocation failure.")
+            # The session will be cleaned up in the finally block
             return
-        
-        # Store the allocated instance in session components and callbacks
-        app.state.SessionManager.set_session_component(session_id, "audio_processor", audio_processor)
-        callbacks.audio_processor = audio_processor  # Store reference in callbacks
-        
-        # Assign callbacks to the session-specific AudioInputProcessor
-        audio_processor.realtime_callback = callbacks.on_partial
-        audio_processor.transcriber.potential_sentence_end = callbacks.on_potential_sentence
-        audio_processor.transcriber.on_tts_allowed_to_synthesize = callbacks.on_tts_allowed_to_synthesize
-        audio_processor.transcriber.potential_full_transcription_callback = callbacks.on_potential_final
-        audio_processor.transcriber.potential_full_transcription_abort_callback = callbacks.on_potential_abort
-        audio_processor.transcriber.full_transcription_callback = callbacks.on_final
-        audio_processor.transcriber.before_final_sentence = callbacks.on_before_final
-        audio_processor.recording_start_callback = callbacks.on_recording_start
-        audio_processor.silence_active_callback = callbacks.on_silence_active
 
-        # Assign callback to the per-user SpeechPipelineManager instead of global
-        if callbacks.audio_processor and hasattr(callbacks.audio_processor, 'speech_pipeline_manager'):
-            callbacks.audio_processor.speech_pipeline_manager.on_partial_assistant_text = callbacks.on_partial_assistant_text
-        else:
-            # Fallback to global manager if per-user not available yet
-            app.state.SpeechPipelineManager.on_partial_assistant_text = callbacks.on_partial_assistant_text
+        if not allocation_result:
+            # Session was queued, client will be notified via WebSocket
+            logger.info(f"🖥️⏳ Session {session_id[:8]} queued for processor allocation")
+        
+        # Continue with WebSocket handling regardless of immediate allocation
+        # The processor will be assigned when available
 
         # Create tasks for handling different responsibilities
         # Pass the 'callbacks' instance to tasks that need connection-specific state
         tasks = [
             asyncio.create_task(process_incoming_data(ws, app, audio_chunks, callbacks, session_id)), # Pass session_id
-            asyncio.create_task(audio_processor.process_chunk_queue(audio_chunks)),  # Use session-specific processor
             asyncio.create_task(send_text_messages(ws, message_queue)),
             asyncio.create_task(send_tts_chunks(app, message_queue, callbacks)), # Pass callbacks
+            asyncio.create_task(handle_audio_processing(audio_chunks, callbacks)), # Handle audio processing with processor allocation waiting
         ]
 
         try:
@@ -1280,27 +1316,32 @@ async def websocket_endpoint(ws: WebSocket):
         except Exception as e:
             logger.error(f"🖥️💥 {Colors.apply('ERROR').red} in WebSocket session {session_id[:8]}: {repr(e)}")
         finally:
+            # Clean up WebSocket-specific resources
             logger.info(f"🖥️🧹 Cleaning up WebSocket tasks for session {session_id[:8]}...")
             
-            # Unregister from system stats updates
+            # Remove from allocation queue if present
+            app.state.AudioInputProcessorPool.remove_from_queue(session_id)
+            
+            # Unregister system stats client
             if hasattr(app.state, 'SystemStatsStreamer') and app.state.SystemStatsStreamer:
                 app.state.SystemStatsStreamer.remove_client(ws)
                 logger.info("🖥️📊 Client unregistered from system stats updates")
             
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            # Ensure all tasks are awaited after cancellation
-            # Use return_exceptions=True to prevent gather from stopping on first error during cleanup
-            await asyncio.gather(*tasks, return_exceptions=True)
+            # Return AudioInputProcessor to pool if allocated
+            if callbacks.audio_processor:
+                app.state.AudioInputProcessorPool.return_instance(session_id)
+            
+            # Remove from rate limiter
+            remove_connection_from_rate_limiter(client_host, session_id)
+            
+            # Clean up session from SessionManager
+            await app.state.SessionManager.remove_session(session_id)
+            
             logger.info(f"🖥️❌ WebSocket session {session_id[:8]} ended.")
     
     finally:
-        # Return AudioInputProcessor instance to pool before session cleanup
-        app.state.AudioInputProcessorPool.return_instance(session_id)
-        
-        # Always clean up session, even if errors occurred
-        app.state.SessionManager.remove_session(session_id)
+        # This block should be removed as it's redundant
+        pass
 
 # --------------------------------------------------------------------
 # Entry point
@@ -1336,3 +1377,94 @@ if __name__ == "__main__":
             ssl_certfile=cert_file,
             ssl_keyfile=key_file,
         )
+
+async def setup_processor_callbacks(app: FastAPI, session_id: str, callbacks: TranscriptionCallbacks, audio_processor) -> None:
+    """Set up all callbacks for an allocated AudioInputProcessor."""
+    # Store the allocated instance in session components
+    app.state.SessionManager.set_session_component(session_id, "audio_processor", audio_processor)
+    
+    # Assign callbacks to the session-specific AudioInputProcessor
+    audio_processor.realtime_callback = callbacks.on_partial
+    audio_processor.transcriber.potential_sentence_end = callbacks.on_potential_sentence
+    audio_processor.transcriber.on_tts_allowed_to_synthesize = callbacks.on_tts_allowed_to_synthesize
+    audio_processor.transcriber.potential_full_transcription_callback = callbacks.on_potential_final
+    audio_processor.transcriber.potential_full_transcription_abort_callback = callbacks.on_potential_abort
+    audio_processor.transcriber.full_transcription_callback = callbacks.on_final
+    audio_processor.transcriber.before_final_sentence = callbacks.on_before_final
+    audio_processor.recording_start_callback = callbacks.on_recording_start
+    audio_processor.silence_active_callback = callbacks.on_silence_active
+
+    # Assign callback to the per-user SpeechPipelineManager
+    if hasattr(audio_processor, 'speech_pipeline_manager'):
+        audio_processor.speech_pipeline_manager.on_partial_assistant_text = callbacks.on_partial_assistant_text
+    else:
+        # Fallback to global manager if per-user not available yet
+        app.state.SpeechPipelineManager.on_partial_assistant_text = callbacks.on_partial_assistant_text
+
+async def allocate_audio_processor(app: FastAPI, session_id: str, callbacks: TranscriptionCallbacks) -> bool | None:
+    """
+    Allocate an AudioInputProcessor for the session with queue support.
+    
+    Returns True if immediately allocated, False if queued, None if failed.
+    """
+    try:
+        # Try to allocate immediately
+        allocated_instance = app.state.AudioInputProcessorPool.allocate_instance(session_id)
+        
+        if allocated_instance:
+            # Immediate allocation successful
+            callbacks.audio_processor = allocated_instance
+            logger.info(f"🖥️🏊‍♂️ Allocated audio processor for session {session_id[:8]}")
+            
+            # Set up callbacks for the allocated processor
+            await setup_processor_callbacks(app, session_id, callbacks, allocated_instance)
+
+            # Notify client that processor is now available
+            await callbacks.message_queue.put({
+                "type": "processor_allocated",
+                "content": {"status": "allocated", "queue_position": None}
+            })
+
+            return True
+        else:
+            # Added to queue, register for notification
+            queue_position = app.state.AudioInputProcessorPool.get_queue_position(session_id)
+            
+            # Register callback for when instance becomes available
+            async def on_instance_available(instance):
+                callbacks.audio_processor = instance
+                logger.info(f"🖥️🏊‍♂️ Queued session {session_id[:8]} now has audio processor")
+                
+                # Set up callbacks for the allocated processor
+                await setup_processor_callbacks(app, session_id, callbacks, instance)
+                
+                # Notify client that processor is now available
+                await callbacks.message_queue.put({
+                    "type": "processor_allocated", 
+                    "content": {"status": "allocated", "queue_position": None}
+                })
+            
+            app.state.AudioInputProcessorPool.register_queue_notification(session_id, on_instance_available)
+            
+            # Send queue status to client
+            await callbacks.message_queue.put({
+                "type": "processor_queued",
+                "content": {
+                    "status": "queued", 
+                    "queue_position": queue_position,
+                    "estimated_wait": queue_position * 30 if queue_position else None  # Rough estimate
+                }
+            })
+            
+            logger.info(f"🖥️🏊‍♂️ Session {session_id[:8]} queued at position {queue_position}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"🖥️💥 Failed to allocate audio processor for session {session_id[:8]}: {e}", exc_info=True)
+        
+        # Send allocation failure
+        await callbacks.message_queue.put({
+            "type": "processor_failed",
+            "content": {"status": "failed", "error": str(e)}
+        })
+        return None

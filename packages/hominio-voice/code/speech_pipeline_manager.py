@@ -209,32 +209,28 @@ class SpeechPipelineManager:
         self.resource_tracker = get_resource_tracker()
         
         # Create managed threads with proper lifecycle management
-        self.request_processing_thread = create_managed_thread(
-            target=self._request_processing_worker, 
-            name="RequestProcessingThread",
-            shutdown_event=self.shutdown_event,
-            cleanup_callback=lambda: logger.info("🗣️🧹 Request processor thread cleaned up")
+        self.request_processor = create_managed_thread(
+            target=self._process_request_queue,
+            name="RequestProcessor",
+            cleanup_callback=lambda: logger.debug("🗣️🧹 Request processor thread cleaned up")
         )
         
-        self.llm_inference_thread = create_managed_thread(
-            target=self._llm_inference_worker, 
-            name="LLMProcessingThread",
-            shutdown_event=self.shutdown_event,
-            cleanup_callback=lambda: logger.info("🗣️🧹 LLM worker thread cleaned up")
+        self.llm_worker = create_managed_thread(
+            target=self._llm_worker_loop,
+            name="LLMWorker",
+            cleanup_callback=lambda: logger.debug("🗣️🧹 LLM worker thread cleaned up")
         )
         
-        self.tts_quick_inference_thread = create_managed_thread(
-            target=self._tts_quick_inference_worker, 
-            name="TTSQuickProcessingThread",
-            shutdown_event=self.shutdown_event,
-            cleanup_callback=lambda: logger.info("🗣️🧹 TTS Quick worker thread cleaned up")
+        self.tts_quick_worker = create_managed_thread(
+            target=self._tts_quick_worker_loop,
+            name="TTSQuickWorker",
+            cleanup_callback=lambda: logger.debug("🗣️🧹 TTS Quick worker thread cleaned up")
         )
         
-        self.tts_final_inference_thread = create_managed_thread(
-            target=self._tts_final_inference_worker, 
-            name="TTSFinalProcessingThread",
-            shutdown_event=self.shutdown_event,
-            cleanup_callback=lambda: logger.info("🗣️🧹 TTS Final worker thread cleaned up")
+        self.tts_final_worker = create_managed_thread(
+            target=self._tts_final_worker_loop,
+            name="TTSFinalWorker",
+            cleanup_callback=lambda: logger.debug("🗣️🧹 TTS Final worker thread cleaned up")
         )
         
         # Start memory monitoring
@@ -288,7 +284,7 @@ class SpeechPipelineManager:
         """
         return self.running_generation is not None and not self.running_generation.abortion_started
 
-    def _request_processing_worker(self):
+    def _process_request_queue(self):
         """
         Worker thread target that processes requests from the `requests_queue`.
 
@@ -343,7 +339,7 @@ class SpeechPipelineManager:
         Sets the `quick_answer_first_chunk_ready` flag on the current `running_generation`
         if one exists. This flag might be used for fine-grained timing or state checks.
         """
-        logger.info("🗣️🎶 First audio chunk synthesized. Setting TTS quick allowed event.")
+        logger.debug("🗣️🎶 First audio chunk synthesized. Setting TTS quick allowed event.")
         if self.running_generation:
             self.running_generation.quick_answer_first_chunk_ready = True
 
@@ -360,7 +356,7 @@ class SpeechPipelineManager:
         Returns:
             The preprocessed text chunk.
         """
-        return chunk.replace("—", "-").replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'").replace("…", "...")
+        return chunk.replace("—", "-").replace(""", '"').replace(""", '"').replace("'", "'").replace("'", "'").replace("...", "...")
 
     def clean_quick_answer(self, text: str) -> str:
         """
@@ -389,7 +385,7 @@ class SpeechPipelineManager:
         
         return current_text
 
-    def _llm_inference_worker(self):
+    def _llm_worker_loop(self):
         """
         Worker thread target that handles LLM inference for a generation.
 
@@ -593,7 +589,7 @@ class SpeechPipelineManager:
                 logger.debug("🗣️🛑🤷 No active generation found during abort check.")
                 return False # No active generation to abort
 
-    def _tts_quick_inference_worker(self):
+    def _tts_quick_worker_loop(self):
         """
         Worker thread target that handles TTS synthesis for the 'quick answer'.
 
@@ -667,7 +663,7 @@ class SpeechPipelineManager:
                      logger.info(f"🗣️👄❌ [Gen {gen_id}] Quick TTS Worker: Aborting TTS synthesis due to stop request or abortion flag.")
                      current_gen.audio_quick_aborted = True
                 else:
-                    logger.info(f"🗣️👄🎶 [Gen {gen_id}] Quick TTS Worker: Synthesizing: '{current_gen.quick_answer[:50]}...'")
+                    logger.debug(f"🗣️👄🎶 [Gen {gen_id}] Quick TTS Worker: Synthesizing: '{current_gen.quick_answer[:50]}...'.")
                     completed = self.audio.synthesize(
                         current_gen.quick_answer,
                         current_gen.audio_chunks,
@@ -702,7 +698,7 @@ class SpeechPipelineManager:
 
                 current_gen.audio_quick_finished = True # Mark quick audio phase as done (even if aborted)
 
-    def _tts_final_inference_worker(self):
+    def _tts_final_worker_loop(self):
         """
         Worker thread target that handles TTS synthesis for the 'final' part of the answer.
 
@@ -793,7 +789,7 @@ class SpeechPipelineManager:
             current_gen.tts_final_finished_event.clear() # Reset TTS finish marker
 
             try:
-                logger.info(f"🗣️👄🎶 [Gen {gen_id}] Final TTS Worker: Synthesizing remaining text...")
+                logger.debug(f"🗣️👄🎶 [Gen {gen_id}] Final TTS Worker: Synthesizing remaining text...")
                 completed = self.audio.synthesize_generator(
                     get_generator(),
                     current_gen.audio_chunks,
@@ -1151,10 +1147,10 @@ class SpeechPipelineManager:
         # Use ManagedThread system for proper cleanup
         logger.info("🗣️🔌🧹 Stopping managed threads...")
         managed_threads = [
-            (self.request_processing_thread, "Request Processor"),
-            (self.llm_inference_thread, "LLM Worker"),
-            (self.tts_quick_inference_thread, "Quick TTS Worker"),
-            (self.tts_final_inference_thread, "Final TTS Worker"),
+            (self.request_processor, "Request Processor"),
+            (self.llm_worker, "LLM Worker"),
+            (self.tts_quick_worker, "Quick TTS Worker"),
+            (self.tts_final_worker, "Final TTS Worker"),
         ]
 
         # Stop all managed threads gracefully

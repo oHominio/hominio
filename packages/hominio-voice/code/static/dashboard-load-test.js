@@ -10,6 +10,9 @@ class VoiceChatLoadTester {
       totalMessages: 0,
       totalAudioChunks: 0,
       latencies: [],
+      queuedUsers: 0,
+      allocatedUsers: 0,
+      failedAllocations: 0,
     };
 
     // Pre-recorded audio prompts using your existing MP3 files
@@ -190,27 +193,40 @@ class VoiceChatLoadTester {
     }
 
     this.testUsers.clear();
+
+    // Reset all stats
     this.stats.activeUsers = 0;
+    this.stats.queuedUsers = 0;
+    this.stats.allocatedUsers = 0;
+    this.stats.failedAllocations = 0;
+
     this.updateStats();
     this.updateUserList();
 
-    // Update UI
+    // Update UI - show start button, hide stop button
     document.getElementById("startTest").style.display = "inline-block";
     document.getElementById("stopTest").style.display = "none";
 
-    // Update UI
+    // Reset button states
     document.getElementById("startTest").disabled = false;
-    document.getElementById("stopTest").disabled = true;
+    document.getElementById("stopTest").disabled = false;
 
     this.log("info", "Load test stopped");
   }
 
   updateStats() {
-    document.getElementById("activeUsers").textContent = this.stats.activeUsers;
-    document.getElementById("totalMessages").textContent =
-      this.stats.totalMessages;
-    document.getElementById("totalAudio").textContent =
-      this.stats.totalAudioChunks;
+    // Update basic stats
+    const activeUsersElement = document.getElementById("activeUsers");
+    const totalMessagesElement = document.getElementById("totalMessages");
+    const totalAudioElement = document.getElementById("totalAudio");
+    const avgLatencyElement = document.getElementById("avgLatency");
+
+    if (activeUsersElement)
+      activeUsersElement.textContent = this.stats.activeUsers;
+    if (totalMessagesElement)
+      totalMessagesElement.textContent = this.stats.totalMessages;
+    if (totalAudioElement)
+      totalAudioElement.textContent = this.stats.totalAudioChunks;
 
     const avgLatency =
       this.stats.latencies.length > 0
@@ -219,11 +235,30 @@ class VoiceChatLoadTester {
               this.stats.latencies.length
           )
         : 0;
-    document.getElementById("avgLatency").textContent = `${avgLatency}ms`;
+    if (avgLatencyElement) avgLatencyElement.textContent = `${avgLatency}ms`;
+
+    // Update new concurrency stats
+    const queuedElement = document.getElementById("queuedUsers");
+    const allocatedElement = document.getElementById("allocatedUsers");
+    const failedElement = document.getElementById("failedAllocations");
+
+    if (queuedElement) queuedElement.textContent = this.stats.queuedUsers;
+    if (allocatedElement)
+      allocatedElement.textContent = this.stats.allocatedUsers;
+    if (failedElement) failedElement.textContent = this.stats.failedAllocations;
   }
 
   updateUserList() {
-    const userList = document.getElementById("userList");
+    const userList = document.getElementById("testUsers");
+    const testUsersSection = document.getElementById("testUsersSection");
+
+    if (!userList) return;
+
+    // Show/hide test users section based on whether we have active users
+    if (testUsersSection) {
+      testUsersSection.style.display =
+        this.testUsers.size > 0 ? "block" : "none";
+    }
 
     if (this.testUsers.size === 0) {
       userList.innerHTML =
@@ -234,12 +269,18 @@ class VoiceChatLoadTester {
     const usersHtml = Array.from(this.testUsers.values())
       .map(
         (user) => `
-            <div class="user-item">
-                <div class="user-info">
+            <div class="user-item ${user.statusClass === "connected" || user.statusClass === "processing" || user.statusClass === "listening" || user.statusClass === "speaking" ? "active" : ""}">
+                <div class="user-header">
+                    <div class="user-status-dot ${user.statusClass}"></div>
                     <div class="user-id">Test User ${user.userId}</div>
-                    <div class="user-status">${user.status} • ${user.messagesSent} msgs sent</div>
                 </div>
-                <div class="status-dot ${user.statusClass}"></div>
+                <div class="user-stats">
+                    Status: ${user.status}<br/>
+                    Messages: ${user.messagesSent}<br/>
+                    ${user.queuePosition !== null ? `Queue: #${user.queuePosition}<br/>` : ""}
+                    ${user.estimatedWait ? `Wait: ${user.estimatedWait}s<br/>` : ""}
+                    Session: ${user.sessionId ? user.sessionId.substring(0, 8) : "none"}
+                </div>
             </div>
         `
       )
@@ -372,6 +413,10 @@ class TestUser {
     this.waitingForResponse = false;
     this.responsePromise = null;
     this.responseResolve = null;
+    this.sessionId = null;
+    this.queuePosition = null;
+    this.estimatedWait = null;
+    this.processorAllocated = false;
 
     // Each user will choose completely random audio files during the session
   }
@@ -409,7 +454,22 @@ class TestUser {
       this.socket.onclose = () => {
         this.status = "disconnected";
         this.statusClass = "idle";
+        this.processorAllocated = false;
+        this.queuePosition = null;
+        this.estimatedWait = null;
         this.tester.log("warning", `User ${this.userId} disconnected`);
+
+        // Update stats
+        this.tester.stats.queuedUsers = Math.max(
+          0,
+          this.tester.stats.queuedUsers - 1
+        );
+        this.tester.stats.allocatedUsers = Math.max(
+          0,
+          this.tester.stats.allocatedUsers - 1
+        );
+        this.tester.updateStats();
+        this.tester.updateUserList();
       };
 
       this.socket.onerror = (error) => {
@@ -439,6 +499,61 @@ class TestUser {
           );
           break;
 
+        case "processor_allocated":
+          this.processorAllocated = true;
+          this.status = "processor allocated";
+          this.statusClass = "connected";
+          this.queuePosition = null;
+          this.estimatedWait = null;
+          this.tester.stats.allocatedUsers++;
+          this.tester.stats.queuedUsers = Math.max(
+            0,
+            this.tester.stats.queuedUsers - 1
+          );
+          this.tester.log(
+            "success",
+            `User ${this.userId} processor allocated - ready for voice chat`
+          );
+          break;
+
+        case "processor_queued":
+          this.processorAllocated = false;
+          this.status = `queued (position ${message.content.queue_position})`;
+          this.statusClass = "listening";
+          this.queuePosition = message.content.queue_position;
+          this.estimatedWait = message.content.estimated_wait;
+          this.tester.stats.queuedUsers++;
+          this.tester.log(
+            "warning",
+            `User ${this.userId} queued at position ${message.content.queue_position}, estimated wait: ${message.content.estimated_wait}s`
+          );
+          break;
+
+        case "processor_failed":
+          this.processorAllocated = false;
+          this.status = "allocation failed";
+          this.statusClass = "error";
+          this.queuePosition = null;
+          this.estimatedWait = null;
+          this.tester.stats.failedAllocations++;
+          this.tester.log(
+            "error",
+            `User ${this.userId} processor allocation failed: ${message.content.error}`
+          );
+          break;
+
+        case "queue_status":
+          if (message.content.queue_position !== undefined) {
+            this.queuePosition = message.content.queue_position;
+            this.estimatedWait = message.content.estimated_wait;
+            this.status = `queued (position ${message.content.queue_position})`;
+            this.tester.log(
+              "info",
+              `User ${this.userId} queue update - position: ${message.content.queue_position}, wait: ${message.content.estimated_wait}s`
+            );
+          }
+          break;
+
         case "partial_assistant_answer":
           this.status = "receiving response";
           this.statusClass = "listening";
@@ -465,8 +580,17 @@ class TestUser {
           this.status = "playing audio";
           this.statusClass = "speaking";
           break;
+
+        default:
+          // Log unhandled message types for debugging
+          this.tester.log(
+            "info",
+            `User ${this.userId} received unhandled message type: ${message.type}`
+          );
+          break;
       }
 
+      this.tester.updateStats();
       this.tester.updateUserList();
     } catch (error) {
       this.tester.log(
@@ -479,6 +603,14 @@ class TestUser {
   async sendRandomAudioPromptAndWaitForResponse() {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
       throw new Error("Socket not connected");
+    }
+
+    // Check if we have a processor allocated
+    if (!this.processorAllocated) {
+      this.tester.log(
+        "warning",
+        `User ${this.userId} attempting to send audio without allocated processor - may need to wait for allocation`
+      );
     }
 
     const prompt = this.getRandomAudioPrompt();
@@ -497,14 +629,14 @@ class TestUser {
     this.responsePromise = new Promise((resolve, reject) => {
       this.responseResolve = resolve;
 
-      // Timeout after 20 seconds if no response
+      // Timeout after 30 seconds if no response (increased for queued users)
       setTimeout(() => {
         if (this.waitingForResponse) {
           this.waitingForResponse = false;
           this.responseResolve = null;
           reject(new Error("Response timeout"));
         }
-      }, 20000);
+      }, 30000);
     });
 
     // Send the audio

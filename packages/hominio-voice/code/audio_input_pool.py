@@ -10,7 +10,7 @@ import asyncio
 import logging
 import threading
 import time
-from typing import Optional, Dict, Any, List, Callable
+from typing import Optional, Dict, Any, List, Callable, Tuple
 from dataclasses import dataclass
 from enum import Enum
 from queue import Queue
@@ -45,39 +45,50 @@ class PoolInstance:
 
 class AudioInputProcessorPool:
     """
-    Manages a pool of AudioInputProcessor instances for multi-user concurrency.
+    A pool of AudioInputProcessor instances to support concurrent users.
     
-    This pool provides dedicated AudioInputProcessor instances to sessions,
-    ensuring complete isolation between users while maximizing resource
-    utilization through reuse.
+    Manages STT model instances with health checking, automatic creation,
+    fair allocation, and graceful cleanup. Supports queue management when
+    pool capacity is reached.
     """
     
-    def __init__(
-        self,
-        initial_size: int = 3,
-        max_size: int = 50,
-        max_idle_time: float = 300.0,  # 5 minutes
-        health_check_interval: float = 60.0,  # 1 minute
-        language: str = "en",
-        is_orpheus: bool = False,
-        pipeline_latency: float = 0.5,
-    ):
+    def __init__(self, initial_size: int = 3, max_size: int = 5, session_timeout: int = 300, 
+                 language: str = 'en', is_orpheus: bool = False, pipeline_latency: float = 0.5):
         """
-        Initialize the AudioInputProcessor pool.
+        Initialize the pool with expanded concurrent user support.
         
         Args:
-            initial_size: Number of instances to create initially
-            max_size: Maximum number of instances in the pool
-            max_idle_time: Maximum time an instance can be idle before cleanup
-            health_check_interval: Interval between health checks
-            language: Default language for AudioInputProcessor instances
-            is_orpheus: Default Orpheus flag for instances
-            pipeline_latency: Default pipeline latency for instances
+            initial_size: Number of instances to create initially (default: 3)
+            max_size: Maximum number of instances allowed (default: 5) 
+            session_timeout: Session timeout in seconds (default: 300)
+            language: Language for STT (default: 'en')
+            is_orpheus: Whether to use Orpheus TTS (default: False)
+            pipeline_latency: Pipeline latency in seconds (default: 0.5)
         """
         self.initial_size = initial_size
         self.max_size = max_size
-        self.max_idle_time = max_idle_time
-        self.health_check_interval = health_check_interval
+        self.session_timeout = session_timeout
+        self.health_check_interval = 60.0  # Health check every 60 seconds
+        self.max_idle_time = 300.0  # Clean up instances idle for more than 5 minutes
+        
+        # Pool management
+        self.instances: Dict[str, PoolInstance] = {}
+        self.allocation_queue: List[Tuple[str, float]] = []  # (session_id, timestamp)
+        self.session_allocations: Dict[str, str] = {}  # session_id -> instance_id
+        self.lock = threading.RLock()
+        self.shutdown_event = threading.Event()
+        
+        # Stats and monitoring
+        self.stats = {
+            'total_created': 0,
+            'current_allocated': 0,
+            'peak_allocated': 0,
+            'queue_wait_times': [],
+            'allocation_failures': 0,
+        }
+        
+        # Queue management for Task 2.2
+        self.queue_notifications: Dict[str, Callable] = {}  # session_id -> callback
         
         # Default parameters for AudioInputProcessor creation
         self.default_params = {
@@ -86,27 +97,11 @@ class AudioInputProcessorPool:
             'pipeline_latency': pipeline_latency,
         }
         
-        # Pool management
-        self.instances: Dict[str, PoolInstance] = {}
-        self.allocation_queue: List[str] = []  # Queue for waiting sessions
-        self.lock = threading.RLock()
-        
-        # Statistics
-        self.stats = {
-            'total_allocations': 0,
-            'total_returns': 0,
-            'failed_allocations': 0,
-            'current_allocated': 0,
-            'peak_allocated': 0,
-            'average_session_duration': 0.0,
-        }
-        
         # Resource tracking
         self.resource_tracker = get_resource_tracker()
         self.resource_tracker.track_resource("global", "AudioInputProcessorPool", f"pool_{id(self)}")
         
         # Health monitoring
-        self.shutdown_event = threading.Event()
         self.health_monitor_thread: Optional[threading.Thread] = None
         
         # Initialize the pool
@@ -117,58 +112,10 @@ class AudioInputProcessorPool:
     
     def _initialize_pool(self) -> None:
         """Initialize the pool with the specified number of instances."""
-        logger.info(f"🏊‍♂️🔧 Initializing pool with {self.initial_size} instances...")
+        logger.debug(f"🏊‍♂️🔧 Initializing pool with {self.initial_size} instances...")
         
-        # Pre-warm Silero VAD cache to prevent race conditions
-        if not _prewarm_silero_cache():
-            logger.error("🏊‍♂️💥 Failed to pre-warm Silero VAD cache - instances may fail to initialize")
-        
-        # Pre-warm TurnDetection model to prevent CUDA conflicts
-        logger.info("🏊‍♂️🔥 Pre-warming TurnDetection model...")
-        try:
-            from turndetect import TurnDetection
-            # Trigger model loading by calling the class method
-            TurnDetection._ensure_model_loaded(local=True)
-            logger.info("🏊‍♂️✅ TurnDetection model pre-warmed successfully")
-        except Exception as e:
-            logger.error(f"🏊‍♂️💥 Failed to pre-warm TurnDetection model: {e}")
-        
-        # Pre-warm STT Whisper models to prevent CUDA conflicts
-        logger.info("🏊‍♂️🔥 Pre-warming STT Whisper models...")
-        try:
-            import torch
-            from faster_whisper import WhisperModel
-            
-            # Pre-load the main STT model (same as used in transcribe.py)
-            logger.info("🏊‍♂️🔥 Loading main Whisper model (base.en)...")
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            compute_type = "float16" if device == "cuda" else "default"
-            
-            main_model = WhisperModel(
-                model_size_or_path="base.en",
-                device=device,
-                compute_type=compute_type
-            )
-            
-            # Since both main and realtime use the same model, share the reference
-            logger.info("🏊‍♂️✅ STT model pre-warmed (base.en), sharing between main and realtime")
-            
-            # Store references to prevent garbage collection
-            _STT_MODEL_CACHE['shared_model'] = main_model
-            _STT_MODEL_CACHE['device'] = device
-            _STT_MODEL_CACHE['compute_type'] = compute_type
-            
-            # Perform a quick warmup inference to ensure model is ready
-            import numpy as np
-            warmup_audio = np.zeros(16000, dtype=np.float32)  # 1 second of silence
-            segments, info = main_model.transcribe(warmup_audio, language="en", beam_size=1)
-            list(segments)  # Consume generator to complete warmup
-            
-            logger.info("🏊‍♂️✅ STT Whisper model pre-warmed and tested successfully")
-        except Exception as e:
-            logger.error(f"🏊‍♂️💥 Failed to pre-warm STT models: {e}")
-            import traceback
-            logger.error(f"🏊‍♂️💥 STT pre-warming traceback: {traceback.format_exc()}")
+        # Pre-warm models before creating instances
+        self._prewarm_models()
         
         # Create instances sequentially to avoid any remaining race conditions
         for i in range(self.initial_size):
@@ -221,7 +168,7 @@ class AudioInputProcessorPool:
                     self.instances[instance_id].instance = instance
                     self.instances[instance_id].state = InstanceState.AVAILABLE
                     self.instances[instance_id].last_activity = time.time()
-                    logger.info(f"🏊‍♂️✅ Instance {instance_id} created and validated successfully")
+                    logger.debug(f"🏊‍♂️✅ Instance {instance_id} created and validated successfully")
                 else:
                     # Instance was removed while we were creating it
                     logger.warning(f"🏊‍♂️⚠️ Instance {instance_id} was removed during creation, shutting down")
@@ -279,40 +226,33 @@ class AudioInputProcessorPool:
             AudioInputProcessor instance or None if allocation failed
         """
         with self.lock:
-            # Check if session already has an instance
-            for pool_instance in self.instances.values():
-                if pool_instance.session_id == session_id:
-                    logger.warning(f"🏊‍♂️⚠️ Session {session_id} already has an allocated instance")
-                    return pool_instance.instance
+            # Check if already allocated
+            if session_id in self.session_allocations:
+                logger.warning(f"🏊‍♂️⚠️ Session {session_id} already has an allocated instance")
+                return self.instances[self.session_allocations[session_id]].instance
             
             # Find available instance
             available_instance_id = None
             for instance_id, pool_instance in self.instances.items():
                 if pool_instance.state == InstanceState.AVAILABLE and pool_instance.instance:
-                    # Additional health check before allocation
-                    if self._validate_instance_health(pool_instance.instance):
-                        available_instance_id = instance_id
-                        break
-                    else:
-                        # Mark unhealthy instance as failed
-                        logger.warning(f"🏊‍♂️⚠️ Instance {instance_id} failed health check during allocation")
-                        pool_instance.state = InstanceState.FAILED
-                        pool_instance.failure_count += 1
+                    available_instance_id = instance_id
+                    break
             
             if available_instance_id:
-                # Allocate existing instance
+                # Allocate existing available instance
                 pool_instance = self.instances[available_instance_id]
                 pool_instance.state = InstanceState.ALLOCATED
                 pool_instance.session_id = session_id
                 pool_instance.allocated_at = time.time()
-                pool_instance.last_activity = time.time()
+                
+                # Track the allocation
+                self.session_allocations[session_id] = available_instance_id
                 
                 # Update statistics
-                self.stats['total_allocations'] += 1
                 self.stats['current_allocated'] += 1
                 self.stats['peak_allocated'] = max(self.stats['peak_allocated'], self.stats['current_allocated'])
                 
-                logger.info(f"🏊‍♂️📤 Allocated instance {available_instance_id} to session {session_id}")
+                logger.debug(f"🏊‍♂️📤 Allocated instance {available_instance_id} to session {session_id}")
                 return pool_instance.instance
             
             else:
@@ -340,7 +280,7 @@ class AudioInputProcessorPool:
                             logger.error(f"🏊‍♂️💥 On-demand instance {instance_id} failed health validation")
                             if hasattr(instance, 'shutdown'):
                                 instance.shutdown()
-                            self.stats['failed_allocations'] += 1
+                            self.stats['allocation_failures'] += 1
                             return None
                         
                         pool_instance = PoolInstance(
@@ -353,26 +293,29 @@ class AudioInputProcessorPool:
                         )
                         self.instances[instance_id] = pool_instance
                         
+                        # Track the allocation
+                        self.session_allocations[session_id] = instance_id
+                        
                         # Update statistics
-                        self.stats['total_allocations'] += 1
+                        self.stats['total_created'] += 1
                         self.stats['current_allocated'] += 1
                         self.stats['peak_allocated'] = max(self.stats['peak_allocated'], self.stats['current_allocated'])
                         
-                        logger.info(f"🏊‍♂️🆕 Created and allocated new instance {instance_id} to session {session_id}")
-                        return instance
+                        logger.debug(f"🏊‍♂️🆕 Created and allocated new instance {instance_id} to session {session_id}")
+                        return instance_id
                         
                     except Exception as e:
                         logger.error(f"🏊‍♂️💥 Failed to create instance for session {session_id}: {e}", exc_info=True)
-                        self.stats['failed_allocations'] += 1
+                        self.stats['allocation_failures'] += 1
                         return None
                 
                 else:
                     # Pool is at capacity, add to queue
                     if session_id not in self.allocation_queue:
-                        self.allocation_queue.append(session_id)
+                        self.allocation_queue.append((session_id, time.time()))
                         logger.info(f"🏊‍♂️⏳ Pool at capacity, queued session {session_id} (position: {len(self.allocation_queue)})")
                     
-                    self.stats['failed_allocations'] += 1
+                    self.stats['allocation_failures'] += 1
                     return None
     
     def return_instance(self, session_id: str) -> bool:
@@ -380,32 +323,35 @@ class AudioInputProcessorPool:
         Return an AudioInputProcessor instance to the pool.
         
         Args:
-            session_id: Session identifier that owns the instance
+            session_id: The session ID that was using the instance
             
         Returns:
             True if instance was successfully returned, False otherwise
         """
         with self.lock:
-            # Find the instance for this session
-            instance_id = None
-            for id_key, pool_instance in self.instances.items():
-                if pool_instance.session_id == session_id:
-                    instance_id = id_key
-                    break
+            # Find instance by session_id
+            if session_id not in self.session_allocations:
+                logger.warning(f"🏊‍♂️⚠️ No allocated instance found for session {session_id}")
+                return False
             
-            if not instance_id:
-                logger.warning(f"🏊‍♂️⚠️ No instance found for session {session_id}")
+            instance_id = self.session_allocations[session_id]
+            if instance_id not in self.instances:
+                logger.error(f"🏊‍♂️💥 Instance {instance_id} not found in pool")
+                # Clean up the tracking
+                del self.session_allocations[session_id]
                 return False
             
             pool_instance = self.instances[instance_id]
             
-            # Calculate session duration for statistics
+            # Calculate session duration if we have allocation time
             if pool_instance.allocated_at:
                 session_duration = time.time() - pool_instance.allocated_at
-                # Update average session duration
-                total_returns = self.stats['total_returns']
-                current_avg = self.stats['average_session_duration']
-                self.stats['average_session_duration'] = (current_avg * total_returns + session_duration) / (total_returns + 1)
+                # Update wait time stats
+                if len(self.stats['queue_wait_times']) < 100:  # Keep recent history
+                    self.stats['queue_wait_times'].append(session_duration)
+                else:
+                    self.stats['queue_wait_times'].pop(0)
+                    self.stats['queue_wait_times'].append(session_duration)
             
             # Reset instance state
             pool_instance.state = InstanceState.AVAILABLE
@@ -413,13 +359,15 @@ class AudioInputProcessorPool:
             pool_instance.allocated_at = None
             pool_instance.last_activity = time.time()
             
+            # Clean up session allocation tracking
+            del self.session_allocations[session_id]
+            
             # Update statistics
-            self.stats['total_returns'] += 1
             self.stats['current_allocated'] -= 1
             
-            logger.info(f"🏊‍♂️📥 Returned instance {instance_id} from session {session_id}")
+            logger.debug(f"🏊‍♂️📥 Returned instance {instance_id} from session {session_id}")
             
-            # Process allocation queue
+            # Process allocation queue if there are waiting sessions
             self._process_allocation_queue()
             
             return True
@@ -438,7 +386,7 @@ class AudioInputProcessorPool:
                 break  # No available instances
             
             # Allocate to next session in queue
-            waiting_session_id = self.allocation_queue.pop(0)
+            waiting_session_id, waiting_time = self.allocation_queue.pop(0)
             pool_instance = self.instances[available_instance_id]
             pool_instance.state = InstanceState.ALLOCATED
             pool_instance.session_id = waiting_session_id
@@ -446,14 +394,31 @@ class AudioInputProcessorPool:
             pool_instance.last_activity = time.time()
             
             # Update statistics
-            self.stats['total_allocations'] += 1
+            self.stats['total_created'] += 1
             self.stats['current_allocated'] += 1
             self.stats['peak_allocated'] = max(self.stats['peak_allocated'], self.stats['current_allocated'])
             
-            logger.info(f"🏊‍♂️📤 Allocated queued instance {available_instance_id} to session {waiting_session_id}")
+            logger.debug(f"🏊‍♂️📤 Allocated queued instance {available_instance_id} to session {waiting_session_id}")
             
-            # TODO: Notify session that instance is now available
-            # This would require integration with the session management system
+            # Notify session that instance is now available
+            if waiting_session_id in self.queue_notifications:
+                callback = self.queue_notifications[waiting_session_id]
+                # Handle both sync and async callbacks
+                try:
+                    if asyncio.iscoroutinefunction(callback):
+                        # Async callback - schedule it
+                        loop = asyncio.get_event_loop()
+                        loop.create_task(callback(pool_instance.instance))
+                    else:
+                        # Sync callback - call directly
+                        callback(pool_instance.instance)
+                    
+                    # Clean up notification after calling
+                    del self.queue_notifications[waiting_session_id]
+                except Exception as e:
+                    logger.error(f"🏊‍♂️💥 Error calling queue notification for {waiting_session_id}: {e}")
+                    # Clean up even on error
+                    self.queue_notifications.pop(waiting_session_id, None)
     
     def get_pool_status(self) -> Dict[str, Any]:
         """Get current pool status and statistics."""
@@ -561,6 +526,88 @@ class AudioInputProcessorPool:
         self.resource_tracker.untrack_resource("global", "AudioInputProcessorPool", f"pool_{id(self)}")
         
         logger.info("🏊‍♂️👋 AudioInputProcessorPool shutdown complete")
+
+    def _prewarm_models(self) -> None:
+        """Pre-warm all models to prevent race conditions during instance creation."""
+        # Pre-warm Silero VAD cache to prevent race conditions
+        if not _prewarm_silero_cache():
+            logger.error("🏊‍♂️💥 Failed to pre-warm Silero VAD cache - instances may fail to initialize")
+        
+        # Pre-warm TurnDetection model to prevent CUDA conflicts
+        logger.debug("🏊‍♂️🔥 Pre-warming TurnDetection model...")
+        try:
+            from turndetect import TurnDetection
+            # Trigger model loading by calling the class method
+            TurnDetection._ensure_model_loaded(local=True)
+            logger.debug("🏊‍♂️✅ TurnDetection model pre-warmed successfully")
+        except Exception as e:
+            logger.error(f"🏊‍♂️💥 Failed to pre-warm TurnDetection model: {e}")
+        
+        # Pre-warm STT Whisper models to prevent CUDA conflicts
+        logger.debug("🏊‍♂️🔥 Pre-warming STT Whisper models...")
+        try:
+            import torch
+            from faster_whisper import WhisperModel
+            
+            # Pre-load the main STT model (same as used in transcribe.py)
+            logger.debug("🏊‍♂️🔥 Loading main Whisper model (base.en)...")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            compute_type = "float16" if device == "cuda" else "default"
+            
+            main_model = WhisperModel(
+                model_size_or_path="base.en",
+                device=device,
+                compute_type=compute_type
+            )
+            
+            # Since both main and realtime use the same model, share the reference
+            logger.debug("🏊‍♂️✅ STT model pre-warmed (base.en), sharing between main and realtime")
+            
+            # Store references to prevent garbage collection
+            _STT_MODEL_CACHE['shared_model'] = main_model
+            _STT_MODEL_CACHE['device'] = device
+            _STT_MODEL_CACHE['compute_type'] = compute_type
+            
+            # Perform a quick warmup inference to ensure model is ready
+            import numpy as np
+            warmup_audio = np.zeros(16000, dtype=np.float32)  # 1 second of silence
+            segments, info = main_model.transcribe(warmup_audio, language="en", beam_size=1)
+            list(segments)  # Consume generator to complete warmup
+            
+            logger.debug("🏊‍♂️✅ STT Whisper model pre-warmed and tested successfully")
+        except Exception as e:
+            logger.error(f"🏊‍♂️💥 Failed to pre-warm STT models: {e}")
+            import traceback
+            logger.error(f"🏊‍♂️💥 STT pre-warming traceback: {traceback.format_exc()}")
+
+    def register_queue_notification(self, session_id: str, callback: Callable) -> None:
+        """Register a callback to be notified when an instance becomes available for a queued session."""
+        with self.lock:
+            self.queue_notifications[session_id] = callback
+    
+    def unregister_queue_notification(self, session_id: str) -> None:
+        """Remove queue notification for a session."""
+        with self.lock:
+            self.queue_notifications.pop(session_id, None)
+    
+    def get_queue_position(self, session_id: str) -> Optional[int]:
+        """Get the position of a session in the allocation queue (1-based)."""
+        with self.lock:
+            for i, (queued_session_id, _) in enumerate(self.allocation_queue):
+                if queued_session_id == session_id:
+                    return i + 1
+            return None
+    
+    def remove_from_queue(self, session_id: str) -> bool:
+        """Remove a session from the allocation queue (e.g., on disconnect)."""
+        with self.lock:
+            for i, (queued_session_id, _) in enumerate(self.allocation_queue):
+                if queued_session_id == session_id:
+                    self.allocation_queue.pop(i)
+                    self.unregister_queue_notification(session_id)
+                    logger.debug(f"🏊‍♂️🗑️ Removed session {session_id} from allocation queue")
+                    return True
+            return False
 
 def _prewarm_silero_cache():
     """

@@ -86,7 +86,7 @@ class SessionManager:
             session_state.update_status(SessionStatus.CONNECTED)
             self.session_states[session_id] = session_state
             
-        logger.info(f"🏢✨ Created session {session_id[:8]} (Total sessions: {len(self.sessions)})")
+        logger.debug(f"🏢✨ Created session {session_id[:8]} (Total sessions: {len(self.sessions)})")
         
         # Broadcast update (async)
         import asyncio
@@ -131,15 +131,11 @@ class SessionManager:
         with self._lock:
             return self.session_components.get(session_id, {}).get(component_name)
     
-    def remove_session(self, session_id: str) -> bool:
+    async def remove_session(self, session_id: str) -> bool:
         """
-        Remove a session and clean up its components.
+        Remove a session and clean up all its associated components.
         
-        Args:
-            session_id: The session ID to remove
-            
-        Returns:
-            True if session was found and removed, False otherwise
+        This method is now a coroutine to handle async cleanup.
         """
         with self._lock:
             session_info = self.sessions.pop(session_id, None)
@@ -151,10 +147,10 @@ class SessionManager:
             return False
         
         # Cleanup session components
-        self._cleanup_session_components(session_id, components)
+        await self._cleanup_session_components(session_id, components)
         
         session_duration = time.time() - session_info.created_at
-        logger.info(f"🏢🗑️ Removed session {session_id[:8]} (Duration: {session_duration:.1f}s, Total sessions: {len(self.sessions)})")
+        logger.debug(f"🏢🗑️ Removed session {session_id[:8]} (Duration: {session_duration:.1f}s, Total sessions: {len(self.sessions)})")
         
         # Broadcast update (async)
         import asyncio
@@ -166,7 +162,7 @@ class SessionManager:
         
         return True
     
-    def _cleanup_session_components(self, session_id: str, components: Dict[str, Any]):
+    async def _cleanup_session_components(self, session_id: str, components: Dict[str, Any]):
         """Clean up components for a session."""
         for component_name, component in components.items():
             try:
@@ -174,8 +170,11 @@ class SessionManager:
                 if hasattr(component, 'shutdown'):
                     logger.debug(f"🏢🧹 Shutting down {component_name} for session {session_id[:8]}")
                     component.shutdown()
-                elif hasattr(component, 'close'):
+                elif hasattr(component, 'close') and asyncio.iscoroutinefunction(component.close):
                     logger.debug(f"🏢🧹 Closing {component_name} for session {session_id[:8]}")
+                    await component.close()
+                elif hasattr(component, 'close'):
+                    logger.debug(f"🏢🧹 Closing {component_name} for session {session_id[:8]} (sync)")
                     component.close()
             except Exception as e:
                 logger.error(f"🏢💥 Error cleaning up {component_name} for session {session_id[:8]}: {e}")
@@ -242,7 +241,7 @@ class SessionManager:
         if expired_sessions:
             logger.info(f"🏢🧹 Cleaning up {len(expired_sessions)} expired sessions")
             for session_id in expired_sessions:
-                self.remove_session(session_id)
+                await self.remove_session(session_id)
     
     def get_session_stats(self) -> Dict[str, Any]:
         """Get detailed statistics about current sessions."""
@@ -337,6 +336,6 @@ class SessionManager:
         
         # Clean up all sessions
         for session_id in session_ids:
-            self.remove_session(session_id)
+            await self.remove_session(session_id)
         
         logger.info("🏢✅ SessionManager shutdown complete") 

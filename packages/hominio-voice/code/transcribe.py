@@ -582,7 +582,7 @@ class TranscriptionProcessor:
         """
         if self.silence_active != silence_active:
             self.silence_active = silence_active
-            logger.info(f"👂🤫 Silence state changed: {'ACTIVE' if silence_active else 'INACTIVE'}")
+            logger.debug(f"👂🤫 Silence state changed: {'ACTIVE' if silence_active else 'INACTIVE'}")
             if self.silence_active_callback:
                 self.silence_active_callback(silence_active)
 
@@ -663,7 +663,7 @@ class TranscriptionProcessor:
                  logger.debug(f"👂💾 Successfully got audio copy (length: {len(audio_copy)} samples).")
                  
                  # Track memory usage
-                 self.resource_tracker.update_memory_usage(f"audio_copy_{id(self)}", len(audio_copy) * 4)  # 4 bytes per float32
+                 self.resource_tracker.track_resource("global", "audio_copy", f"audio_copy_{id(self)}", audio_copy)
 
              return audio_copy
         except Exception as e:

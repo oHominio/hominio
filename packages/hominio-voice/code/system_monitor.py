@@ -250,7 +250,7 @@ class SystemStatsStreamer:
     def add_client(self, websocket):
         """Add a WebSocket client for system stats updates"""
         self.clients.add(websocket)
-        logger.info(f"🖥️📊 System stats client added. Total clients: {len(self.clients)}")
+        logger.debug("🖥️📊 System stats client added. Total clients: {len(self.clients)}")
         
     def remove_client(self, websocket):
         """Remove a WebSocket client"""

@@ -145,6 +145,25 @@
         overflow-y: auto;
       }
 
+      .sessions-subsection {
+        margin-bottom: 1rem;
+      }
+
+      .sessions-subsection:last-child {
+        margin-bottom: 0;
+      }
+
+      .sessions-subsection-title {
+        font-size: 0.7rem;
+        font-weight: 700;
+        color: #2c3e50;
+        margin-bottom: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        padding: 0.5rem 0;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.3);
+      }
+
       .session-item {
         background: rgba(255, 255, 255, 0.4);
         border-radius: 12px;
@@ -441,23 +460,23 @@
       /* User Display */
       .users-container {
         background: rgba(255, 255, 255, 0.3);
-        border-radius: 15px;
-        padding: 1.5rem;
+        border-radius: 10px;
+        padding: 1rem;
         border: 1px solid rgba(255, 255, 255, 0.4);
-        max-height: 400px;
+        max-height: 300px;
         overflow-y: auto;
       }
 
       .users-grid {
         display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-        gap: 1rem;
+        grid-template-columns: 1fr;
+        gap: 0.75rem;
       }
 
       .user-item {
         background: rgba(255, 255, 255, 0.4);
-        border-radius: 10px;
-        padding: 1rem;
+        border-radius: 8px;
+        padding: 0.75rem;
         border: 1px solid rgba(255, 255, 255, 0.4);
         transition: all 0.3s ease;
       }
@@ -904,8 +923,28 @@
           </div>
         </div>
 
-        <div id="sessionsList" class="sessions-list">
-          <!-- Sessions will be populated here -->
+        <!-- Real Sessions -->
+        <div class="sessions-subsection">
+          <div class="sessions-subsection-title">Voice Chat Users</div>
+          <div id="sessionsList" class="sessions-list">
+            <!-- Sessions will be populated here -->
+            <div style="text-align: center; color: #6c757d; padding: 20px">
+              Connecting to session manager...
+            </div>
+          </div>
+        </div>
+
+        <!-- Test Users Section (moved from center panel) -->
+        <div
+          class="sessions-subsection"
+          id="testUsersSection"
+          style="display: none">
+          <div class="sessions-subsection-title">Load Test Users</div>
+          <div class="users-container">
+            <div id="testUsers" class="users-grid">
+              <!-- Test users will be populated here -->
+            </div>
+          </div>
         </div>
       </div>
 
@@ -971,12 +1010,6 @@
             style="display: none">
             Stop Test
           </button>
-          <button
-            id="stopTest"
-            class="test-button stop-button"
-            style="display: none">
-            Stop Test
-          </button>
         </div>
 
         <!-- Test Status -->
@@ -991,31 +1024,37 @@
               <circle cx="12" cy="12" r="10"></circle>
               <polyline points="12,6 12,12 16,14"></polyline>
             </svg>
-            Test Status
+            Test Status & Concurrency Metrics
           </div>
           <div id="testStatus" class="status-message">
             Ready to start load test
           </div>
-        </div>
 
-        <!-- Active Test Users -->
-        <div class="control-section" id="usersSection" style="display: none">
-          <div class="section-title">
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              xmlns="http://www.w3.org/2000/svg">
-              <path
-                d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path>
-              <rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect>
-            </svg>
-            Test Users
-          </div>
-          <div class="users-container">
-            <div id="testUsers" class="users-grid">
-              <!-- Test users will be populated here -->
+          <!-- Concurrency Statistics Grid -->
+          <div class="controls-grid" style="margin-top: 1rem">
+            <div class="control-group">
+              <div class="control-label">Active Users</div>
+              <div class="stat-value" id="activeUsers">0</div>
+            </div>
+            <div class="control-group">
+              <div class="control-label">Allocated Processors</div>
+              <div class="stat-value" id="allocatedUsers">0</div>
+            </div>
+            <div class="control-group">
+              <div class="control-label">Queued Users</div>
+              <div class="stat-value" id="queuedUsers">0</div>
+            </div>
+            <div class="control-group">
+              <div class="control-label">Failed Allocations</div>
+              <div class="stat-value" id="failedAllocations">0</div>
+            </div>
+            <div class="control-group">
+              <div class="control-label">Total Messages</div>
+              <div class="stat-value" id="totalMessages">0</div>
+            </div>
+            <div class="control-group">
+              <div class="control-label">Avg Latency</div>
+              <div class="stat-value" id="avgLatency">0ms</div>
             </div>
           </div>
         </div>
