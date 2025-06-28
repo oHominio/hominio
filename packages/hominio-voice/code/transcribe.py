@@ -810,6 +810,59 @@ class TranscriptionProcessor:
             logger.debug("👂🚫 Cannot feed audio: Shutdown already performed.")
         # No warning if shutdown_performed is True, as expected
 
+    def reinitialize(self) -> bool:
+        """
+        Reinitializes the TranscriptionProcessor after shutdown, allowing it to be reused.
+        
+        This method is designed to be called when reusing an instance from the pool.
+        It resets the shutdown flag and recreates the recorder if needed.
+        
+        Returns:
+            True if reinitialization succeeded, False otherwise
+        """
+        try:
+            logger.info("👂🔄 Reinitializing TranscriptionProcessor...")
+            
+            # Reset shutdown flag first
+            self.shutdown_performed = False
+            
+            # Reset internal state
+            self.realtime_text = ""
+            self.final_transcription = ""
+            self.stripped_partial_user_text = ""
+            self.silence_time = 0.0
+            self.silence_active = False
+            
+            # Clear caches
+            self.sentence_end_cache.clear()
+            self.potential_sentences_yielded.clear()
+            
+            # Reset turn detection if enabled
+            if USE_TURN_DETECTION and hasattr(self, 'turn_detection'):
+                self.turn_detection.reset()
+            
+            # Recreate recorder if it doesn't exist
+            if not self.recorder:
+                self._create_recorder()
+                
+                # Only set up transcription loop for new recorder
+                if self.recorder:
+                    self.transcribe_loop()
+                    
+            # NOTE: Don't restart silence monitor here - it will be started
+            # automatically when the transcription loop begins processing
+            
+            if self.recorder:
+                logger.info("👂✅ TranscriptionProcessor successfully reinitialized")
+                return True
+            else:
+                logger.error("👂❌ TranscriptionProcessor reinitialization failed - no recorder")
+                return False
+                
+        except Exception as e:
+            logger.error(f"👂💥 Error during TranscriptionProcessor reinitialization: {e}", exc_info=True)
+            return False
+
     def shutdown(self) -> None:
         """
         Shuts down the recorder instance, cleans up resources, and prevents

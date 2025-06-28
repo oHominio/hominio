@@ -287,6 +287,49 @@ class AudioInputProcessor:
         self.realtime_callback = realtime_callback
         self.recording_start_callback = recording_start_callback
 
+    def reinitialize(self) -> bool:
+        """
+        Reinitializes the AudioInputProcessor for reuse after shutdown.
+        
+        This method is called when an instance is being reused from the pool
+        to ensure all components are properly reset and ready for a new session.
+        
+        Returns:
+            True if reinitialization succeeded, False otherwise
+        """
+        try:
+            logger.debug("👂🔄 Reinitializing AudioInputProcessor...")
+            
+            # Reset flags and counters
+            self.interrupted = False
+            self.dropped_chunks = 0
+            self._task_started = False
+            self._transcription_failed = False
+            
+            # Reset callbacks
+            self.realtime_callback = None
+            self.recording_start_callback = None
+            
+            # Simply reset transcription task reference without waiting
+            self.transcription_task = None
+            
+            # Reinitialize the transcriber (this should be quick)
+            if hasattr(self, 'transcriber') and self.transcriber:
+                success = self.transcriber.reinitialize()
+                if not success:
+                    logger.warning("👂⚠️ Failed to reinitialize transcriber, will create fresh instance")
+                    return False
+            else:
+                logger.warning("👂⚠️ No transcriber to reinitialize")
+                return False
+                
+            logger.debug("👂✅ AudioInputProcessor successfully reinitialized")
+            return True
+            
+        except Exception as e:
+            logger.error(f"👂💥 Error during AudioInputProcessor reinitialization: {e}", exc_info=True)
+            return False
+
     def shutdown(self) -> None:
         """
         Shuts down the AudioInputProcessor and cleans up resources.

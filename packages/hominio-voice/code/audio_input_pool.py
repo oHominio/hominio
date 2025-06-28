@@ -236,24 +236,12 @@ class AudioInputProcessorPool:
                     available_instance_id = instance_id
                     break
             
+            # TEMPORARILY DISABLED: Always create fresh instances instead of reusing
+            # This is to debug the hanging connection issue
             if available_instance_id:
-                # Allocate existing available instance
-                pool_instance = self.instances[available_instance_id]
-                pool_instance.state = InstanceState.ALLOCATED
-                pool_instance.session_id = session_id
-                pool_instance.allocated_at = time.time()
-                
-                # Track the allocation
-                self.session_allocations[session_id] = available_instance_id
-                
-                # Update statistics
-                self.stats['current_allocated'] += 1
-                self.stats['peak_allocated'] = max(self.stats['peak_allocated'], self.stats['current_allocated'])
-                
-                logger.debug(f"🏊‍♂️📤 Allocated instance {available_instance_id} to session {session_id}")
-                return pool_instance.instance
+                logger.debug(f"🏊‍♂️🚫 Temporarily skipping reuse of instance {available_instance_id}, creating fresh")
             
-            else:
+            # Always create new instance for debugging
                 # Try to create new instance if under max_size
                 if len(self.instances) < self.max_size:
                     instance_id = f"instance_{len(self.instances)}_{int(time.time())}"
@@ -300,7 +288,7 @@ class AudioInputProcessorPool:
                         self.stats['peak_allocated'] = max(self.stats['peak_allocated'], self.stats['current_allocated'])
                         
                         logger.debug(f"🏊‍♂️🆕 Created and allocated new instance {instance_id} to session {session_id}")
-                        return instance_id
+                        return instance
                         
                     except Exception as e:
                         logger.error(f"🏊‍♂️💥 Failed to create instance for session {session_id}: {e}", exc_info=True)
@@ -383,20 +371,9 @@ class AudioInputProcessorPool:
             if not available_instance_id:
                 break  # No available instances
             
-            # Allocate to next session in queue
-            waiting_session_id, waiting_time = self.allocation_queue.pop(0)
-            pool_instance = self.instances[available_instance_id]
-            pool_instance.state = InstanceState.ALLOCATED
-            pool_instance.session_id = waiting_session_id
-            pool_instance.allocated_at = time.time()
-            pool_instance.last_activity = time.time()
-            
-            # Update statistics
-            self.stats['total_created'] += 1
-            self.stats['current_allocated'] += 1
-            self.stats['peak_allocated'] = max(self.stats['peak_allocated'], self.stats['current_allocated'])
-            
-            logger.debug(f"🏊‍♂️📤 Allocated queued instance {available_instance_id} to session {waiting_session_id}")
+            # TEMPORARILY DISABLED: Skip queue processing to focus on fresh instance creation
+            logger.debug(f"🏊‍♂️⏭️ Temporarily skipping queue processing for debugging")
+            break  # Exit the queue processing loop
             
             # Notify session that instance is now available
             if waiting_session_id in self.queue_notifications:
