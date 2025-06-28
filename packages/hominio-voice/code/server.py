@@ -27,8 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import HTMLResponse, Response, FileResponse
 
-# GPU Monitoring imports
-from system_monitor import SystemMonitor, SystemStatsStreamer
+# Removed system monitoring imports
 
 # Session management imports
 from session_manager import SessionManager
@@ -198,16 +197,7 @@ async def lifespan(app: FastAPI):
     app.state.SessionManager = SessionManager()
     await app.state.SessionManager.start_cleanup_task()
     
-    # Initialize system monitoring
-    app.state.SystemMonitor = SystemMonitor()
-    system_initialized = await app.state.SystemMonitor.initialize()
-    if system_initialized:
-        app.state.SystemStatsStreamer = SystemStatsStreamer(app.state.SystemMonitor, update_interval=0.5)
-        await app.state.SystemStatsStreamer.start_streaming()
-        logger.info("🖥️📊 System monitoring initialized and streaming started")
-    else:
-        app.state.SystemStatsStreamer = None
-        logger.warning("🖥️⚠️ System monitoring not available")
+    # Removed system monitoring initialization
     
     # Initialize global components - these will be shared by sessions but accessed safely
     app.state.SpeechPipelineManager = SpeechPipelineManager(
@@ -267,14 +257,7 @@ async def lifespan(app: FastAPI):
         await app.state.SessionManager.shutdown()
         logger.info("🖥️🏢 Session manager shutdown")
     
-    # Shutdown system monitoring
-    if hasattr(app.state, 'SystemStatsStreamer') and app.state.SystemStatsStreamer:
-        await app.state.SystemStatsStreamer.stop_streaming()
-        logger.info("🖥️📊 System stats streaming stopped")
-        
-    if hasattr(app.state, 'SystemMonitor'):
-        await app.state.SystemMonitor.shutdown()
-        logger.info("🖥️📊 System monitor shutdown")
+    # Removed system monitoring shutdown
     
     # Shutdown AudioInputProcessor pool
     if hasattr(app.state, 'AudioInputProcessorPool'):
@@ -538,7 +521,7 @@ async def process_incoming_data(ws: WebSocket, app: FastAPI, incoming_chunks: as
                 data = parse_json_message(msg["text"])
                 msg_type = data.get("type")
                 # Only log important incoming messages, skip partial requests to reduce noise
-                if msg_type not in ("partial_user_request", "get_system_stats"):
+                if msg_type not in ("partial_user_request",):
                     logger.debug(Colors.apply(f"🖥️📥 ←←Client: {data}").orange)
 
 
@@ -550,28 +533,7 @@ async def process_incoming_data(ws: WebSocket, app: FastAPI, incoming_chunks: as
                     logger.debug("🖥️ℹ️ Received tts_stop from client.")
                     # Update connection-specific state via callbacks
                     callbacks.tts_client_playing = False
-                elif msg_type == "get_system_stats":
-                    # Send current system stats to client
-                    if hasattr(app.state, 'SystemMonitor') and app.state.SystemMonitor:
-                        try:
-                            await app.state.SystemMonitor.get_stats()
-                            stats_dict = app.state.SystemMonitor.to_dict()
-                            callbacks.message_queue.put_nowait({
-                                "type": "system_stats",
-                                "content": stats_dict
-                            })
-                        except Exception as e:
-                            logger.error(f"🖥️💥 Error getting system stats: {e}")
-                            callbacks.message_queue.put_nowait({
-                                "type": "system_stats",
-                                "content": {"error": str(e)}
-                            })
-                    else:
-                        logger.warning("🖥️⚠️ SystemMonitor not available")
-                        callbacks.message_queue.put_nowait({
-                            "type": "system_stats", 
-                            "content": {"error": "System monitor not available"}
-                        })
+
                 
                 elif msg_type == "get_queue_status":
                     # Send queue status for this session
@@ -630,8 +592,8 @@ async def send_text_messages(ws: WebSocket, message_queue: asyncio.Queue) -> Non
             await asyncio.sleep(0.001) # Yield control
             data = await message_queue.get()
             msg_type = data.get("type")
-            # Only log important messages, skip noisy partial messages and stats to reduce noise
-            if msg_type not in ("tts_chunk", "session_stats", "partial_assistant_answer", "partial_user_request"):
+            # Only log important messages, skip noisy partial messages to reduce noise
+            if msg_type not in ("tts_chunk", "partial_assistant_answer", "partial_user_request"):
                 logger.debug(Colors.apply(f"🖥️📤 →→Client: {data}").orange)
             await ws.send_json(data)
     except asyncio.CancelledError:
@@ -1042,13 +1004,7 @@ class TranscriptionCallbacks:
         if not self.final_transcription: # Store it if not already set by on_before_final logic
              self.final_transcription = txt
         
-        # Trigger immediate GPU stats update after STT processing
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self.app.state.SystemMonitor.trigger_immediate_update("STT completed"))
-        except RuntimeError:
-            # No running event loop, skip the update
-            logger.debug("No running event loop, skipping immediate stats update")
+        # Removed system monitoring trigger
         
         # Update session state - user finished speaking
         session_state = self.app.state.SessionManager.get_session_state(self.session_id)
@@ -1211,8 +1167,7 @@ class TranscriptionCallbacks:
                 self.final_assistant_answer_sent = True
                 self.final_assistant_answer = cleaned_answer # Store the sent answer
                 
-                # Trigger immediate GPU stats update after LLM+TTS processing
-                asyncio.create_task(self.app.state.SystemMonitor.trigger_immediate_update("LLM+TTS completed"))
+                # Removed system monitoring trigger
             else:
                 logger.warning(f"🖥️⚠️ {Colors.YELLOW}Final assistant answer was empty after cleaning.{Colors.RESET}")
                 self.final_assistant_answer_sent = False # Don't mark as sent
@@ -1276,10 +1231,7 @@ async def websocket_endpoint(ws: WebSocket):
         }
         await message_queue.put(session_info_msg)
 
-        # Register for system stats updates if available
-        if hasattr(app.state, 'SystemStatsStreamer') and app.state.SystemStatsStreamer:
-            app.state.SystemStatsStreamer.add_client(ws)
-            logger.info("🖥️📊 Client registered for system stats updates")
+        # Removed system stats registration
 
         # Allocate AudioInputProcessor with queue support
         allocation_result = await allocate_audio_processor(app, session_id, callbacks)
@@ -1322,10 +1274,7 @@ async def websocket_endpoint(ws: WebSocket):
             # Remove from allocation queue if present
             app.state.AudioInputProcessorPool.remove_from_queue(session_id)
             
-            # Unregister system stats client
-            if hasattr(app.state, 'SystemStatsStreamer') and app.state.SystemStatsStreamer:
-                app.state.SystemStatsStreamer.remove_client(ws)
-                logger.info("🖥️📊 Client unregistered from system stats updates")
+            # Removed system stats unregistration
             
             # Return AudioInputProcessor to pool if allocated
             if callbacks.audio_processor:

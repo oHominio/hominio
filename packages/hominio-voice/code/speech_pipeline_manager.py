@@ -131,7 +131,7 @@ class SpeechPipelineManager:
         ):
         """
         Initializes the SpeechPipelineManager.
-
+w
         Sets up configuration, instantiates dependencies (AudioProcessor, LLM, etc.),
         loads system prompts, initializes state variables (queues, events, flags),
         measures initial inference latencies, and starts the background worker threads.

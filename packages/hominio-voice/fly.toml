@@ -1,7 +1,7 @@
 # fly.toml app configuration file for realtime-voice-test
 app = 'hominio-voice'
 primary_region = 'ord'
-vm.size = 'a100-40gb'
+vm.size = 'a10'
 
 [build]
 dockerfile = 'Dockerfile'
@@ -10,7 +10,7 @@ dockerfile = 'Dockerfile'
 CUDA_VISIBLE_DEVICES = '0'
 FORCE_CUDA = '1'
 LLM_BASE_URL = 'https://api.redpill.ai/v1'
-LLM_MODEL = 'phala/llama-3.2-3b-instruct'
+LLM_MODEL = 'phala/llama-3.3-70b-instruct'
 LLM_PROVIDER = 'openai'
 LOG_LEVEL = 'INFO'
 MAX_AUDIO_QUEUE_SIZE = '50'

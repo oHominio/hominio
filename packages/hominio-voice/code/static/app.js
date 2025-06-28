@@ -19,11 +19,7 @@ const statusText = document.getElementById("statusText");
 const chatStatus = document.getElementById("chatStatus");
 const viewToggle = document.getElementById("viewToggle");
 
-// Initialize stats manager if elements are present
-let statsManager = null;
-if (typeof StatsManager !== "undefined") {
-  statsManager = new StatsManager();
-}
+// Removed stats manager initialization
 
 // Toggle buttons for both views
 const toggleBtn = document.getElementById("toggleBtn");
@@ -272,10 +268,7 @@ function renderMessages() {
 }
 
 function handleJSONMessage({ type, content }) {
-  // Try to handle stats-related messages first
-  if (statsManager && statsManager.handleStatsMessage(type, content)) {
-    return; // Message was handled by stats manager
-  }
+  // Removed stats message handling
 
   if (type === "session_info") {
     // Received session info from server
