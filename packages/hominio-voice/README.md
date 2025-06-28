@@ -28,7 +28,7 @@ A sophisticated client-server system built for low-latency interaction:
 *   **Low Latency Focus:** Optimized architecture using audio chunk streaming.
 *   **Smart Turn-Taking:** Dynamic silence detection (`turndetect.py`) adapts to the conversation pace.
 *   **Flexible AI Brains:** Pluggable LLM backends (Ollama default, OpenAI support via `llm_module.py`).
-*   **Customizable Voices:** Choose from different Text-to-Speech engines (Kokoro, Coqui, Orpheus via `audio_module.py`).
+*   **High-Quality Voice:** Uses Kokoro TTS engine for natural-sounding speech synthesis.
 *   **Web Interface:** Clean and simple UI using Vanilla JS and the Web Audio API.
 *   **Dockerized Deployment:** Recommended setup using Docker Compose for easier dependency management.
 
@@ -54,7 +54,7 @@ This project leverages powerful AI models, which have some requirements:
     *   **Docker:** Linux is recommended for the best GPU integration with Docker.
     *   **Manual:** The provided script (`install.bat`) is for Windows. Manual steps are possible on Linux/macOS but may require more troubleshooting (especially for DeepSpeed).
 *   **🐍 Python:** 3.9 or higher (if setting up manually).
-*   **🚀 GPU:** **A powerful CUDA-enabled NVIDIA GPU is *highly recommended***, especially for faster STT (Whisper) and TTS (Coqui). Performance on CPU-only or weaker GPUs will be significantly slower.
+*   **🚀 GPU:** **A powerful CUDA-enabled NVIDIA GPU is *highly recommended***, especially for faster STT (Whisper) and TTS. Performance on CPU-only or weaker GPUs will be significantly slower.
     *   The setup assumes **CUDA 12.1**. Adjust PyTorch installation if you have a different CUDA version.
     *   **Docker (Linux):** Requires [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
 *   **🐳 Docker (Optional but Recommended):** Docker Engine and Docker Compose v2+ for the containerized setup.
@@ -172,7 +172,7 @@ This method requires managing the Python environment yourself. It offers more di
     ```bash
     pip install -r requirements.txt
     ```
-    *   **Note on DeepSpeed:** The `requirements.txt` may include DeepSpeed. Installation can be complex, especially on Windows. The `install.bat` tries a precompiled wheel. If manual installation fails, you might need to build it from source or consult resources like [deepspeedpatcher](https://github.com/erew123/deepspeedpatcher) (use at your own risk). Coqui TTS performance benefits most from DeepSpeed.
+    *   **Note on DeepSpeed:** The `requirements.txt` may include DeepSpeed. Installation can be complex, especially on Windows. The `install.bat` tries a precompiled wheel. If manual installation fails, you might need to build it from source or consult resources like [deepspeedpatcher](https://github.com/erew123/deepspeedpatcher) (use at your own risk).
 
 </details>
 
@@ -213,9 +213,8 @@ Want to tweak the AI's voice, brain, or how it listens? Modify the Python files 
 
 **⚠️ Important Docker Note:** If using Docker, make any configuration changes *before* running `docker compose build` to ensure they are included in the image.
 
-*   **TTS Engine & Voice (`server.py`, `audio_module.py`):**
-    *   Change `START_ENGINE` in `server.py` to `"coqui"`, `"kokoro"`, or `"orpheus"`.
-    *   Adjust engine-specific settings (e.g., voice model path for Coqui, speaker ID for Orpheus, speed) within `AudioProcessor.__init__` in `audio_module.py`.
+*   **TTS Voice Settings (`audio_module.py`):**
+    *   Adjust Kokoro voice settings (voice selection, speed, etc.) within `AudioProcessor.__init__` in `audio_module.py`.
 *   **LLM Backend & Model (`server.py`, `llm_module.py`):**
     *   Set `LLM_START_PROVIDER` (`"ollama"` or `"openai"`) and `LLM_START_MODEL` (e.g., `"hf.co/..."` for Ollama, model name for OpenAI) in `server.py`. Remember to pull the Ollama model if using Docker (see Installation Step A3).
     *   Customize the AI's personality by editing `system_prompt.txt`.
@@ -247,4 +246,4 @@ Got ideas or found a bug? Contributions are welcome! Feel free to open issues or
 
 The core codebase of this project is released under the **MIT License** (see the [LICENSE](./LICENSE) file for details).
 
-This project relies on external specific TTS engines (like `Coqui XTTSv2`) and LLM providers which have their **own licensing terms**. Please ensure you comply with the licenses of all components you use.
+This project relies on external TTS engines and LLM providers which have their **own licensing terms**. Please ensure you comply with the licenses of all components you use.

@@ -4,22 +4,136 @@ import time
 import logging
 import asyncio
 from typing import Dict, Optional, Any, List
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import Lock
-from session_state import SessionState, SessionStatus
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
+class SessionStatus(Enum):
+    """Enumeration of possible session states."""
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
+    LISTENING = "listening"
+    PROCESSING = "processing"
+    SPEAKING = "speaking"
+    IDLE = "idle"
+    DISCONNECTED = "disconnected"
+    INACTIVE = "inactive"
+
 @dataclass
-class SessionInfo:
-    """Holds metadata and state for an individual user session."""
+class SessionState:
+    """Tracks the current state and activity of a session."""
     session_id: str
-    created_at: float
-    last_activity: float
-    websocket: Any  # WebSocket connection
+    status: SessionStatus = SessionStatus.CONNECTING
+    created_at: float = field(default_factory=time.time)
+    last_activity: float = field(default_factory=time.time)
+    last_status_change: float = field(default_factory=time.time)
+    
+    # Activity counters
+    messages_sent: int = 0
+    messages_received: int = 0
+    audio_chunks_processed: int = 0
+    tts_chunks_sent: int = 0
+    
+    # Current activity
+    is_recording: bool = False
+    is_speaking: bool = False
+    is_processing: bool = False
     is_active: bool = True
+    
+    # Connection info
+    websocket: Optional[Any] = None
     user_agent: Optional[str] = None
     ip_address: Optional[str] = None
+    
+    def update_status(self, new_status: SessionStatus):
+        """Update the session status and timestamp."""
+        if self.status != new_status:
+            self.status = new_status
+            self.last_status_change = time.time()
+            self.last_activity = time.time()
+    
+    def update_activity(self):
+        """Update the last activity timestamp."""
+        self.last_activity = time.time()
+    
+    def increment_message_sent(self):
+        """Increment sent message counter."""
+        self.messages_sent += 1
+        self.update_activity()
+    
+    def increment_message_received(self):
+        """Increment received message counter."""
+        self.messages_received += 1
+        self.update_activity()
+    
+    def increment_audio_chunk(self):
+        """Increment audio chunk counter."""
+        self.audio_chunks_processed += 1
+        self.update_activity()
+    
+    def increment_tts_chunk(self):
+        """Increment TTS chunk counter."""
+        self.tts_chunks_sent += 1
+        self.update_activity()
+    
+    def set_recording(self, is_recording: bool):
+        """Set recording state."""
+        self.is_recording = is_recording
+        if is_recording:
+            self.update_status(SessionStatus.LISTENING)
+        self.update_activity()
+    
+    def set_speaking(self, is_speaking: bool):
+        """Set speaking state."""
+        self.is_speaking = is_speaking
+        if is_speaking:
+            self.update_status(SessionStatus.SPEAKING)
+        elif self.status == SessionStatus.SPEAKING:
+            self.update_status(SessionStatus.IDLE)
+        self.update_activity()
+    
+    def set_processing(self, is_processing: bool):
+        """Set processing state."""
+        self.is_processing = is_processing
+        if is_processing:
+            self.update_status(SessionStatus.PROCESSING)
+        self.update_activity()
+    
+    def get_duration_seconds(self) -> float:
+        """Get session duration in seconds."""
+        return time.time() - self.created_at
+    
+    def get_idle_seconds(self) -> float:
+        """Get seconds since last activity."""
+        return time.time() - self.last_activity
+    
+    def get_status_duration_seconds(self) -> float:
+        """Get seconds since last status change."""
+        return time.time() - self.last_status_change
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return {
+            "session_id": self.session_id,
+            "status": self.status.value,
+            "created_at": self.created_at,
+            "last_activity": self.last_activity,
+            "last_status_change": self.last_status_change,
+            "duration_seconds": self.get_duration_seconds(),
+            "idle_seconds": self.get_idle_seconds(),
+            "status_duration_seconds": self.get_status_duration_seconds(),
+            "messages_sent": self.messages_sent,
+            "messages_received": self.messages_received,
+            "audio_chunks_processed": self.audio_chunks_processed,
+            "tts_chunks_sent": self.tts_chunks_sent,
+            "is_recording": self.is_recording,
+            "is_speaking": self.is_speaking,
+            "is_processing": self.is_processing,
+            "user_agent": self.user_agent,
+            "ip_address": self.ip_address
+        }
 
 class SessionManager:
     """
@@ -39,8 +153,7 @@ class SessionManager:
         """
         self.session_timeout = session_timeout
         self.cleanup_interval = cleanup_interval
-        self.sessions: Dict[str, SessionInfo] = {}
-        self.session_states: Dict[str, SessionState] = {}
+        self.sessions: Dict[str, SessionState] = {}
         self.session_components: Dict[str, Dict[str, Any]] = {}
         self._lock = Lock()
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -62,34 +175,23 @@ class SessionManager:
             Unique session ID string
         """
         session_id = str(uuid.uuid4())
-        current_time = time.time()
         
         with self._lock:
-            session_info = SessionInfo(
+            # Create session state with all necessary info
+            session_state = SessionState(
                 session_id=session_id,
-                created_at=current_time,
-                last_activity=current_time,
                 websocket=websocket,
                 user_agent=user_agent,
                 ip_address=ip_address
             )
-            
-            self.sessions[session_id] = session_info
-            self.session_components[session_id] = {}
-            
-            # Create session state tracking
-            session_state = SessionState(
-                session_id=session_id,
-                user_agent=user_agent,
-                ip_address=ip_address
-            )
             session_state.update_status(SessionStatus.CONNECTED)
-            self.session_states[session_id] = session_state
+            
+            self.sessions[session_id] = session_state
+            self.session_components[session_id] = {}
             
         logger.debug(f"🏢✨ Created session {session_id[:8]} (Total sessions: {len(self.sessions)})")
         
         # Broadcast update (async)
-        import asyncio
         try:
             asyncio.create_task(self.broadcast_session_update())
         except RuntimeError:
@@ -98,8 +200,8 @@ class SessionManager:
         
         return session_id
     
-    def get_session(self, session_id: str) -> Optional[SessionInfo]:
-        """Get session info by ID."""
+    def get_session(self, session_id: str) -> Optional[SessionState]:
+        """Get session state by ID."""
         with self._lock:
             return self.sessions.get(session_id)
     
@@ -107,12 +209,9 @@ class SessionManager:
         """Update the last activity timestamp for a session."""
         with self._lock:
             if session_id in self.sessions:
-                self.sessions[session_id].last_activity = time.time()
-            if session_id in self.session_states:
-                self.session_states[session_id].update_activity()
+                self.sessions[session_id].update_activity()
         
         # Broadcast update (async)
-        import asyncio
         try:
             asyncio.create_task(self.broadcast_session_update())
         except RuntimeError:
@@ -138,22 +237,20 @@ class SessionManager:
         This method is now a coroutine to handle async cleanup.
         """
         with self._lock:
-            session_info = self.sessions.pop(session_id, None)
-            session_state = self.session_states.pop(session_id, None)
+            session_state = self.sessions.pop(session_id, None)
             components = self.session_components.pop(session_id, {})
             
-        if session_info is None:
+        if session_state is None:
             logger.warning(f"🏢⚠️ Attempted to remove non-existent session {session_id[:8]}")
             return False
         
         # Cleanup session components
         await self._cleanup_session_components(session_id, components)
         
-        session_duration = time.time() - session_info.created_at
+        session_duration = session_state.get_duration_seconds()
         logger.debug(f"🏢🗑️ Removed session {session_id[:8]} (Duration: {session_duration:.1f}s, Total sessions: {len(self.sessions)})")
         
         # Broadcast update (async)
-        import asyncio
         try:
             asyncio.create_task(self.broadcast_session_update())
         except RuntimeError:
@@ -184,7 +281,7 @@ class SessionManager:
         with self._lock:
             return len([s for s in self.sessions.values() if s.is_active])
     
-    def get_all_session_ids(self) -> list[str]:
+    def get_all_session_ids(self) -> List[str]:
         """Get all session IDs."""
         with self._lock:
             return list(self.sessions.keys())
@@ -233,9 +330,9 @@ class SessionManager:
         expired_sessions = []
         
         with self._lock:
-            for session_id, session_info in self.sessions.items():
-                if (not session_info.is_active and 
-                    current_time - session_info.last_activity > self.session_timeout):
+            for session_id, session_state in self.sessions.items():
+                if (not session_state.is_active and 
+                    current_time - session_state.last_activity > self.session_timeout):
                     expired_sessions.append(session_id)
         
         if expired_sessions:
@@ -251,7 +348,7 @@ class SessionManager:
             total_count = len(self.sessions)
             
             if total_count > 0:
-                avg_duration = sum(current_time - s.created_at for s in self.sessions.values()) / total_count
+                avg_duration = sum(s.get_duration_seconds() for s in self.sessions.values()) / total_count
                 oldest_session = min(s.created_at for s in self.sessions.values())
                 newest_session = max(s.created_at for s in self.sessions.values())
             else:
@@ -260,10 +357,7 @@ class SessionManager:
                 newest_session = current_time
             
             # Get detailed session list
-            detailed_sessions = []
-            for session_id, session_state in self.session_states.items():
-                if session_id in self.sessions:  # Only active sessions
-                    detailed_sessions.append(session_state.to_dict())
+            detailed_sessions = [session_state.to_dict() for session_state in self.sessions.values()]
             
             return {
                 "total_sessions": total_count,
@@ -272,22 +366,21 @@ class SessionManager:
                 "average_duration_seconds": avg_duration,
                 "oldest_session_age_seconds": current_time - oldest_session,
                 "newest_session_age_seconds": current_time - newest_session,
-                "sessions": detailed_sessions  # Add detailed session list
+                "sessions": detailed_sessions
             }
 
     def get_session_state(self, session_id: str) -> Optional[SessionState]:
         """Get the session state for a specific session."""
         with self._lock:
-            return self.session_states.get(session_id)
+            return self.sessions.get(session_id)
 
     def update_session_status(self, session_id: str, status: SessionStatus):
         """Update the status of a session."""
         with self._lock:
-            if session_id in self.session_states:
-                self.session_states[session_id].update_status(status)
+            if session_id in self.sessions:
+                self.sessions[session_id].update_status(status)
         
-        # Broadcast update (async) - keeping original logic
-        import asyncio
+        # Broadcast update (async)
         try:
             asyncio.create_task(self.broadcast_session_update())
         except RuntimeError:
@@ -315,7 +408,6 @@ class SessionManager:
                             message_queue.put_nowait(update_message)
                         else:
                             # For asyncio queues
-                            import asyncio
                             asyncio.create_task(message_queue.put(update_message))
                     except Exception as e:
                         logger.warning(f"🏢⚠️ Failed to send session update to {session_id[:8]}: {e}")

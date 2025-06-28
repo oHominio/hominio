@@ -44,8 +44,6 @@ DEFAULT_RECORDER_CONFIG: Dict[str, Any] = {
     "beam_size": 3,
     "beam_size_realtime": 3,
     "no_log_file": True,
-    "wake_words": "jarvis",
-    "wakeword_backend": "pvporcupine",
     "allowed_latency_limit": 500,
     # Callbacks will be added dynamically in _create_recorder
     "debug_mode": True,
@@ -105,7 +103,6 @@ class TranscriptionProcessor:
             before_final_sentence: Optional[Callable[[Optional[np.ndarray], Optional[str]], bool]] = None,
             silence_active_callback: Optional[Callable[[bool], None]] = None,
             on_recording_start_callback: Optional[Callable[[], None]] = None,
-            is_orpheus: bool = False,
             local: bool = True,
             tts_allowed_event: Optional[threading.Event] = None, # Note: This seems unused in the original code provided
             pipeline_latency: float = 0.5,
@@ -123,8 +120,7 @@ class TranscriptionProcessor:
             potential_sentence_end: Callback triggered when a potential sentence end is detected. Receives the potentially complete sentence text.
             before_final_sentence: Callback triggered just before the recorder finalizes transcription. Receives audio copy and current real-time text. Return True to potentially influence recorder behavior (if supported).
             silence_active_callback: Callback triggered when silence detection state changes. Receives boolean (True if silence is active).
-            on_recording_start_callback: Callback triggered when the recorder starts recording after silence or wake word.
-            is_orpheus: Flag indicating if specific timing adjustments for 'Orpheus' mode should be used.
+            on_recording_start_callback: Callback triggered when the recorder starts recording after silence.
             local: Flag used by TurnDetection (if enabled) to indicate local vs remote processing context.
             tts_allowed_event: An event that might be set when TTS synthesis is allowed (currently unused in provided logic).
             pipeline_latency: Estimated latency of the downstream processing pipeline in seconds. Used for timing calculations.
@@ -139,13 +135,10 @@ class TranscriptionProcessor:
         self.before_final_sentence = before_final_sentence
         self.silence_active_callback = silence_active_callback
         self.on_recording_start_callback = on_recording_start_callback
-        self.is_orpheus = is_orpheus
         self.pipeline_latency = pipeline_latency
         self.recorder: Optional[AudioToTextRecorder | AudioToTextRecorderClient] = None
         self.is_silero_speech_active: bool = False # Note: Seems unused
         self.silero_working: bool = False         # Note: Seems unused
-        self.on_wakeword_detection_start: Optional[Callable] = None # Note: Seems unused
-        self.on_wakeword_detection_end: Optional[Callable] = None   # Note: Seems unused
         self.realtime_text: Optional[str] = None
         self.sentence_end_cache: List[Dict[str, Any]] = []
         self.potential_sentences_yielded: List[Dict[str, Any]] = []
@@ -272,12 +265,7 @@ class TranscriptionProcessor:
                     if start_hot_condition_time < self._MIN_HOT_CONDITION_DURATION_S:
                         start_hot_condition_time = self._MIN_HOT_CONDITION_DURATION_S
 
-                    # Adjust potential_sentence_end_time based on Orpheus mode
-                    if self.is_orpheus:
-                         # For Orpheus, ensure potential end detection doesn't happen too early relative to hot state
-                        orpheus_potential_end_time = silence_waiting_time - self._HOT_THRESHOLD_OFFSET_S
-                        if potential_sentence_end_time < orpheus_potential_end_time:
-                             potential_sentence_end_time = orpheus_potential_end_time
+
 
 
                     # --- Trigger Actions Based on Timing ---
@@ -783,13 +771,9 @@ class TranscriptionProcessor:
                 # Note: The client might use different callback names, adjust if needed
                 # For now, assume it might accept the same or handle internally
                 self.recorder = AudioToTextRecorderClient(**active_config)
-                # Ensure wake words are disabled if needed (can also be done via config dict)
-                self._set_recorder_param("use_wake_words", False)
             else:
                 # Instantiate the LOCAL recorder with the corrected active_config
                 self.recorder = AudioToTextRecorder(**active_config)
-                # Ensure wake words are disabled if needed (double check via param setting)
-                self._set_recorder_param("use_wake_words", False) # Uses the helper method
 
             logger.debug(f"👂✅ {recorder_type} instance created successfully.")
 

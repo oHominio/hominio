@@ -28,7 +28,6 @@ class AudioInputProcessor:
     def __init__(
             self,
             language: str = "en",
-            is_orpheus: bool = False,
             silence_active_callback: Optional[Callable[[bool], None]] = None,
             pipeline_latency: float = 0.5,
         ) -> None:
@@ -37,7 +36,6 @@ class AudioInputProcessor:
 
         Args:
             language: Target language code for transcription (e.g., "en").
-            is_orpheus: Flag indicating if a specific model variant should be used.
             silence_active_callback: Optional callback function invoked when silence state changes.
                                      It receives a boolean argument (True if silence is active).
             pipeline_latency: Estimated latency of the processing pipeline in seconds.
@@ -50,21 +48,18 @@ class AudioInputProcessor:
             llm_provider="openai", 
             llm_model="phala/llama-3.3-70b-instruct",
             no_think=False,
-            orpheus_model="orpheus-3b-0.1-ft-Q8_0-GGUF/orpheus-3b-0.1-ft-q8_0.gguf"
         )
         
         self.transcriber = TranscriptionProcessor(
             language,
             on_recording_start_callback=self._on_recording_start,
             silence_active_callback=self._silence_active_callback,
-            is_orpheus=is_orpheus,
             pipeline_latency=pipeline_latency,
         )
         # Flag to indicate if the transcription loop has failed fatally
         self._transcription_failed = False
         self.transcription_task = None  # Will be created when needed
         self._task_started = False
-
 
         self.realtime_callback: Optional[Callable[[str], None]] = None
         self.recording_start_callback: Optional[Callable[[None], None]] = None # Type adjusted
@@ -151,7 +146,6 @@ class AudioInputProcessor:
 
         logger.info(f"👂⏹️ Background transcription task ({task_name}) finished.")
 
-
     def process_audio_chunk(self, raw_bytes: bytes) -> np.ndarray:
         """
         Converts raw audio bytes (int16) to a 16kHz 16-bit PCM numpy array.
@@ -183,7 +177,6 @@ class AudioInputProcessor:
         resampled_int16 = np.clip(resampled_float, -32768, 32767).astype(np.int16)
 
         return resampled_int16
-
 
     async def process_chunk_queue(self, audio_queue: asyncio.Queue) -> None:
         """
@@ -219,104 +212,108 @@ class AudioInputProcessor:
                 # Needs to check self.transcription_task existence as it might be None during shutdown
                 if self.transcription_task and self.transcription_task.done() and not self._transcription_failed:
                      # Attempt to check exception status if task is done
-                    task_exception = self.transcription_task.exception()
-                    if task_exception and not isinstance(task_exception, asyncio.CancelledError):
-                        # If there was an exception other than CancelledError, treat it as failed.
-                        logger.error(f"👂🛑 Transcription task finished with unexpected error: {task_exception}. Stopping audio processing.", exc_info=task_exception)
-                        self._transcription_failed = True # Mark as failed
-                        break
-                    else:
-                         # Finished cleanly or was cancelled
-                        logger.warning("👂⏹️ Transcription task is no longer running (completed or cancelled). Stopping audio processing.")
-                        break # Stop processing
+                     exception_result = self.transcription_task.exception()
+                     if exception_result is not None:
+                         logger.error(f"👂💥 Transcription task finished with exception: {exception_result}")
+                         self._transcription_failed = True
+                         break
+                     else:
+                         logger.warning("👂⚠️ Transcription task finished without exception. This is unexpected.")
 
-                # Check queue size for overflow protection
-                queue_size = audio_queue.qsize() if hasattr(audio_queue, 'qsize') else 0
+                # Check queue size and apply backpressure
+                queue_size = audio_queue.qsize()
                 if queue_size > self.max_queue_size:
-                    logger.warning(f"👂⚠️ Audio queue overflow detected ({queue_size}/{self.max_queue_size}), draining old chunks")
-                    # Drain old chunks to prevent memory buildup
-                    drained_count = 0
-                    target_size = self.max_queue_size // 2  # Drain to 50% capacity
-                    while queue_size > target_size and drained_count < 100:  # Safety limit
+                    logger.warning(f"👂⚠️ Audio queue overflow ({queue_size}), dropping oldest chunks")
+                    # Drop old chunks to prevent memory overflow
+                    for _ in range(min(queue_size - self.max_queue_size + 50, queue_size)):
                         try:
-                            await asyncio.wait_for(audio_queue.get(), timeout=0.001)
-                            drained_count += 1
-                            queue_size -= 1
+                            audio_queue.get_nowait()
                             self.dropped_chunks += 1
-                        except (asyncio.TimeoutError, asyncio.QueueEmpty):
+                        except asyncio.QueueEmpty:
                             break
-                    if drained_count > 0:
-                        logger.warning(f"👂🗑️ Drained {drained_count} old audio chunks, total dropped: {self.dropped_chunks}")
-                
-                audio_data = await audio_queue.get()
-                if audio_data is None:
-                    logger.info("👂🔌 Received termination signal for audio processing.")
-                    break  # Termination signal
 
-                pcm_data = audio_data.pop("pcm")
+                # Get audio chunk with timeout to prevent infinite blocking
+                try:
+                    chunk_data = await asyncio.wait_for(audio_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    # Timeout occurred, check loop conditions again
+                    continue
 
-                # Process audio chunk (resampling happens consistently via float32)
-                processed = self.process_audio_chunk(pcm_data)
-                if processed.size == 0:
-                    continue # Skip empty chunks
+                # Check for termination signal
+                if chunk_data is None:
+                    logger.debug("👂🛑 Received termination signal (None). Stopping audio processing.")
+                    break
 
-                # Feed audio only if not interrupted and transcriber should be running
+                # Extract PCM data
+                pcm_data = chunk_data.get('pcm')
+                if pcm_data is None:
+                    logger.warning("👂⚠️ Received chunk with no PCM data. Skipping.")
+                    continue
+
+                # Process audio chunk
                 if not self.interrupted:
-                    # Check failure flag again, as it might have been set between queue.get and here
-                     if not self._transcription_failed:
-                        # Feed audio to the underlying processor
-                        self.transcriber.feed_audio(processed.tobytes(), audio_data)
-                     # No 'else' needed here because the checks at the start of the loop handle termination
+                    try:
+                        processed_audio = self.process_audio_chunk(pcm_data)
+                        self.transcriber.feed_audio(processed_audio.tobytes(), {})
+                    except Exception as e:
+                        logger.error(f"👂💥 Error processing audio chunk: {e}", exc_info=True)
+                        # Continue processing despite error
+
+                # Mark task as done for this chunk
+                audio_queue.task_done()
 
             except asyncio.CancelledError:
-                logger.info("👂🚫 Audio processing task cancelled.")
+                logger.info("👂🚫 Audio chunk processing cancelled.")
                 break
             except Exception as e:
-                # Log general errors during audio chunk processing
-                logger.error(f"👂💥 Audio processing error in queue loop: {e}", exc_info=True)
-                # Continue processing subsequent chunks after logging the error.
-                # Consider adding logic to break if errors persist.
+                logger.error(f"👂💥 Unexpected error in audio processing loop: {e}", exc_info=True)
+                # Continue processing despite error
+                await asyncio.sleep(0.1)  # Brief pause to prevent tight error loop
+
         logger.info("👂⏹️ Audio chunk processing loop finished.")
 
+    def set_callbacks(
+        self,
+        realtime_callback: Optional[Callable[[str], None]] = None,
+        recording_start_callback: Optional[Callable[[None], None]] = None,
+    ) -> None:
+        """
+        Sets external callbacks for transcription events.
+
+        Args:
+            realtime_callback: Called with partial transcription text as it becomes available.
+            recording_start_callback: Called when recording starts (e.g., when silence ends).
+        """
+        self.realtime_callback = realtime_callback
+        self.recording_start_callback = recording_start_callback
 
     def shutdown(self) -> None:
         """
-        Initiates shutdown procedures for the audio processor and transcriber.
+        Shuts down the AudioInputProcessor and cleans up resources.
 
-        Signals the transcriber to shut down and cancels the background
-        transcription task.
+        Cancels the background transcription task, shuts down internal components,
+        and performs cleanup.
         """
-        logger.info("👂🛑 Shutting down AudioInputProcessor...")
-        
-        # Untrack resource
-        self.resource_tracker.untrack_resource("global", "AudioInputProcessor", f"audio_input_{id(self)}")
-        
-        # Shutdown speech pipeline manager first to prevent user interference
-        if hasattr(self, 'speech_pipeline_manager'):
-            try:
-                logger.info("👂🛑 Shutting down dedicated SpeechPipelineManager...")
-                self.speech_pipeline_manager.shutdown()
-                logger.info("👂✅ SpeechPipelineManager shutdown complete.")
-            except Exception as e:
-                logger.error(f"👂💥 Error shutting down SpeechPipelineManager: {e}")
-        
-        # Ensure transcriber shutdown is called first to signal the loop
-        if hasattr(self.transcriber, 'shutdown'):
-             logger.info("👂🛑 Signaling TranscriptionProcessor to shut down.")
-             self.transcriber.shutdown()
-        else:
-             logger.warning("👂⚠️ TranscriptionProcessor does not have a shutdown method.")
+        logger.info("👂🔌 Shutting down AudioInputProcessor...")
 
+        # Cancel transcription task
         if self.transcription_task and not self.transcription_task.done():
-            task_name = self.transcription_task.get_name() if hasattr(self.transcription_task, 'get_name') else 'TranscriptionTask'
-            logger.info(f"👂🚫 Cancelling background transcription task ({task_name})...")
             self.transcription_task.cancel()
-            # Optional: Add await with timeout here in an async shutdown context
-            # try:
-            #     await asyncio.wait_for(self.transcription_task, timeout=5.0)
-            # except (asyncio.TimeoutError, asyncio.CancelledError, Exception) as e:
-            #     logger.warning(f"👂⚠️ Error/Timeout waiting for transcription task {task_name} cancellation: {e}")
-        else:
-            logger.info("👂✅ Transcription task already done or not running during shutdown.")
+            logger.debug("👂🚫 Transcription task cancelled.")
 
-        logger.info("👂👋 AudioInputProcessor shutdown sequence initiated.")
+        # Shutdown transcriber
+        if hasattr(self, 'transcriber') and self.transcriber:
+            self.transcriber.shutdown()
+
+        # Shutdown speech pipeline manager
+        if hasattr(self, 'speech_pipeline_manager') and self.speech_pipeline_manager:
+            self.speech_pipeline_manager.shutdown()
+
+        # Untrack resource
+        if hasattr(self, 'resource_tracker'):
+            self.resource_tracker.untrack_resource("global", "AudioInputProcessor", f"audio_input_{id(self)}")
+
+        if self.dropped_chunks > 0:
+            logger.info(f"👂📊 Total dropped chunks during session: {self.dropped_chunks}")
+
+        logger.info("👂🔌 AudioInputProcessor shutdown complete.")

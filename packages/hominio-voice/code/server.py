@@ -8,18 +8,18 @@ if __name__ == "__main__":
     logger.info("🖥️👋 Welcome to local real-time voice chat")
 
 from upsample_overlap import UpsampleOverlap
-from datetime import datetime
+# Removed datetime import - was only used for timestamp formatting
 from colors import Colors
 import uvicorn
 import asyncio
 import struct
 import json
 import time
-import threading # Keep threading for SpeechPipelineManager internals and AbortWorker
+import threading # For per-user SpeechPipelineManager worker threads and managed thread system
 import sys
 import os # Added for environment variable access
 
-from typing import Any, Dict, Optional, Callable # Added for type hints in docstrings
+from typing import Any, Dict, Optional # For type hints in docstrings
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -31,23 +31,21 @@ from starlette.responses import HTMLResponse, Response, FileResponse
 
 # Session management imports
 from session_manager import SessionManager
-from session_state import SessionStatus
+from session_manager import SessionStatus
 
 # Memory & Thread management imports
-from memory_manager import get_memory_monitor, get_resource_tracker, QueueManager
-from thread_manager import get_thread_manager, create_managed_thread
+from memory_manager import get_memory_monitor, get_resource_tracker
+from thread_manager import get_thread_manager
 
 USE_SSL = False
 TTS_START_ENGINE = "kokoro"
-TTS_ORPHEUS_MODEL = "Orpheus_3B-1BaseGGUF/mOrpheus_3B-1Base_Q4_K_M.gguf"
-TTS_ORPHEUS_MODEL = "orpheus-3b-0.1-ft-Q8_0-GGUF/orpheus-3b-0.1-ft-q8_0.gguf"
 
 LLM_START_PROVIDER = "openai"
 LLM_START_MODEL = "phala/llama-3.3-70b-instruct"
 # LLM_START_PROVIDER = "lmstudio"
 # LLM_START_MODEL = "Qwen3-30B-A3B-GGUF/Qwen3-30B-A3B-Q3_K_L.gguf"
 NO_THINK = False
-DIRECT_STREAM = TTS_START_ENGINE=="kokoro"  # Kokoro supports streaming through RealtimeTTS
+DIRECT_STREAM = True  # Kokoro supports streaming through RealtimeTTS
 
 if __name__ == "__main__":
     logger.info(f"🖥️⚙️ {Colors.apply('[PARAM]').blue} Starting engine: {Colors.apply(TTS_START_ENGINE).blue}")
@@ -199,15 +197,7 @@ async def lifespan(app: FastAPI):
     
     # Removed system monitoring initialization
     
-    # Initialize global components - these will be shared by sessions but accessed safely
-    app.state.SpeechPipelineManager = SpeechPipelineManager(
-        tts_engine=TTS_START_ENGINE,
-        llm_provider=LLM_START_PROVIDER,
-        llm_model=LLM_START_MODEL,
-        no_think=NO_THINK,
-        orpheus_model=TTS_ORPHEUS_MODEL,
-    )
-
+    # Initialize components for multi-user concurrency
     app.state.Upsampler = UpsampleOverlap()
     
     # Initialize AudioInputProcessor pool for multi-user concurrency
@@ -233,11 +223,10 @@ async def lifespan(app: FastAPI):
         initial_size=initial_pool_size,
         max_size=max_concurrent_users,
         language=LANGUAGE,
-        is_orpheus=TTS_START_ENGINE=="orpheus",
-        pipeline_latency=app.state.SpeechPipelineManager.full_output_pipeline_latency / 1000, # seconds
+        pipeline_latency=0.5,  # Default pipeline latency, each user gets their own manager
     )
     
-    app.state.Aborting = False # Keep this? Its usage isn't clear in the provided snippet. Minimizing changes.
+    # Removed legacy global abort flag - each user session manages its own state
 
     yield
 
@@ -286,52 +275,15 @@ async def health_check():
     """Health check endpoint for Fly.io deployment"""
     try:
         # Quick health check - verify key components are initialized
-        if (hasattr(app.state, 'SpeechPipelineManager') and 
-            app.state.SpeechPipelineManager is not None):
-            return {"status": "healthy", "kokoro": "ready", "message": "All systems operational"}
+        if (hasattr(app.state, 'AudioInputProcessorPool') and 
+            app.state.AudioInputProcessorPool is not None):
+            return {"status": "healthy", "multi_user": "ready", "message": "All systems operational"}
         else:
-            return {"status": "initializing", "kokoro": "loading", "message": "System still starting up"}
+            return {"status": "initializing", "multi_user": "loading", "message": "System still starting up"}
     except Exception as e:
         return {"status": "error", "error": str(e), "message": "Health check failed"}
 
-@app.get("/sessions")
-async def session_stats():
-    """
-    Returns session statistics for monitoring multi-user usage.
-
-    Returns:
-        dict: Session statistics including active users, total sessions, etc.
-    """
-    try:
-        stats = app.state.SessionManager.get_session_stats()
-        return {
-            "status": "OK",
-            "timestamp": time.time(),
-            "sessions": stats
-        }
-    except Exception as e:
-        return {"status": "error", "error": str(e), "message": "Failed to get session stats"}
-
-@app.get("/pool")
-async def pool_stats():
-    """
-    Returns AudioInputProcessor pool statistics for monitoring resource usage.
-
-    Returns:
-        dict: Pool statistics including allocation counts, utilization, etc.
-    """
-    try:
-        if hasattr(app.state, 'AudioInputProcessorPool'):
-            pool_status = app.state.AudioInputProcessorPool.get_pool_status()
-            return {
-                "status": "OK",
-                "timestamp": time.time(),
-                "pool": pool_status
-            }
-        else:
-            return {"status": "error", "message": "AudioInputProcessor pool not available"}
-    except Exception as e:
-        return {"status": "error", "error": str(e), "message": "Failed to get pool stats"}
+# Removed /sessions and /pool monitoring endpoints - not used by main application
 
 @app.get("/favicon.ico")
 async def favicon():
@@ -357,24 +309,7 @@ async def get_index() -> HTMLResponse:
         html_content = f.read()
     return HTMLResponse(content=html_content)
 
-@app.get("/dashboard")
-async def get_dashboard() -> HTMLResponse:
-    """
-    Serves the dashboard interface for load testing and system monitoring.
-
-    Returns:
-        An HTMLResponse containing the dashboard interface.
-    """
-    try:
-        with open("static/dashboard.html", "r", encoding="utf-8") as f:
-            html_content = f.read()
-        return HTMLResponse(content=html_content)
-    except FileNotFoundError:
-        return HTMLResponse("""
-        <!DOCTYPE html>
-        <html><head><title>Dashboard</title></head>
-        <body><h1>Dashboard Page Not Found</h1></body></html>
-        """, status_code=404)
+# Removed /dashboard endpoint - dashboard.html doesn't exist and UI links were removed
 
 # --------------------------------------------------------------------
 # Utility functions
@@ -397,31 +332,7 @@ def parse_json_message(text: str) -> dict:
         logger.warning("🖥️⚠️ Ignoring client message with invalid JSON")
         return {}
 
-def format_timestamp_ns(timestamp_ns: int) -> str:
-    """
-    Formats a nanosecond timestamp into a human-readable HH:MM:SS.fff string.
-
-    Args:
-        timestamp_ns: The timestamp in nanoseconds since the epoch.
-
-    Returns:
-        A string formatted as hours:minutes:seconds.milliseconds.
-    """
-    # Split into whole seconds and the nanosecond remainder
-    seconds = timestamp_ns // 1_000_000_000
-    remainder_ns = timestamp_ns % 1_000_000_000
-
-    # Convert seconds part into a datetime object (local time)
-    dt = datetime.fromtimestamp(seconds)
-
-    # Format the main time as HH:MM:SS
-    time_str = dt.strftime("%H:%M:%S")
-
-    # For instance, if you want milliseconds, divide the remainder by 1e6 and format as 3-digit
-    milliseconds = remainder_ns // 1_000_000
-    formatted_timestamp = f"{time_str}.{milliseconds:03d}"
-
-    return formatted_timestamp
+# Removed format_timestamp_ns() function - was only used for debug timestamp formatting
 
 # --------------------------------------------------------------------
 # WebSocket data processing
@@ -439,7 +350,7 @@ async def process_incoming_data(ws: WebSocket, app: FastAPI, incoming_chunks: as
 
     Args:
         ws: The WebSocket connection instance.
-        app: The FastAPI application instance (for accessing global state if needed).
+        app: The FastAPI application instance (for accessing shared application components).
         incoming_chunks: An asyncio queue to put processed audio metadata dictionaries into.
         callbacks: The TranscriptionCallbacks instance for this connection to manage state.
         session_id: The unique session identifier for this WebSocket connection.
@@ -466,14 +377,12 @@ async def process_incoming_data(ws: WebSocket, app: FastAPI, incoming_chunks: as
                 metadata = {
                     "client_sent_ms":           timestamp_ms,
                     "client_sent":              client_sent_ns,
-                    "client_sent_formatted":    format_timestamp_ns(client_sent_ns),
                     "isTTSPlaying":             bool(flags & 1),
                 }
 
                 # Record server receive time
                 server_ns = time.time_ns()
                 metadata["server_received"] = server_ns
-                metadata["server_received_formatted"] = format_timestamp_ns(server_ns)
 
                 # The rest of the payload is raw PCM bytes
                 metadata["pcm"] = raw[8:]
@@ -551,12 +460,11 @@ async def process_incoming_data(ws: WebSocket, app: FastAPI, incoming_chunks: as
                 
                 elif msg_type == "clear_history":
                     logger.debug("🖥️ℹ️ Received clear_history from client.")
-                    # Use per-user speech pipeline manager instead of global
+                    # Use per-user speech pipeline manager
                     if callbacks.audio_processor and hasattr(callbacks.audio_processor, 'speech_pipeline_manager'):
                         callbacks.audio_processor.speech_pipeline_manager.reset()
                     else:
-                        # Fallback to global manager if per-user not available yet
-                        app.state.SpeechPipelineManager.reset()
+                        logger.warning("🖥️⚠️ Cannot clear history - no audio processor allocated yet")
                 elif msg_type == "set_speed":
                     speed_value = data.get("speed", 0)
                     speed_factor = speed_value / 100.0  # Convert 0-100 to 0.0-1.0
@@ -679,8 +587,6 @@ async def send_tts_chunks(app: FastAPI, message_queue: asyncio.Queue, callbacks:
         logger.info("🖥️🔊 Starting TTS chunk sender")
         last_quick_answer_chunk = 0
         last_chunk_sent = 0
-        prev_status = None
-        last_status_log_time = 0  # Add throttling for status logs
 
         while True:
             await asyncio.sleep(0.001) # Yield control
@@ -691,56 +597,30 @@ async def send_tts_chunks(app: FastAPI, message_queue: asyncio.Queue, callbacks:
                 callbacks.interruption_time = 0 # Reset via callbacks
                 logger.info(Colors.apply("🖥️🎙️ interruption flag reset after 2 seconds").cyan)
 
-            # Use per-user speech pipeline manager instead of global
+            # Use per-user speech pipeline manager
             speech_manager = None
             if callbacks.audio_processor and hasattr(callbacks.audio_processor, 'speech_pipeline_manager'):
                 speech_manager = callbacks.audio_processor.speech_pipeline_manager
             else:
-                # Fallback to global manager if per-user not available yet
-                speech_manager = app.state.SpeechPipelineManager
+                # No processor allocated yet, skip TTS processing
+                await asyncio.sleep(0.001)
+                continue
                 
             is_tts_finished = speech_manager.is_valid_gen() and speech_manager.running_generation.audio_quick_finished
 
-            def log_status():
-                nonlocal prev_status, last_status_log_time
-                current_time = time.time()
-                last_quick_answer_chunk_decayed = (
-                    last_quick_answer_chunk
-                    and time.time() - last_quick_answer_chunk > TTS_FINAL_TIMEOUT
-                    and time.time() - last_chunk_sent > TTS_FINAL_TIMEOUT
-                )
-
-                curr_status = (
-                    # Access connection-specific state via callbacks
-                    int(callbacks.tts_to_client),
-                    int(callbacks.tts_client_playing),
-                    int(callbacks.tts_chunk_sent),
-                    1, # Placeholder?
-                    int(callbacks.is_hot), # from callbacks
-                    int(callbacks.synthesis_started), # from callbacks
-                    int(speech_manager.running_generation is not None), # Per-user manager state
-                    int(speech_manager.is_valid_gen()), # Per-user manager state
-                    int(is_tts_finished), # Calculated local variable
-                    int(callbacks.audio_processor.interrupted if callbacks.audio_processor else False) # Input processor state
-                )
-
-                # State logging removed to reduce noise
-                prev_status = curr_status
+            # Removed log_status() function - was creating status tuples but not actually logging them
 
             # Use connection-specific state via callbacks
             if not callbacks.tts_to_client:
                 await asyncio.sleep(0.001)
-                log_status()
                 continue
 
             if not speech_manager.running_generation:
                 await asyncio.sleep(0.001)
-                log_status()
                 continue
 
             if speech_manager.running_generation.abortion_started:
                 await asyncio.sleep(0.001)
-                log_status()
                 continue
 
             if not speech_manager.running_generation.audio_quick_finished:
@@ -748,7 +628,6 @@ async def send_tts_chunks(app: FastAPI, message_queue: asyncio.Queue, callbacks:
 
             if not speech_manager.running_generation.quick_answer_first_chunk_ready:
                 await asyncio.sleep(0.001)
-                log_status()
                 continue
 
             chunk = None
@@ -771,7 +650,6 @@ async def send_tts_chunks(app: FastAPI, message_queue: asyncio.Queue, callbacks:
                     callbacks.reset_state() # Reset connection state via callbacks
 
                 await asyncio.sleep(0.001)
-                log_status()
                 continue
 
             base64_chunk = app.state.Upsampler.get_base64_chunk(chunk)
@@ -854,16 +732,14 @@ class TranscriptionCallbacks:
         # Abort generation using the session-specific speech pipeline manager
         if self.audio_processor and hasattr(self.audio_processor, 'speech_pipeline_manager'):
             self.audio_processor.speech_pipeline_manager.abort_generation(reason="reset_state")
-        else:
-            # Fallback to global manager if per-user not available yet
-            self.app.state.SpeechPipelineManager.abort_generation(reason="reset_state")
+        # Note: If no processor allocated yet, no generation to abort
 
     def on_partial(self, txt: str):
         """
         Callback invoked when a partial transcription result is available.
 
         Updates internal state, sends the partial result to the client,
-        and signals the abort worker thread to check for potential interruptions.
+        and triggers abort checking for the user's speech pipeline.
 
         Args:
             txt: The partial transcription text.
@@ -873,7 +749,7 @@ class TranscriptionCallbacks:
         self.partial_transcription = txt
         self.message_queue.put_nowait({"type": "partial_user_request", "content": txt})
         self.abort_text = txt # Update text used for abort check
-        self.abort_request_event.set() # Signal the abort worker
+        self.abort_request_event.set() # Signal abort checking for this user's pipeline
         
         # Update session state
         session_state = self.app.state.SessionManager.get_session_state(self.session_id)
@@ -882,23 +758,20 @@ class TranscriptionCallbacks:
             session_state.increment_message_received()
 
     def safe_abort_running_syntheses(self, reason: str):
-        """Placeholder for safely aborting syntheses (currently does nothing)."""
-        # TODO: Implement actual abort logic if needed, potentially interacting with SpeechPipelineManager
-        pass
+        """Safely aborts running syntheses using the per-user speech pipeline manager."""
+        if self.audio_processor and hasattr(self.audio_processor, 'speech_pipeline_manager'):
+            self.audio_processor.speech_pipeline_manager.abort_generation(reason=f"safe_abort_running_syntheses: {reason}")
+        # Note: If no processor allocated yet, no generation to abort
 
     def on_tts_allowed_to_synthesize(self):
         """Callback invoked when the system determines TTS synthesis can proceed."""
-        # Use per-user speech pipeline manager instead of global
-        speech_manager = None
+        # Use per-user speech pipeline manager
         if self.audio_processor and hasattr(self.audio_processor, 'speech_pipeline_manager'):
             speech_manager = self.audio_processor.speech_pipeline_manager
-        else:
-            # Fallback to global manager if per-user not available yet
-            speech_manager = self.app.state.SpeechPipelineManager
-            
-        if speech_manager.running_generation and not speech_manager.running_generation.abortion_started:
-            logger.debug(f"🖥️🔊 TTS ALLOWED (Session: {self.session_id})")
-            speech_manager.running_generation.tts_quick_allowed_event.set()
+            if speech_manager.running_generation and not speech_manager.running_generation.abortion_started:
+                logger.debug(f"🖥️🔊 TTS ALLOWED (Session: {self.session_id})")
+                speech_manager.running_generation.tts_quick_allowed_event.set()
+        # Note: If no processor allocated yet, ignore TTS allowance signal
 
     def on_potential_sentence(self, txt: str):
         """
@@ -910,12 +783,10 @@ class TranscriptionCallbacks:
             txt: The potential sentence text.
         """
         logger.debug(f"🖥️🧠 Potential sentence: '{txt}'")
-        # Use per-user speech pipeline manager instead of global
+        # Use per-user speech pipeline manager
         if self.audio_processor and hasattr(self.audio_processor, 'speech_pipeline_manager'):
             self.audio_processor.speech_pipeline_manager.prepare_generation(txt)
-        else:
-            # Fallback to global manager if per-user not available yet
-            self.app.state.SpeechPipelineManager.prepare_generation(txt)
+        # Note: If no processor allocated yet, ignore potential sentence
 
     def on_potential_final(self, txt: str):
         """
@@ -949,17 +820,13 @@ class TranscriptionCallbacks:
         self.user_finished_turn = True
         self.user_interrupted = False # Reset connection-specific flag (user finished, not interrupted)
         
-        # Use per-user speech pipeline manager instead of global
-        speech_manager = None
+        # Use per-user speech pipeline manager
         if self.audio_processor and hasattr(self.audio_processor, 'speech_pipeline_manager'):
             speech_manager = self.audio_processor.speech_pipeline_manager
-        else:
-            # Fallback to global manager if per-user not available yet
-            speech_manager = self.app.state.SpeechPipelineManager
-            
-        if speech_manager.is_valid_gen():
-            logger.debug(f"🖥️🔊 TTS ALLOWED (before final, Session: {self.session_id})")
-            speech_manager.running_generation.tts_quick_allowed_event.set()
+            if speech_manager.is_valid_gen():
+                logger.debug(f"🖥️🔊 TTS ALLOWED (before final, Session: {self.session_id})")
+                speech_manager.running_generation.tts_quick_allowed_event.set()
+        # Note: If no processor allocated yet, ignore TTS allowance
 
         # first block further incoming audio (Audio processor's state)
         if self.audio_processor and not self.audio_processor.interrupted:
@@ -988,8 +855,10 @@ class TranscriptionCallbacks:
                 })
 
         logger.info(f"🖥️🧠 Adding user request to history: '{user_request_content}'")
-        # Use per-user speech pipeline manager's history instead of global
-        speech_manager.history.append({"role": "user", "content": user_request_content})
+        # Use per-user speech pipeline manager's history
+        if self.audio_processor and hasattr(self.audio_processor, 'speech_pipeline_manager'):
+            self.audio_processor.speech_pipeline_manager.history.append({"role": "user", "content": user_request_content})
+        # Note: If no processor allocated yet, history will be managed when processor is available
 
     def on_final(self, txt: str):
         """
@@ -1022,12 +891,10 @@ class TranscriptionCallbacks:
             reason: A string describing why the abortion is triggered.
         """
         logger.info(f"{Colors.apply('🖥️🛑 Aborting generation:').blue} {reason}")
-        # Use per-user speech pipeline manager instead of global
+        # Use per-user speech pipeline manager
         if self.audio_processor and hasattr(self.audio_processor, 'speech_pipeline_manager'):
             self.audio_processor.speech_pipeline_manager.abort_generation(reason=f"server.py abort_generations: {reason}")
-        else:
-            # Fallback to global manager if per-user not available yet
-            self.app.state.SpeechPipelineManager.abort_generation(reason=f"server.py abort_generations: {reason}")
+        # Note: If no processor allocated yet, no generation to abort
 
     def on_silence_active(self, silence_active: bool):
         """
@@ -1051,8 +918,6 @@ class TranscriptionCallbacks:
         Args:
             txt: The partial assistant text.
         """
-        # Remove partial assistant answer log noise - already handled by final answer
-        # logger.debug(f"{Colors.apply('🖥️💬 PARTIAL ASSISTANT ANSWER: ').green}{txt}")
         # Use connection-specific user_interrupted flag
         if not self.user_interrupted:
             self.assistant_answer = txt
@@ -1126,16 +991,11 @@ class TranscriptionCallbacks:
         """
         final_answer = ""
         
-        # Use per-user speech pipeline manager instead of global
-        speech_manager = None
+        # Use per-user speech pipeline manager
         if self.audio_processor and hasattr(self.audio_processor, 'speech_pipeline_manager'):
             speech_manager = self.audio_processor.speech_pipeline_manager
-        else:
-            # Fallback to global manager if per-user not available yet
-            speech_manager = self.app.state.SpeechPipelineManager
-            
-        if speech_manager.is_valid_gen():
-            final_answer = speech_manager.running_generation.quick_answer + speech_manager.running_generation.final_answer
+            if speech_manager.is_valid_gen():
+                final_answer = speech_manager.running_generation.quick_answer + speech_manager.running_generation.final_answer
 
         if not final_answer: # Check if constructed answer is empty
             # If forced, try using the last known partial answer from this connection
@@ -1162,8 +1022,9 @@ class TranscriptionCallbacks:
                     "type": "final_assistant_answer",
                     "content": cleaned_answer
                 })
-                # Use per-user speech pipeline manager's history instead of global
-                speech_manager.history.append({"role": "assistant", "content": cleaned_answer})
+                # Use per-user speech pipeline manager's history
+                if self.audio_processor and hasattr(self.audio_processor, 'speech_pipeline_manager'):
+                    self.audio_processor.speech_pipeline_manager.history.append({"role": "assistant", "content": cleaned_answer})
                 self.final_assistant_answer_sent = True
                 self.final_assistant_answer = cleaned_answer # Store the sent answer
                 
@@ -1347,8 +1208,7 @@ async def setup_processor_callbacks(app: FastAPI, session_id: str, callbacks: Tr
     if hasattr(audio_processor, 'speech_pipeline_manager'):
         audio_processor.speech_pipeline_manager.on_partial_assistant_text = callbacks.on_partial_assistant_text
     else:
-        # Fallback to global manager if per-user not available yet
-        app.state.SpeechPipelineManager.on_partial_assistant_text = callbacks.on_partial_assistant_text
+        logger.warning("🖥️⚠️ AudioProcessor missing speech_pipeline_manager - partial text callback not set")
 
 async def allocate_audio_processor(app: FastAPI, session_id: str, callbacks: TranscriptionCallbacks) -> bool | None:
     """

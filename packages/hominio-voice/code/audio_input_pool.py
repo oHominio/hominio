@@ -53,7 +53,7 @@ class AudioInputProcessorPool:
     """
     
     def __init__(self, initial_size: int = 3, max_size: int = 5, session_timeout: int = 300, 
-                 language: str = 'en', is_orpheus: bool = False, pipeline_latency: float = 0.5):
+                 language: str = 'en', pipeline_latency: float = 0.5):
         """
         Initialize the pool with expanded concurrent user support.
         
@@ -62,7 +62,6 @@ class AudioInputProcessorPool:
             max_size: Maximum number of instances allowed (default: 5) 
             session_timeout: Session timeout in seconds (default: 300)
             language: Language for STT (default: 'en')
-            is_orpheus: Whether to use Orpheus TTS (default: False)
             pipeline_latency: Pipeline latency in seconds (default: 0.5)
         """
         self.initial_size = initial_size
@@ -93,7 +92,6 @@ class AudioInputProcessorPool:
         # Default parameters for AudioInputProcessor creation
         self.default_params = {
             'language': language,
-            'is_orpheus': is_orpheus,
             'pipeline_latency': pipeline_latency,
         }
         

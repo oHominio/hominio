@@ -28,24 +28,6 @@ except FileNotFoundError:
     system_prompt = "You are a helpful assistant."
 
 
-USE_ORPHEUS_UNCENSORED = False
-
-orpheus_prompt_addon_normal = """
-When expressing emotions, you are ONLY allowed to use the following exact tags (including the spaces):
-" <laugh> ", " <chuckle> ", " <sigh> ", " <cough> ", " <sniffle> ", " <groan> ", " <yawn> ", and " <gasp> ".
-
-Do NOT create or use any other emotion tags. Do NOT remove the spaces. Use these tags exactly as shown, and only when appropriate.
-""".strip()
-
-orpheus_prompt_addon_uncensored = """
-When expressing emotions, you are ONLY allowed to use the following exact tags (including the spaces):
-" <moans> ", " <panting> ", " <grunting> ", " <gagging sounds> ", " <chokeing> ", " <kissing noises> ", " <laugh> ", " <chuckle> ", " <sigh> ", " <cough> ", " <sniffle> ", " <groan> ", " <yawn> ", " <gasp> ".
-Do NOT create or use any other emotion tags. Do NOT remove the spaces. Use these tags exactly as shown, and only when appropriate.
-""".strip()
-
-orpheus_prompt_addon = orpheus_prompt_addon_uncensored if USE_ORPHEUS_UNCENSORED else orpheus_prompt_addon_normal
-
-
 class PipelineRequest:
     """
     Represents a request to be processed by the SpeechPipelineManager's request queue.
@@ -122,48 +104,44 @@ class SpeechPipelineManager:
     and coordinates worker threads using queues and events.
     """
     def __init__(
-            self,
-                    tts_engine: str = "kokoro",
+        self,
+        tts_engine: str = "kokoro",
         llm_provider: str = "openai",
         llm_model: str = "phala/llama-3.3-70b-instruct",
-            no_think: bool = False,
-            orpheus_model: str = "orpheus-3b-0.1-ft-Q8_0-GGUF/orpheus-3b-0.1-ft-q8_0.gguf",
-        ):
+        no_think: bool = False,
+    ):
         """
         Initializes the SpeechPipelineManager.
-w
+
         Sets up configuration, instantiates dependencies (AudioProcessor, LLM, etc.),
         loads system prompts, initializes state variables (queues, events, flags),
         measures initial inference latencies, and starts the background worker threads.
 
         Args:
-            tts_engine: The TTS engine to use (e.g., "kokoro", "orpheus").
-            llm_provider: The LLM backend provider (e.g., "ollama").
+            tts_engine: Must be "kokoro" (only supported TTS engine).
+            llm_provider: The LLM backend provider (e.g., "openai").
             llm_model: The specific LLM model identifier.
             no_think: If True, removes specific thinking tags from LLM output.
-            orpheus_model: Path or identifier for the Orpheus TTS model, if used.
         """
+        if tts_engine != "kokoro":
+            raise ValueError("Only 'kokoro' TTS engine is supported")
+            
         self.tts_engine = tts_engine
         self.llm_provider = llm_provider
         self.llm_model = llm_model
         self.no_think = no_think
-        self.orpheus_model = orpheus_model
 
         self.system_prompt = system_prompt
-        # Removed orpheus-specific system prompt modification - only using Kokoro now
 
         # --- Instance Dependencies ---
-        self.audio = AudioProcessor(
-            engine=self.tts_engine,
-            orpheus_model=self.orpheus_model
-        )
+        self.audio = AudioProcessor(engine=self.tts_engine)
         self.audio.on_first_audio_chunk_synthesize = self.on_first_audio_chunk_synthesize
         self.text_similarity = TextSimilarity(focus='end', n_words=5)
         self.text_context = TextContext()
         self.generation_counter: int = 0
         self.abort_lock = threading.Lock()
         self.llm = LLM(
-            backend=self.llm_provider, # Or your backend
+            backend=self.llm_provider,
             model=self.llm_model,
             system_prompt=self.system_prompt,
             no_think=no_think,
